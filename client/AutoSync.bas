@@ -13,7 +13,7 @@ Private Const META_UPD As String = "updated_at"
 Private Const META_DEL As String = "deleted"
 Private Const HIDDEN_CONFLICT_SHEET As String = "_Conflicts"
 
-' ───────────────────────── Init/Start/Stop ─────────────────────────
+' ????????????????????????? Init/Start/Stop ?????????????????????????
 
 Public Sub AutoSync_Init(ByVal baseUrl As String, ByVal apiKey As String, _
                          ByVal pullIntervalSec As Double, ByVal pushDebounceSec As Double, _
@@ -60,16 +60,16 @@ Public Sub AutoSync_Stop()
     On Error GoTo 0
 End Sub
 
-' ───────────────────────── Scheduling ─────────────────────────
+' ????????????????????????? Scheduling ?????????????????????????
 
 Private Sub SchedulePull()
     If Not gRunning Or gPullScheduled Then Exit Sub
-    On Error GoTo EH
+    On Error GoTo eh
     gNextPullAt = DateAdd("s", gPullSec, Now)
     Application.OnTime gNextPullAt, "AutoSync_PullTick"
     gPullScheduled = True
     Exit Sub
-EH:
+eh:
     gPullScheduled = False
 End Sub
 
@@ -85,14 +85,14 @@ End Sub
 
 Private Sub SchedulePush()
     If Not gRunning Then Exit Sub
-    On Error GoTo EH
+    On Error GoTo eh
     gNextPushAt = DateAdd("s", gPushDebounceSec, Now)
     If Not gPushScheduled Then
         Application.OnTime gNextPushAt, "AutoSync_PushTick"
         gPushScheduled = True
     End If
     Exit Sub
-EH:
+eh:
     gPushScheduled = False
 End Sub
 
@@ -107,12 +107,12 @@ End Sub
 
 Private Sub SchedulePresence()
     If Not gRunning Or gPresenceScheduled Then Exit Sub
-    On Error GoTo EH
+    On Error GoTo eh
     gNextPresenceAt = DateAdd("s", gPresenceSec, Now)
     Application.OnTime gNextPresenceAt, "AutoSync_PresenceTick"
     gPresenceScheduled = True
     Exit Sub
-EH:
+eh:
     gPresenceScheduled = False
 End Sub
 
@@ -127,7 +127,7 @@ Public Sub AutoSync_PresenceTick()
     SchedulePresence
 End Sub
 
-' ───────────────────────── Event Hook ─────────────────────────
+' ????????????????????????? Event Hook ?????????????????????????
 
 Public Sub AutoSync_SheetChanged(ByVal Sh As Object, ByVal Target As Range)
     On Error Resume Next
@@ -144,15 +144,15 @@ Public Sub AutoSync_SheetChanged(ByVal Sh As Object, ByVal Target As Range)
     HeartbeatActiveSelection
 End Sub
 
-' ───────────────────────── Schema/Meta ─────────────────────────
+' ????????????????????????? Schema/Meta ?????????????????????????
 
 Private Sub EnsureSheetSchema(ByVal ws As Worksheet)
     Dim lo As ListObject
     If ws.ListObjects.Count = 0 Then
         ws.Cells.Clear
         ws.Range("A1").Value = META_ID
-        Set lo = ws.ListObjects.Add(xlSrcRange, ws.Range("A1").Resize(2, 1), , xlYes)
-        lo.Name = "Table1"
+        Set lo = ws.ListObjects.add(xlSrcRange, ws.Range("A1").Resize(2, 1), , xlYes)
+        lo.name = "Table1"
     Else
         Set lo = ws.ListObjects(1)
     End If
@@ -168,8 +168,8 @@ Private Sub EnsureSheetSchema(ByVal ws As Worksheet)
     End If
 
     On Error Resume Next
-    Gql_CreateTable ws.Name, headers, firstRow
-    Gql_AddColumns ws.Name, headers, firstRow
+    Gql_CreateTable ws.name, headers, firstRow
+    Gql_AddColumns ws.name, headers, firstRow
     On Error GoTo 0
 End Sub
 
@@ -184,16 +184,16 @@ Private Sub EnsureMetaColumns(ByVal lo As ListObject, ByVal metaArr As Variant)
         Dim nm As String: nm = CStr(metaArr(i))
         If Not have.Exists(UCase$(nm)) Then
             Dim lc As ListColumn
-            Set lc = lo.ListColumns.Add
-            lc.Name = nm
+            Set lc = lo.ListColumns.add
+            lc.name = nm
         End If
     Next i
 End Sub
 
-' ───────────────────────── Pull/Push ─────────────────────────
+' ????????????????????????? Pull/Push ?????????????????????????
 
 Private Sub PullOnce(ByVal ws As Worksheet, ByVal sinceVer As Long)
-    Dim arr As Object: Set arr = Gql_LoadRows(ws.Name, sinceVer)
+    Dim arr As Object: Set arr = Gql_LoadRows(ws.name, sinceVer)
     If arr Is Nothing Then Exit Sub
     If arr.Count = 0 And sinceVer > 0 Then Exit Sub
     ApplySnapshot ws, arr
@@ -206,7 +206,7 @@ Private Sub PushDirty(ByVal ws As Worksheet)
     Dim idx As Object: Set idx = HeaderIndexMap(lo)
     Dim rowsJson As String: rowsJson = ""
     Dim r As Range
-    For Each r In lo.DataBodyRange.Rows
+    For Each r In lo.DataBodyRange.rows
         Dim one As String: one = RowToUpsertJson(r, idx)
         If Len(one) > 0 Then
             If Len(rowsJson) > 0 Then rowsJson = rowsJson & ","
@@ -215,8 +215,8 @@ Private Sub PushDirty(ByVal ws As Worksheet)
     Next r
     If Len(rowsJson) = 0 Then Exit Sub
 
-    ' 닉네임 일관 사용
-    Dim payload As Object: Set payload = Gql_UpsertRows(ws.Name, gNick, rowsJson)
+    ' ?됰꽕???쇨? ?ъ슜
+    Dim payload As Object: Set payload = Gql_UpsertRows(ws.name, gNick, rowsJson)
     Dim results As Object: Set results = payload("results")
     Dim snapshot As Object: Set snapshot = payload("snapshot")
 
@@ -231,9 +231,9 @@ Private Sub HandleResults(ByVal ws As Worksheet, ByVal results As Object, ByVal 
     Dim idToRow As Object: Set idToRow = CreateObject("Scripting.Dictionary")
     Dim rr As Range
     If Not lo.DataBodyRange Is Nothing Then
-        For Each rr In lo.DataBodyRange.Rows
+        For Each rr In lo.DataBodyRange.rows
             Dim idv As Variant: idv = SafeCell(rr, idx(META_ID))
-            If Len(CStr(idv)) > 0 Then idToRow(CStr(idv)) = rr.Row
+            If Len(CStr(idv)) > 0 Then idToRow(CStr(idv)) = rr.row
         Next rr
     End If
 
@@ -243,14 +243,14 @@ Private Sub HandleResults(ByVal ws As Worksheet, ByVal results As Object, ByVal 
         Dim rid As Variant: rid = it("id")
         If IsNull(rid) Then GoTo NextIt
         If idToRow.Exists(CStr(rid)) Then
-            Dim rownum As Long: rownum = CLng(idToRow(CStr(rid)))
+            Dim rowNum As Long: rowNum = CLng(idToRow(CStr(rid)))
             Select Case st
-                Case "ok": ws.Rows(rownum).Interior.Color = RGB(220, 255, 220)
+                Case "ok": ws.rows(rowNum).Interior.Color = RGB(220, 255, 220)
                 Case "conflict"
-                    BackupRow backupWS, ws, rownum
-                    ws.Rows(rownum).Interior.Color = RGB(255, 245, 170)
+                    BackupRow backupWS, ws, rowNum
+                    ws.rows(rowNum).Interior.Color = RGB(255, 245, 170)
                 Case Else
-                    ws.Rows(rownum).Interior.Color = RGB(255, 200, 200)
+                    ws.rows(rowNum).Interior.Color = RGB(255, 200, 200)
             End Select
         End If
 NextIt:
@@ -258,12 +258,12 @@ NextIt:
 End Sub
 
 Private Sub BackupRow(ByVal backupWS As Worksheet, ByVal srcWS As Worksheet, ByVal rowNum As Long)
-    Dim lastRow As Long: lastRow = backupWS.Cells(backupWS.Rows.Count, 1).End(xlUp).Row
+    Dim lastRow As Long: lastRow = backupWS.Cells(backupWS.rows.Count, 1).End(xlUp).row
     If lastRow < 1 Then lastRow = 1
     backupWS.Cells(lastRow + 1, 1).Value = Now
-    backupWS.Cells(lastRow + 1, 2).Value = srcWS.Name
+    backupWS.Cells(lastRow + 1, 2).Value = srcWS.name
     backupWS.Cells(lastRow + 1, 3).Value = rowNum
-    backupWS.Cells(lastRow + 1, 4).Value = Join(GetRowValues(srcWS.Rows(rowNum)), "|")
+    backupWS.Cells(lastRow + 1, 4).Value = Join(GetRowValues(srcWS.rows(rowNum)), "|")
 End Sub
 
 Private Function GetRowValues(ByVal rng As Range) As Variant
@@ -275,7 +275,7 @@ Private Function GetRowValues(ByVal rng As Range) As Variant
     GetRowValues = arr
 End Function
 
-' ───────────────────────── Snapshot Apply ─────────────────────────
+' ????????????????????????? Snapshot Apply ?????????????????????????
 
 Private Sub ApplySnapshot(ByVal ws As Worksheet, ByVal rows As Object)
     If rows Is Nothing Then Exit Sub
@@ -303,7 +303,7 @@ Private Sub ApplySnapshot(ByVal ws As Worksheet, ByVal rows As Object)
     Dim r As Long, c As Long
     For r = 1 To rows.Count
         Dim row As Object: Set row = rows(r)
-        Dim lr As ListRow: Set lr = lo.ListRows.Add
+        Dim lr As ListRow: Set lr = lo.ListRows.add
         c = 0
         For Each k In first.Keys
             c = c + 1
@@ -320,7 +320,7 @@ FIN:
     Application.EnableEvents = True
 End Sub
 
-' ───────────────────────── Presence ─────────────────────────
+' ????????????????????????? Presence ?????????????????????????
 
 Private Sub HeartbeatActiveSelection()
     On Error Resume Next
@@ -339,8 +339,8 @@ Private Sub HeartbeatActiveSelection()
             If Not Intersect(Selection, lo.DataBodyRange) Is Nothing Then
                 Dim idx As Object: Set idx = HeaderIndexMap(lo)
 
-                ' 절대 좌표로 안전하게 계산
-                Dim rowNum As Long: rowNum = Selection.Row
+                ' ?덈? 醫뚰몴濡??덉쟾?섍쾶 怨꾩궛
+                Dim rowNum As Long: rowNum = Selection.row
                 Dim colId As Long
                 If idx.Exists(META_ID) Then
                     colId = lo.ListColumns(META_ID).Range.Column
@@ -359,7 +359,7 @@ Private Sub HeartbeatActiveSelection()
 
     Dim q As String, vars As String
     q = "mutation HB($u:String!,$t:String!,$ca:String,$rid:Int,$cn:String){ presenceHeartbeat(user:$u,table:$t,cell_addr:$ca,row_id:$rid,col_name:$cn) }"
-    Dim parts As String: parts = """u"":" & JsonQuote(gNick) & ",""t"":" & JsonQuote(ws.Name)
+    Dim parts As String: parts = """u"":" & JsonQuote(gNick) & ",""t"":" & JsonQuote(ws.name)
     If Len(addr) > 0 Then parts = parts & ",""ca"":" & JsonQuote(addr)
     If Not IsEmpty(rid) And Len(CStr(rid)) > 0 Then parts = parts & ",""rid"":" & CStr(CLng(rid))
     If Len(colname) > 0 Then parts = parts & ",""cn"":" & JsonQuote(colname)
@@ -370,14 +370,14 @@ End Sub
 Private Sub RefreshPresenceMarkers(ByVal ws As Worksheet)
     Dim lo As ListObject: Set lo = FirstTable(ws): If lo Is Nothing Then Exit Sub
 
-    Dim sh As Shape
-    For Each sh In ws.Shapes
-        If Left$(sh.Name, 12) = "presenceDot_" Then sh.Delete
-    Next sh
+    Dim Sh As Shape
+    For Each Sh In ws.Shapes
+        If Left$(Sh.name, 12) = "presenceDot_" Then Sh.Delete
+    Next Sh
 
     Dim q As String, vars As String
     q = "query P($t:String!){ presence(table:$t){ user table_name cell_addr row_id col_name ts } }"
-    vars = "{""t"":" & JsonQuote(ws.Name) & "}"
+    vars = "{""t"":" & JsonQuote(ws.name) & "}"
     Dim data As Object: On Error Resume Next: Set data = GqlCall(q, vars): On Error GoTo 0
     If data Is Nothing Then Exit Sub
     Dim arr As Object: Set arr = data("presence")
@@ -393,23 +393,23 @@ Private Sub RefreshPresenceMarkers(ByVal ws As Worksheet)
         On Error Resume Next: Set tgt = ws.Range(cellAddr): On Error GoTo 0
         If tgt Is Nothing Then GoTo NextIt
 
-        ' 주석(메모) 표시: 365 환경 차이 고려해 예외 무시
+        ' 二쇱꽍(硫붾え) ?쒖떆: 365 ?섍꼍 李⑥씠 怨좊젮???덉쇅 臾댁떆
         On Error Resume Next
         If Not tgt.Comment Is Nothing Then tgt.Comment.Delete
-        tgt.AddComment "편집중: " & nick
+        tgt.AddComment "?몄쭛以? " & nick
         tgt.Comment.Visible = False
         On Error GoTo 0
 
         Dim dot As Shape
         Set dot = ws.Shapes.AddShape(msoShapeOval, tgt.Left + 2, tgt.Top + 2, 6, 6)
-        dot.Name = "presenceDot_" & nick & "_" & cellAddr
+        dot.name = "presenceDot_" & nick & "_" & cellAddr
         dot.Fill.ForeColor.RGB = HashColor(nick)
         dot.Line.Visible = msoFalse
 NextIt:
     Next it
 End Sub
 
-' ───────────────────────── Helpers ─────────────────────────
+' ????????????????????????? Helpers ?????????????????????????
 
 Private Function FirstTable(ByVal ws As Worksheet) As ListObject
     If ws.ListObjects.Count > 0 Then Set FirstTable = ws.ListObjects(1) Else Set FirstTable = Nothing
@@ -471,7 +471,7 @@ Private Function JVal(v As Variant) As String
     ElseIf VarType(v) = vbBoolean Then
         JVal = IIf(v, "true", "false")
     ElseIf IsDate(v) Then
-        ' ISO-8601 문자열로 전송
+        ' ISO-8601 臾몄옄?대줈 ?꾩넚
         JVal = """" & Format$(v, "yyyy-mm-dd\Thh:nn:ss") & """"
     ElseIf IsNumeric(v) Then
         JVal = JNum(v)
@@ -481,7 +481,7 @@ Private Function JVal(v As Variant) As String
 End Function
 
 Private Function JNum(ByVal v As Variant) As String
-    ' 로케일 소수점(, → .) 강제
+    ' 濡쒖????뚯닔??, ??.) 媛뺤젣
     Dim s As String: s = CStr(v)
     JNum = Replace(s, Application.International(xlDecimalSeparator), ".")
 End Function
@@ -491,8 +491,8 @@ Private Function EnsureHiddenSheet(ByVal name As String) As Worksheet
     Set EnsureHiddenSheet = ThisWorkbook.Worksheets(name)
     On Error GoTo 0
     If EnsureHiddenSheet Is Nothing Then
-        Set EnsureHiddenSheet = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count))
-        EnsureHiddenSheet.Name = name
+        Set EnsureHiddenSheet = ThisWorkbook.Worksheets.add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count))
+        EnsureHiddenSheet.name = name
         EnsureHiddenSheet.Visible = xlSheetVeryHidden
         EnsureHiddenSheet.Cells(1, 1).Value = "ts"
         EnsureHiddenSheet.Cells(1, 2).Value = "sheet"
@@ -502,7 +502,7 @@ Private Function EnsureHiddenSheet(ByVal name As String) As Worksheet
 End Function
 
 Private Function IsHiddenSheet(ByVal ws As Worksheet) As Boolean
-    IsHiddenSheet = (ws.Name Like "_" & "*")
+    IsHiddenSheet = (ws.name Like "_" & "*")
 End Function
 
 Private Function ZeroIfEmpty(ByVal v As Variant) As Long
@@ -520,11 +520,11 @@ End Function
 
 Private Function GetOrPromptNickname() As String
     On Error Resume Next
-    Dim nm As Name: Set nm = ThisWorkbook.Names("_Nick")
+    Dim nm As name: Set nm = ThisWorkbook.Names("_Nick")
     On Error GoTo 0
     If Not nm Is Nothing Then
         Dim s As String
-        s = CStr(Evaluate(nm.RefersTo)) ' ="value" 안전 파싱
+        s = CStr(Evaluate(nm.RefersTo)) ' ="value" ?덉쟾 ?뚯떛
         If Len(s) > 0 Then GetOrPromptNickname = s: Exit Function
     End If
 
@@ -539,9 +539,9 @@ End Function
 
 Private Sub SaveNickname(ByVal v As String)
     On Error Resume Next
-    Dim nm As Name: Set nm = ThisWorkbook.Names("_Nick")
+    Dim nm As name: Set nm = ThisWorkbook.Names("_Nick")
     If nm Is Nothing Then
-        ThisWorkbook.Names.Add Name:="_Nick", RefersTo:="=""" & v & """"
+        ThisWorkbook.Names.add name:="_Nick", RefersTo:="=""" & v & """"
     Else
         nm.RefersTo = "=""" & v & """"
     End If

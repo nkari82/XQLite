@@ -193,7 +193,7 @@ Public Sub Gql_CreateTable(ByVal tableName As String, ByVal headers As Variant, 
                 If IsNumeric(samp) Then
                     If samp = CLng(samp) Then ctype = "INTEGER" Else ctype = "REAL"
                 ElseIf IsDate(samp) Then
-                    ctype = "TEXT" ' 서버가 ISO8601 처리
+                    ctype = "TEXT" ' ?쒕쾭媛 ISO8601 泥섎━
                 End If
             End If
         End If
