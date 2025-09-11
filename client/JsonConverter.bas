@@ -1,5 +1,4 @@
-Attribute VB_Name = "JsonConverter"
-Option Explicit
+﻿Option Explicit
 Option Compare Binary
 ' =============================================================================
 ' VBA-JSON (modernized 64-bit only) ? based on Tim Hall's v2.3.1
@@ -539,7 +538,7 @@ Private Function utc_DateToSystemTime(ByVal v As Date) As utc_SYSTEMTIME
     End With
 End Function
 
-Private Function utc_SystemTimeToDate(ByVal v As utc_SYSTEMTIME) As Date
+Private Function utc_SystemTimeToDate(v As utc_SYSTEMTIME) As Date
     utc_SystemTimeToDate = DateSerial(v.utc_wYear, v.utc_wMonth, v.utc_wDay) + _
                            TimeSerial(v.utc_wHour, v.utc_wMinute, v.utc_wSecond)
 End Function
