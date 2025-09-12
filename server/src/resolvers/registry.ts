@@ -46,3 +46,26 @@ export function zodShapeFor(def: TableDef) {
     }
     return z.object(shape).strict();
 }
+
+
+export function syncRegistryFromDB() {
+    const tables = db.prepare(`
+    SELECT name FROM sqlite_master
+    WHERE type='table' AND name NOT LIKE 'sqlite_%'
+      AND name NOT IN ('migrations','audit_log','presence','locks','meta','item_stats')
+  `).all().map((r: any) => r.name as string);
+
+    for (const t of tables) {
+        const cols = db.prepare(`PRAGMA table_info(${t})`).all() as Array<{ name: string; type: string; notnull: number; dflt_value: any }>;
+        // 메타 컬럼 제외
+        const userCols = cols.filter(c => !['id', 'row_version', 'updated_at', 'deleted'].includes(c.name))
+            .map(c => ({
+                name: c.name,
+                type: (c.type || "TEXT").toUpperCase() as any,
+                notNull: !!c.notnull,
+                default: c.dflt_value ?? undefined,
+            }));
+        const def: TableDef = { table: t, columns: userCols };
+        setTableDef(def);
+    }
+}

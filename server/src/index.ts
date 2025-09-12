@@ -19,7 +19,7 @@ import { config } from './config.js';
 import { logger } from './logger.js';
 import { registry, gqlCounter, gqlDuration } from './observability.js';
 import { integrityCheck } from './maintenance.js';
-
+import { runMigrations } from "./migrator.js";
 // ── GraphQL resolvers
 const resolvers = {
     Query: {
@@ -42,6 +42,12 @@ const resolvers = {
         recoverFromExcel: rows.recoverFromExcel,
     },
 };
+
+
+if (process.env.MIGRATE_ON_BOOT !== "0") {
+    runMigrations(require("path").resolve(process.cwd(), "migrations"));
+}
+
 
 // ── Express 5 앱 구성
 const app = express();

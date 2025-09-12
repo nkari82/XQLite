@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 import { hideBin } from "yargs/helpers";
 import yargs from "yargs";
+import path from "path";
 import { config } from "./config.js";
 import { logger } from "./logger.js";
 import { integrityCheck, snapshot } from "./maintenance.js";
 import { db } from "./db.js";
+import { runMigrations } from "./migrator.js";
 
 yargs(hideBin(process.argv))
     .scriptName("xqlite")
@@ -26,6 +28,10 @@ yargs(hideBin(process.argv))
         }
         const it = db.prepare(`SELECT * FROM ${t}`).iterate();
         for (const row of it) console.log(JSON.stringify(row));
+    })
+    .command("migrate [dir]", "Apply SQL migrations in dir", (y) => y.positional("dir", { type: "string", default: "./migrations" }), (argv) => {
+        const dir = path.resolve(process.cwd(), String(argv.dir));
+        runMigrations(dir);
     })
     .demandCommand(1)
     .strict()

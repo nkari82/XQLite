@@ -10,7 +10,8 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
-    "cli": "node dist/cli.js"
+    "cli": "node dist/cli.js",
+    "migrate": "node dist/cli.js migrate"
   },
   "engines": {
     "node": ">=20.0.0"
