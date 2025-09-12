@@ -49,43 +49,11 @@ export const queryRows = (_: any, args: any) => {
 };
 
 // ───────────────────────────────────────────
-// V1(레거시) 그대로 유지하고, V2를 신규 지원
-// ───────────────────────────────────────────
-
-export const upsertRows = (_: any, { table, rows, actor }: any) => {
-    if (!rows?.length) return { rows: [], max_row_version: 0, affected: 0, conflicts: [], errors: [] };
-    assertKnownTable(table);
-
-    const keys = Object.keys(rows[0]).filter(k => !["row_version", "updated_at", "deleted"].includes(k));
-    const setClause = keys.map(c => `${c}=?`).join(",");
-
-    const insert = db.prepare(`
-    INSERT INTO ${table} (${["id", ...keys, "row_version", "updated_at", "deleted"].join(",")})
-    VALUES (? , ${keys.map(_ => "?").join(",")} , ? , ? , 0)
-    ON CONFLICT(id) DO UPDATE SET ${setClause}, row_version=excluded.row_version, updated_at=excluded.updated_at
-  `);
-
-    const now = new Date().toISOString();
-    const tx = db.transaction(() => {
-        let affected = 0;
-        for (const r of rows) {
-            const rv = nextRowVersion();
-            const vals = [r.id, ...keys.map(k => r[k]), rv, now];
-            insert.run(vals);
-            affected++;
-        }
-        const maxv = Number((db.prepare(`SELECT value FROM meta WHERE key='max_row_version'`).get() as { value: string }).value);
-        return { rows: [], max_row_version: maxv, affected, conflicts: [], errors: [] };
-    });
-    return tx();
-};
-
-// ───────────────────────────────────────────
 // V2: 낙관적 잠금 + 셀 충돌
 // ───────────────────────────────────────────
 const toNFC = (v: any) => typeof v === "string" ? v.normalize("NFC") : v;
 
-export const upsertRowsV2 = (_: any, { table, rows, actor }: any) => {
+export const upsertRows = (_: any, { table, rows, actor }: any) => {
     const def = assertKnownTable(table);
     const validator = zodShapeFor(def);
     const now = new Date().toISOString();

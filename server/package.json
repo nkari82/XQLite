@@ -26,6 +26,7 @@
     "express": "^5.1.0",
     "express-rate-limit": "^8.1.0",
     "graphql": "^16.11.0",
+    "graphql-type-json": "^0.3.2",
     "http-errors": "^2.0.0",
     "pino": "^9.9.5",
     "prom-client": "^15.1.3",
