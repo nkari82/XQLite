@@ -14,6 +14,7 @@ import * as rows from './resolvers/rows.js';
 import * as schemaOps from './resolvers/schema.js';
 import * as presence from './resolvers/presence.js';
 import * as audit from './resolvers/audit.js';
+import { syncRegistryFromDB } from './resolvers/registry.js'
 
 import { config } from './config.js';
 import { logger } from './logger.js';
@@ -46,6 +47,8 @@ const resolvers = {
 
 if (process.env.MIGRATE_ON_BOOT !== "0") {
     runMigrations(require("path").resolve(process.cwd(), "migrations"));
+
+    syncRegistryFromDB();
 }
 
 
