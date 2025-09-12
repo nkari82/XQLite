@@ -1,10 +1,8 @@
-import { db, nextRowVersion } from "../db.js";
+import { db, nextRowVersion, RowData } from "../db.js";
 import { getTableDef, zodShapeFor, TableDef } from "./registry.js";
 import { ERR } from "../errors.js";
 import { sanitizeOrderBy } from "../util/sql.js";
 import { notifyChange } from "../notifier.js"
-
-type RowData = Record<string, any> & { row_version: number };
 
 const META_FORBID = new Set(["row_version", "updated_at", "deleted"]);
 const SQL_FORBID = /\b(ATTACH|PRAGMA|UNION|SELECT|INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|;|--|\/\*)\b/i;

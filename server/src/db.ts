@@ -49,3 +49,5 @@ export function nextRowVersion(): number {
 }
 
 export const presenceTTLSeconds = config.presenceTTL;
+
+export type RowData = Record<string, any> & { row_version: number, deleted?: boolean | number | null };

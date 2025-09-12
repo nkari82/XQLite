@@ -26,7 +26,7 @@ import { logger } from './logger.js';
 import { registry, gqlCounter, gqlDuration } from './observability.js';
 import { integrityCheck } from './maintenance.js';
 import { runMigrations } from "./migrator.js";
-
+import { mountSSE } from "./sse.js";
 
 // ── GraphQL resolvers
 const resolvers = {
@@ -84,6 +84,8 @@ app.use((req: Request, res: Response, next: NextFunction) => {
     }
     next();
 });
+
+mountSSE(app);
 
 // 인증 헬퍼
 function requireApiKey(req: express.Request, res: express.Response, next: express.NextFunction) {
