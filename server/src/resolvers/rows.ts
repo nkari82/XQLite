@@ -2,6 +2,7 @@ import { db, nextRowVersion } from "../db.js";
 import { getTableDef, zodShapeFor, TableDef } from "./registry.js";
 import { ERR } from "../errors.js";
 import { sanitizeOrderBy } from "../util/sql.js";
+import { notifyChange } from "../notifier.js"
 
 type RowData = Record<string, any> & { row_version: number };
 
@@ -124,7 +125,9 @@ export const upsertRows = (_: any, { table, rows, actor }: any) => {
         return { rows: [], max_row_version: maxv, affected, conflicts, errors: [] };
     });
 
-    return tx();
+    const out = tx();
+    notifyChange(table, out.max_row_version);   // ← 커밋 후 알림
+    return out;
 };
 
 export const deleteRows = (_: any, { table, ids, actor }: any) => {
@@ -140,7 +143,9 @@ export const deleteRows = (_: any, { table, ids, actor }: any) => {
         const maxv = Number((db.prepare(`SELECT value FROM meta WHERE key='max_row_version'`).get() as { value: string }).value);
         return { rows: [], max_row_version: maxv, affected, conflicts: [], errors: [] };
     });
-    return tx();
+    const out = tx();
+    notifyChange(table, out.max_row_version);
+    return out;
 };
 
 export const recoverFromExcel = (_: any, { table, rows, schema_hash, actor }: any) => {
@@ -158,6 +163,8 @@ export const recoverFromExcel = (_: any, { table, rows, schema_hash, actor }: an
         }
     });
     tx();
+    const maxv = Number((db.prepare(`SELECT value FROM meta WHERE key='max_row_version'`).get() as any).value);
+    notifyChange(table, maxv);
     return true;
 };
 

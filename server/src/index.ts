@@ -1,3 +1,7 @@
+import { db } from "./db.js";
+import { getTableDef } from "./resolvers/registry.js";
+import { waitForChange } from "./notifier.js";
+
 // Apollo Server v5 + Express 5 (최신)
 import { ApolloServer } from '@apollo/server';
 import { expressMiddleware } from '@as-integrations/express5';
@@ -22,6 +26,8 @@ import { logger } from './logger.js';
 import { registry, gqlCounter, gqlDuration } from './observability.js';
 import { integrityCheck } from './maintenance.js';
 import { runMigrations } from "./migrator.js";
+
+
 // ── GraphQL resolvers
 const resolvers = {
     Query: {
@@ -77,6 +83,61 @@ app.use((req: Request, res: Response, next: NextFunction) => {
         return;
     }
     next();
+});
+
+// 인증 헬퍼
+function requireApiKey(req: express.Request, res: express.Response, next: express.NextFunction) {
+    if (config.apiKey && req.headers["x-api-key"] !== config.apiKey) {
+        return res.status(401).json({ error: "unauthorized" });
+    }
+    next();
+}
+
+/**
+ * Long-poll changes:
+ * GET /changes/longpoll?table=items&since=123&limit=500&timeout_ms=30000
+ * 응답: { changes: [{row,row_version,op}], max_row_version }
+ */
+app.get("/changes/longpoll", requireApiKey, async (req, res) => {
+    try {
+        const table = String(req.query.table ?? "");
+        const since = Number(req.query.since ?? 0);
+        const limit = Math.max(1, Math.min(5000, Number(req.query.limit ?? 500)));
+        const timeoutMs = Math.max(1000, Math.min(60000, Number(req.query.timeout_ms ?? 30000)));
+
+        // 테이블 화이트리스트(레지스트리) 확인
+        const def = getTableDef(table);
+        if (!def) return res.status(400).json({ error: "unknown table" });
+
+        // 현재 max_row_version
+        const maxvRow = db.prepare(`SELECT value FROM meta WHERE key='max_row_version'`).get() as any;
+        let maxv = Number(maxvRow?.value ?? 0);
+
+        // 변화가 아직 없다면 대기
+        if (maxv <= since) {
+            await waitForChange(table, since, timeoutMs);
+            const after = db.prepare(`SELECT value FROM meta WHERE key='max_row_version'`).get() as any;
+            maxv = Number(after?.value ?? 0);
+        }
+
+        // 증분 로드
+        const rows = db.prepare(`
+      SELECT * FROM ${table}
+      WHERE row_version > ?
+      ORDER BY row_version ASC
+      LIMIT ?
+    `).all(since, limit);
+
+        const changes = rows.map((r: any) => ({
+            row: r,
+            row_version: r.row_version,
+            op: r.deleted ? "delete" : "upsert",
+        }));
+
+        res.json({ changes, max_row_version: maxv });
+    } catch (e: any) {
+        res.status(400).json({ error: String(e?.message || e) });
+    }
 });
 
 // 헬스체크 & 메트릭
