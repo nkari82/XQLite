@@ -1,4 +1,5 @@
 import { db, presenceTTLSeconds } from "../db";
+import { logger } from "../logger";
 
 export const heartbeat = (_: any, { nickname, sheet, cell }: { nickname: string, sheet?: string, cell?: string }) => {
     db.prepare(`
@@ -44,3 +45,11 @@ export const queryLocks = (_: any, { sheet }: { sheet?: string }) => {
     if (sheet) return db.prepare(`SELECT * FROM locks WHERE sheet=?`).all(sheet);
     return db.prepare(`SELECT * FROM locks`).all();
 };
+
+
+// 서버 시작 시 5초마다 만료 레코드 정리
+setInterval(() => {
+    const delP = db.prepare(`DELETE FROM presence WHERE (strftime('%s','now') - strftime('%s',updated_at)) > ?`).run(presenceTTLSeconds * 2).changes;
+    const delL = db.prepare(`DELETE FROM locks WHERE (strftime('%s','now') - strftime('%s',updated_at)) > ?`).run(presenceTTLSeconds * 2).changes;
+    if (delP || delL) logger.info({ delP, delL }, 'presence/locks purged');
+}, 5000);

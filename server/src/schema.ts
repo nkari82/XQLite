@@ -34,4 +34,14 @@ type Mutation {
 
   recoverFromExcel(table: String!, rows: [JSON!]!, schema_hash: String!, actor: String!): Boolean!
 }
+
+input UpsertRowInput {
+  id: Int!
+  base_row_version: Int     # ← Excel이 보냄(없으면 0)
+  data: JSON!               # 실제 컬럼 값들
+}
+
+extend type Mutation {
+  upsertRowsV2(table: String!, rows: [UpsertRowInput!]!, actor: String!): RowResult!
+}
 `;

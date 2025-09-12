@@ -22,3 +22,4 @@ export const addIndex = (_: any, { table, name, expr, unique }: { table: string,
     db.exec(`CREATE ${unique ? "UNIQUE" : ""} INDEX IF NOT EXISTS ${name} ON ${table}(${expr})`);
     return true;
 };
+
