@@ -3,37 +3,37 @@
   "version": "0.1.0",
   "private": true,
   "description": "XQLite GraphQL + SQLite server (Node.js + TypeScript)",
+  "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
-    "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
-    "typecheck": "tsc --noEmit",
-    "postinstall": "npm rebuild better-sqlite3 || true"
+    "dev": "tsx watch src/index.ts"
   },
   "engines": {
     "node": ">=20.0.0"
   },
   "dependencies": {
-    "apollo-server-express": "^3.13.0",
-    "better-sqlite3": "^9.6.0",
+    "@apollo/server": "^5.0.0",
+    "@as-integrations/express5": "^1.1.2",
+    "@types/better-sqlite3": "^7.6.13",
+    "better-sqlite3": "^12.2.0",
     "cors": "^2.8.5",
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2",
-    "express-rate-limit": "^7.4.0",
-    "graphql": "^16.8.1",
+    "express": "^5.1.0",
+    "express-rate-limit": "^8.1.0",
+    "graphql": "^16.11.0",
+    "http-errors": "^2.0.0",
     "pino": "^9.9.5",
-    "zod": "^3.23.8"
+    "prom-client": "^15.1.3",
+    "yarn": "^1.22.22",
+    "zod": "^4.1.8"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/cors": "^2.8.17",
-    "@types/express": "^4.17.21",
-    "@types/node": "^20.14.10",
-    "pino-pretty": "^11.2.1",
-    "ts-node": "^10.9.2",
-    "ts-node-dev": "^2.0.0",
-    "typescript": "^5.5.4"
+    "@types/express": "^5.0.3",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
   }
 }

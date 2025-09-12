@@ -1,16 +1,17 @@
 {
   "compilerOptions": {
     "skipLibCheck": true,
-    "moduleResolution": "node",
+    "moduleResolution": "NodeNext",
     "esModuleInterop": true,
     "strict": true,
     "target": "ES2022",
-    "module": "CommonJS",
+    "module": "NodeNext",
     "resolveJsonModule": true,
+    "forceConsistentCasingInFileNames": true,
     "outDir": "dist"
   },
   "include": [
-    "src/**/*"
+    "src/**/*.ts"
   ],
   "exclude": [
     "node_modules",
