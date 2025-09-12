@@ -25,9 +25,10 @@ const resolvers = {
     Query: {
         meta: meta.getMeta,
         rows: rows.queryRows,
+        changes: rows.changes,          // ← 추가
         presence: presence.queryPresence,
         locks: presence.queryLocks,
-        // auditLog: audit.queryAudit,
+        auditLog: audit.queryAudit,
     },
     Mutation: {
         createTable: schemaOps.createTable,

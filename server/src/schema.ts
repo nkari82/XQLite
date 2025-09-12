@@ -45,4 +45,15 @@ type Mutation {
   # 복구
   recoverFromExcel(table: String!, rows: [JSON!]!, schema_hash: String!, actor: String!): Boolean!
 }
+
+type Change {
+  row: JSON!           # 변경된 행(삭제면 최소 id 포함)
+  row_version: Int!    # 변경이 발생한 전역 버전
+  op: String!          # "upsert" | "delete"
+}
+
+extend type Query {
+  # since_version 초과분만 오름차순 반환 (row_version ASC)
+  changes(table: String!, since_version: Int!, limit: Int = 5000, offset: Int = 0): [Change!]!
+}
 `;

@@ -1,6 +1,7 @@
 import { db, nextRowVersion } from "../db.js";
 import { getTableDef, zodShapeFor, TableDef } from "./registry.js";
 import { ERR } from "../errors.js";
+import { sanitizeOrderBy } from "../util/sql.js";
 
 type RowData = Record<string, any> & { row_version: number };
 
@@ -41,7 +42,7 @@ export const queryRows = (_: any, args: any) => {
     if (since_version != null) conds.push(`row_version > ${Number(since_version)}`);
     if (whereRaw) conds.push(validateWhereRaw(def, whereRaw));
     const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
-    const order = orderBy ? `ORDER BY ${orderBy}` : "";
+    const order = sanitizeOrderBy(orderBy, def);
     const rows = db.prepare(`SELECT * FROM ${table} ${where} ${order} LIMIT ? OFFSET ?`).all(limit, offset);
     const maxv = Number((db.prepare(`SELECT value FROM meta WHERE key='max_row_version'`).get() as { value: string }).value);
     return { rows, max_row_version: maxv, affected: rows.length, conflicts: [], errors: [] };
@@ -190,4 +191,24 @@ export const recoverFromExcel = (_: any, { table, rows, schema_hash, actor }: an
     });
     tx();
     return true;
+};
+
+
+export const changes = (_: any, { table, since_version, limit = 5000, offset = 0 }: any) => {
+    const def = assertKnownTable(table);
+    // row_version > since_version 인 행을 최신 상태로 그대로 보내고,
+    // deleted 플래그 기준으로 op를 도출한다.
+    const rows = db.prepare(`
+    SELECT * FROM ${table}
+    WHERE row_version > ?
+    ORDER BY row_version ASC
+    LIMIT ? OFFSET ?
+  `).all(since_version, limit, offset);
+
+    const out = rows.map((r: any) => ({
+        row: r,
+        row_version: r.row_version,
+        op: r.deleted ? "delete" : "upsert",
+    }));
+    return out;
 };
