@@ -27,6 +27,7 @@ import { registry, gqlCounter, gqlDuration } from './observability.js';
 import { integrityCheck } from './maintenance.js';
 import { runMigrations } from "./migrator.js";
 import { mountSSE } from "./sse.js";
+import { setupShutdown } from './shutdown.js';
 
 // ── GraphQL resolvers
 const resolvers = {
@@ -153,6 +154,18 @@ app.get('/metrics', async (_req, res) => {
     res.end(await registry.metrics());
 });
 
+app.use((_req: Request, res: Response) => {
+    res.status(404).json({ error: 'not_found' });
+});
+
+app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
+    // 필요시 타입 가공
+    const status = typeof err?.status === 'number' ? err.status : 500;
+    const code = err?.code ?? 'internal';
+    logger.error({ err }, 'request_error');
+    res.status(status).json({ error: code, message: String(err?.message ?? 'internal error') });
+});
+
 // ── Apollo Server (플러그인 포함)
 type Ctx = { actor: string };
 
@@ -223,3 +236,8 @@ app.use('/graphql',
 httpServer.listen(config.port, () => {
     logger.info({ port: config.port }, 'XQLite server up');
 });
+
+// 종료 훅 연결 (Apollo stop + 기타 정리)
+setupShutdown(httpServer, [
+    async () => await server.stop(),
+]);

@@ -1,3 +1,6 @@
+import type { Request, Response, NextFunction } from 'express';
+import { logger } from './logger.js';
+
 export class AppError extends Error {
     code: string; http?: number; extra?: any;
     constructor(code: string, message: string, http = 400, extra?: any) {
