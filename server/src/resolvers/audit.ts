@@ -1,5 +1,5 @@
 // server/src/resolvers/audit.ts
-import { db } from "../db";
+import { db } from "../db.js";
 
 export type AuditRow = {
     id: number;

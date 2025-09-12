@@ -1,5 +1,5 @@
 import Database = require('better-sqlite3');
-import { logger } from './logger';
+import { logger } from './logger.js';
 
 export function snapshot(dbPath: string, outPath: string) {
     const src = new Database(dbPath, { readonly: true });

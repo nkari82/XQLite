@@ -1,5 +1,5 @@
 // server/src/resolvers/meta.ts
-import { db } from "../db";
+import { db } from "../db.js";
 
 type Meta = { schema_hash: string; max_row_version: number };
 

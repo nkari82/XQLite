@@ -1,5 +1,5 @@
-import { db, presenceTTLSeconds } from "../db";
-import { logger } from "../logger";
+import { db, presenceTTLSeconds } from "../db.js";
+import { logger } from "../logger.js";
 
 export const heartbeat = (_: any, { nickname, sheet, cell }: { nickname: string, sheet?: string, cell?: string }) => {
     db.prepare(`

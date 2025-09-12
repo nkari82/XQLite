@@ -1,24 +1,32 @@
-import { ApolloServer } from 'apollo-server-express'
-import { typeDefs } from './schema';
-import * as meta from './resolvers/meta';
-import * as rows from './resolvers/rows';
-import * as schemaOps from './resolvers/schema';
-import * as presence from './resolvers/presence';
-import * as audit from './resolvers/audit';
-import { config } from './config';
-import { logger } from './logger';
-import rateLimit from 'express-rate-limit';
-import express from 'express';
-import cors from 'cors';
-import http from 'http';
+// Apollo Server v5 + Express 5 (최신)
+import { ApolloServer } from '@apollo/server';
+import { expressMiddleware } from '@as-integrations/express5';
+import { ApolloServerPluginDrainHttpServer } from '@apollo/server/plugin/drainHttpServer';
 
+import express, { Request, Response, NextFunction } from 'express';
+import http from 'http';
+import cors from 'cors';
+import { rateLimit } from 'express-rate-limit';
+
+import { typeDefs } from './schema.js';
+import * as meta from './resolvers/meta.js';
+import * as rows from './resolvers/rows.js';
+import * as schemaOps from './resolvers/schema.js';
+import * as presence from './resolvers/presence.js';
+import * as audit from './resolvers/audit.js';
+
+import { config } from './config.js';
+import { logger } from './logger.js';
+import { registry, gqlCounter, gqlDuration } from './observability.js';
+import { integrityCheck } from './maintenance.js';
+
+// ── GraphQL resolvers
 const resolvers = {
     Query: {
         meta: meta.getMeta,
         rows: rows.queryRows,
         presence: presence.queryPresence,
         locks: presence.queryLocks,
-        // (옵션) 감사 로그 공개 시
         // auditLog: audit.queryAudit,
     },
     Mutation: {
@@ -31,40 +39,88 @@ const resolvers = {
         acquireLock: presence.acquire,
         releaseLock: presence.release,
         recoverFromExcel: rows.recoverFromExcel,
-    }
+    },
 };
 
-// ── Express 래핑으로 보안/레이트리밋/CORS
+// ── Express 5 앱 구성
 const app = express();
+const httpServer = http.createServer(app);
+
+// CORS & Body Parser
 app.use(cors({ origin: config.corsOrigin, credentials: false }));
 app.use(express.json({ limit: '3mb' }));
-app.use(rateLimit({ windowMs: 60_000, max: config.rateLimitRPM }));
 
-// 간단 API KEY 인증 미들웨어(프로덕션은 JWT 등으로 대체)
-app.use((req: any, res: any, next: any) => {
+// Rate Limit (v8: named export, 옵션명 `limit`)
+const limiter = rateLimit({
+    windowMs: 60_000,
+    limit: config.rateLimitRPM,
+    standardHeaders: 'draft-8',
+    legacyHeaders: false,
+});
+app.use(limiter);
+
+// 간단 API KEY 인증 (프로덕션은 JWT 등 권장)
+app.use((req: Request, res: Response, next: NextFunction) => {
     if (config.apiKey && req.headers['x-api-key'] !== config.apiKey) {
-        res.status(401).json({ error: 'unauthorized' }); return;
+        res.status(401).json({ error: 'unauthorized' });
+        return;
     }
     next();
 });
 
-const server = new ApolloServer({
-    typeDefs, resolvers,
-    context: ({ req }) => ({
-        actor: req.headers['x-actor'] ?? 'unknown', // Excel 닉네임 전달
-    }),
-    formatError: (err) => {
-        logger.error({ err }, 'GraphQLError');
-        return err;
-    }
+// 헬스체크 & 메트릭
+app.get('/health', async (_req, res) => {
+    const ok = integrityCheck(process.env.DB_PATH || 'db.sqlite');
+    res.json({ ok, integrity: ok });
 });
 
-(async () => {
-    await server.start();
-    //server.applyMiddleware({ app, path: '/' });
+app.get('/metrics', async (_req, res) => {
+    res.setHeader('Content-Type', registry.contentType);
+    res.end(await registry.metrics());
+});
 
-    const httpServer = http.createServer(app);
-    httpServer.listen(config.port, () => {
-        logger.info({ port: config.port }, 'XQLite server up');
-    });
-})();
+// ── Apollo Server (플러그인 포함)
+type Ctx = { actor: string };
+
+const opLogPlugin = {
+    async requestDidStart() {
+        const endAll = gqlDuration.startTimer();
+        return {
+            async didResolveOperation(ctx: any) {
+                const op = ctx.request.operationName ?? 'anonymous';
+                const type = ctx.operation?.operation ?? 'unknown';
+                gqlCounter.inc({ op, type: String(type) });
+            },
+            async willSendResponse() {
+                endAll({ op: 'all' });
+            },
+        };
+    },
+};
+
+const server = new ApolloServer<Ctx>({
+    typeDefs,
+    resolvers,
+    plugins: [
+        opLogPlugin,
+        ApolloServerPluginDrainHttpServer({ httpServer }),
+    ],
+    formatError: (err) => err,
+});
+
+// ── 미들웨어 장착 (/graphql)
+await server.start();
+app.use(
+    '/graphql',
+    express.json({ limit: '3mb' }),
+    expressMiddleware(server, {
+        context: async (req: any) => ({
+            actor: String((req.headers['x-actor'] as string) ?? 'unknown'),
+        }),
+    }),
+);
+
+// ── 기동
+httpServer.listen(config.port, () => {
+    logger.info({ port: config.port }, 'XQLite server up');
+});
