@@ -1,4 +1,4 @@
-import Database = require('better-sqlite3');
+import Database from "better-sqlite3";
 import { logger } from './logger.js';
 
 export function snapshot(dbPath: string, outPath: string) {

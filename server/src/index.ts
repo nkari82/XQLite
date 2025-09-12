@@ -2,6 +2,7 @@
 import { ApolloServer } from '@apollo/server';
 import { expressMiddleware } from '@as-integrations/express5';
 import { ApolloServerPluginDrainHttpServer } from '@apollo/server/plugin/drainHttpServer';
+import { ApolloServerPluginLandingPageLocalDefault } from '@apollo/server/plugin/landingPage/default'; // ← Sandbox 랜딩페이지
 
 import express, { Request, Response, NextFunction } from 'express';
 import http from 'http';
@@ -111,23 +112,48 @@ const opLogPlugin = {
 const server = new ApolloServer<Ctx>({
     typeDefs,
     resolvers,
+    introspection: true,
     plugins: [
         opLogPlugin,
         ApolloServerPluginDrainHttpServer({ httpServer }),
+        ApolloServerPluginLandingPageLocalDefault({ embed: true }) // ← 브라우저 IDE
     ],
     formatError: (err) => err,
 });
 
+
+// production에선 다시 채워야 한다.
+// API_KEY=dev-secret-change-me
+
+// 인스펙션 쿼리 판별 도우미
+function isIntrospection(body: any) {
+    const q = typeof body?.query === 'string' ? body.query : '';
+    return q.includes('__schema') || q.includes('__type');
+}
+
 // ── 미들웨어 장착 (/graphql)
 await server.start();
-app.use(
-    '/graphql',
-    express.json({ limit: '3mb' }),
+
+// CORS 등은 그대로 두고…
+app.use('/graphql',
+    express.json({ limit: '3mb' }),                    // ⬅️ 먼저 body 파싱
+    (req, res, next) => {
+        // 1) IDE 로딩(landing page)은 GET → 항상 허용
+        if (req.method === 'GET') return next();
+
+        // 2) 개발 모드에서 인스펙션 POST는 허용 (헤더 넣기 전 초기 인스펙션 허용)
+        if (process.env.ENABLE_IDE && isIntrospection((req as any).body)) return next();
+
+        // 3) 그 외에는 API Key 검사
+        const apiKey = req.headers['x-api-key'];
+        if (process.env.API_KEY && apiKey !== process.env.API_KEY) {
+            return res.status(401).json({ error: 'unauthorized' });
+        }
+        next();
+    },
     expressMiddleware(server, {
-        context: async (req: any) => ({
-            actor: String((req.headers['x-actor'] as string) ?? 'unknown'),
-        }),
-    }),
+        context: async ({ req }) => ({ actor: String((req.headers['x-actor'] as string) ?? 'unknown') }),
+    })
 );
 
 // ── 기동
