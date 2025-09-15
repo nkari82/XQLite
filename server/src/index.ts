@@ -215,10 +215,12 @@ app.use('/graphql',
     express.json({ limit: '3mb' }),                    // ⬅️ 먼저 body 파싱
     (req, res, next) => {
         // 1) IDE 로딩(landing page)은 GET → 항상 허용
-        if (req.method === 'GET') return next();
+        if (req.method === 'GET')
+            return next();
 
         // 2) 개발 모드에서 인스펙션 POST는 허용 (헤더 넣기 전 초기 인스펙션 허용)
-        if (process.env.ENABLE_IDE && isIntrospection((req as any).body)) return next();
+        if (process.env.ENABLE_IDE && isIntrospection((req as any).body))
+            return next();
 
         // 3) 그 외에는 API Key 검사
         const apiKey = req.headers['x-api-key'];
