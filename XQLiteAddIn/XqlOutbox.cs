@@ -38,7 +38,7 @@ namespace XQLite.AddIn
                 string tmp = PathBox + ".tmp";
                 try
                 {
-                    File.Move(PathBox, tmp, overwrite: true);
+                    File.Move(PathBox, tmp);
                     foreach (var line in File.ReadLines(tmp))
                     {
                         if (string.IsNullOrWhiteSpace(line)) continue;

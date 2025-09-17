@@ -11,19 +11,18 @@ namespace XQLite.AddIn
         [ExcelCommand(Name = "XQL.CmdPalette", Description = "Open XQLite command palette", ShortCut = "Ctrl-Shift-K")]
         public static void CmdPalette()
         {
-#if false
             XqlCommandPaletteForm.ShowSingleton();
-#endif
         }
 
         [ExcelCommand(Name = "XQL.Config", Description = "Open XQLite Config")]
         public static void ConfigCommand()
         {
             // 1
-#if false
-            try { XqlConfigForm.ShowSingleton(); }
+            try 
+            { 
+                XqlConfigForm.ShowSingleton(); 
+            }
             catch (Exception ex) { MessageBox.Show(ex.Message, "XQLite", MessageBoxButtons.OK, MessageBoxIcon.Error); }
-#endif
         }
 
         [ExcelCommand(Name = "XQL.Commit", Description = "Commit pending changes", ShortCut = "Ctrl-Shift-C")]
@@ -37,20 +36,16 @@ namespace XQLite.AddIn
         public static void RecoverCommand()
         {
             // 2
-#if false
             try { XqlRecoverForm.ShowSingleton(); }
             catch (Exception ex) { MessageBox.Show("Recover UI failed: " + ex.Message, "XQLite"); }
-#endif
         }
 
         [ExcelCommand(Name = "XQL.Inspector", Description = "Open Inspector", ShortCut = "Ctrl-Shift-I")]
         public static void InspectorCommand()
         {
             // 3
-#if false
             try { XqlInspectorForm.ShowSingleton(); }
             catch (Exception ex) { MessageBox.Show("Inspector failed: " + ex.Message, "XQLite"); }
-#endif
         }
 
 
@@ -108,20 +103,22 @@ namespace XQLite.AddIn
         public static void PresenceCommand()
         {
             // 4
-#if false
-            try { XqlPresenceHudForm.ShowSingleton(); }
+            try 
+            { 
+                XqlPresenceHudForm.ShowSingleton(); 
+            }
             catch (Exception ex) { MessageBox.Show("Presence HUD failed: " + ex.Message, "XQLite"); }
-#endif
         }
 
         [ExcelCommand(Name = "XQL.Schema", Description = "Open schema explorer", ShortCut = "Ctrl-Shift-S")]
         public static void SchemaCommand()
         {
             // 5
-#if false
-            try { XqlSchemaForm.ShowSingleton(); }
+            try 
+            { 
+                XqlSchemaForm.ShowSingleton(); 
+            }
             catch (Exception ex) { MessageBox.Show("Schema explorer failed: " + ex.Message, "XQLite"); }
-#endif
         }
 
         [ExcelCommand(Name = "XQL.ExportDiagnostics", Description = "Export diagnostics zip", ShortCut = "Ctrl-Shift-D")]
@@ -139,12 +136,13 @@ namespace XQLite.AddIn
         public static void LockCommand()
         {
             // 6
-#if false
-            try { XqlLockForm.ShowSingleton(); }
+            try 
+            { 
+                XqlLockForm.ShowSingleton(); 
+            }
             catch (Exception ex) { MessageBox.Show("Lock explorer failed: " + ex.Message, "XQLite"); }
-#endif
         }
 
     }
 #endif
-        }
+}

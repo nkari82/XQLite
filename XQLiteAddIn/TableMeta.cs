@@ -183,6 +183,6 @@ namespace XQLite.AddIn
         }
 
         public static IEnumerable<TableMeta> All() => _byName.Values;
-        public static void Clear() => _byName.Clear();
+        internal static void Clear() => _byName.Clear();
     }
 }

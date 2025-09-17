@@ -12,7 +12,7 @@ namespace XQLite.AddIn
         private Button btnRefresh = new() { Text = "Refresh" };
         private Button btnClear = new() { Text = "Clear" };
 
-        public static void ShowSingleton()
+        internal static void ShowSingleton()
         {
             if (_inst == null || _inst.IsDisposed) _inst = new XqlInspectorForm();
             _inst.Show(); _inst.BringToFront();

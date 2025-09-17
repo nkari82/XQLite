@@ -10,7 +10,7 @@ namespace XQLite.AddIn
     public sealed class XqlLockForm : Form
     {
         private static XqlLockForm? _inst;
-        public static void ShowSingleton()
+        internal static void ShowSingleton()
         {
             if (_inst == null || _inst.IsDisposed) _inst = new XqlLockForm();
             _inst.Show();
@@ -39,6 +39,13 @@ namespace XQLite.AddIn
         {
             var sel = GetSelection(); if (sel == null) return;
             if (string.IsNullOrEmpty(sel.Table) || string.IsNullOrEmpty(sel.ColumnName)) { MessageBox.Show("선택 영역이 테이블 컬럼이 아닙니다."); return; }
+
+            if (sel.Table is null || sel.ColumnName is null)
+            {
+                MessageBox.Show("Invalid selection: table or column is null");
+                return;
+            }
+
             var ok = await XqlLockService.AcquireColumnAsync(sel.Table, sel.ColumnName);
             MessageBox.Show(ok ? "Locked" : "Lock failed");
             RefreshList();
@@ -54,7 +61,11 @@ namespace XQLite.AddIn
 
         private async Task UnlockSelectedAsync()
         {
-            if (lv.SelectedItems.Count == 0) return; var id = lv.SelectedItems[0].Tag as string; if (string.IsNullOrEmpty(id)) return;
+            if (lv.SelectedItems.Count == 0) return; 
+            var id = lv.SelectedItems[0].Tag as string; 
+            if (id == null || id == "") 
+                return;
+
             await XqlLockService.ReleaseAsync(id); RefreshList();
         }
 

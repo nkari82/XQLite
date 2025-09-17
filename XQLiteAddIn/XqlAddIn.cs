@@ -22,6 +22,7 @@ namespace XQLite.AddIn
 
         public void AutoOpen()
         {
+#if true
             try
             {
                 Directory.CreateDirectory(AppDir);
@@ -32,15 +33,18 @@ namespace XQLite.AddIn
             {
                 MessageBox.Show($"XQLite failed to start:\r\n{ex}", "XQLite", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
+#endif
         }
 
         public void AutoClose()
         {
+#if true
             try
             {
                 StopRuntime();
             }
             catch { /* ignore */ }
+#endif
         }
 
         // ====== Runtime lifecycle ======

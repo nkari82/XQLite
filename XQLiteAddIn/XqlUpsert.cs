@@ -139,8 +139,10 @@ mutation ($table:String!, $rows:[JSON!]!) {
             using var sem = new SemaphoreSlim(_maxDegree);
             var tasks = new List<Task>(byTable.Count);
 
-            foreach (var (table, rows) in byTable)
+            foreach (var kv in byTable)
             {
+                var table = kv.Key;
+                var rows = kv.Value;
                 await sem.WaitAsync(ct);
                 tasks.Add(Task.Run(async () =>
                 {
@@ -208,7 +210,7 @@ mutation ($table:String!, $rows:[JSON!]!) {
             var sample = rows.Take(Math.Min(32, n)).ToArray();
             double avg = Math.Max(16, sample.Average(RowSize)); // 너무 작게 나오면 최소 보정
             const int TargetBytes = 256 * 1024; // 256KB
-            int byBytes = (int)Math.Clamp(TargetBytes / avg, 100, 1500);
+            int byBytes = (int)Compat.Clamp(TargetBytes / avg, 100, 1500);
 
             // 행수 절대 상한/하한도 적용
             if (n > 20000) return Math.Min(byBytes, 200);
@@ -236,7 +238,7 @@ mutation ($table:String!, $rows:[JSON!]!) {
                         table = table,
                         row = r
                     }, _jsonOpts);
-                    await sw.WriteLineAsync(line.AsMemory(), ct);
+                    await sw.WriteLineAsync(line, ct);
                 }
             }
             catch (Exception ex)
@@ -250,7 +252,7 @@ mutation ($table:String!, $rows:[JSON!]!) {
             if (!File.Exists(_outboxPath)) return;
 
             var tmp = _outboxPath + ".tmp";
-            try { File.Move(_outboxPath, tmp, true); }
+            try { File.Move(_outboxPath, tmp); }
             catch
             {
                 // 다른 프로세스가 사용 중일 수 있음
@@ -279,8 +281,10 @@ mutation ($table:String!, $rows:[JSON!]!) {
   }
 }";
 
-            foreach (var (table, rows) in byTable)
+            foreach (var kv in byTable)
             {
+                var table = kv.Key;
+                var rows = kv.Value;
                 int chunkSize = PickBatchSize(rows);
                 for (int i = 0; i < rows.Count; i += chunkSize)
                 {

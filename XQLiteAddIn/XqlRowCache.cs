@@ -25,7 +25,7 @@ namespace XQLite.AddIn
             using var sha = SHA256.Create();
             var bytes = Encoding.UTF8.GetBytes(sb.ToString());
             var hash = sha.ComputeHash(bytes);
-            return Convert.ToHexString(hash);
+            return Compat.ToHexString(hash);
         }
 
         public static bool IsChanged(string table, string rowKey, string hash)

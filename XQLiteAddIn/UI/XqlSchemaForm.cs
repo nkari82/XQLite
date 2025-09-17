@@ -11,7 +11,7 @@ namespace XQLite.AddIn
     public sealed class XqlSchemaForm : Form
     {
         private static XqlSchemaForm? _inst;
-        public static void ShowSingleton()
+        internal static void ShowSingleton()
         {
             if (_inst == null || _inst.IsDisposed) _inst = new XqlSchemaForm();
             _inst.Show(); _inst.BringToFront();

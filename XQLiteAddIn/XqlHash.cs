@@ -4,6 +4,7 @@ using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
 
+
 namespace XQLite.AddIn
 {
     public static class XqlHash
@@ -22,7 +23,7 @@ namespace XQLite.AddIn
             }
             var bytes = Encoding.UTF8.GetBytes(sb.ToString());
             var hash = _sha.ComputeHash(bytes);
-            return Convert.ToHexString(hash);
+            return Compat.ToHexString(hash);
         }
     }
 }

@@ -23,7 +23,7 @@ namespace XQLite.AddIn
 
         private CheckBox chkSecure = new() { Text = "Protect API Key (DPAPI)", AutoSize = true };
 
-        public static void ShowSingleton()
+        internal static void ShowSingleton()
         {
             if (_instance == null || _instance.IsDisposed)
                 _instance = new XqlConfigForm();

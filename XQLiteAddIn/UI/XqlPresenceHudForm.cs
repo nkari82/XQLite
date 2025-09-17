@@ -7,7 +7,15 @@ namespace XQLite.AddIn
 {
     public sealed class XqlPresenceHudForm : Form
     {
-        private static XqlPresenceHudForm? _inst; public static void ShowSingleton() { if (_inst == null || _inst.IsDisposed) _inst = new XqlPresenceHudForm(); _inst.Show(); _inst.BringToFront(); }
+        private static XqlPresenceHudForm? _inst; 
+        
+        internal static void ShowSingleton() 
+        { 
+            if (_inst == null || _inst.IsDisposed) 
+                _inst = new XqlPresenceHudForm(); 
+            _inst.Show(); 
+            _inst.BringToFront(); 
+        }
 
         private ListView lv = new(); private Timer auto = new() { Interval = 2000 };
 

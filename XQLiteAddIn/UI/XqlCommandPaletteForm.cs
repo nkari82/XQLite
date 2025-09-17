@@ -7,7 +7,7 @@ namespace XQLite.AddIn
     public sealed class XqlCommandPaletteForm : Form
     {
         private static XqlCommandPaletteForm? _inst;
-        public static void ShowSingleton() 
+        internal static void ShowSingleton() 
         { 
             if (_inst == null || _inst.IsDisposed) 
                 _inst = new XqlCommandPaletteForm(); 

@@ -29,11 +29,11 @@ namespace XQLite.AddIn
         private static readonly ConcurrentDictionary<string, LockInfo> _locksByKey = new(StringComparer.OrdinalIgnoreCase);
         private static Timer? _timer; // 3s 주기로 refresh
 
-        public static void Start()
+        internal static void Start()
         {
             _timer = new Timer(async _ => await RefreshAsync(), null, 0, 3000);
         }
-        public static void Stop() { _timer?.Dispose(); _timer = null; _locksById.Clear(); _locksByKey.Clear(); }
+        internal static void Stop() { _timer?.Dispose(); _timer = null; _locksById.Clear(); _locksByKey.Clear(); }
 
         public static async Task<bool> AcquireColumnAsync(string table, string column, int ttlSec = 10)
             => await AcquireAsync(new() { { "type", "column" }, { "table", table }, { "column", column } }, ttlSec);

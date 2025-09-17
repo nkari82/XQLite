@@ -19,7 +19,7 @@ namespace XQLite.AddIn
             SubscribeRowsChanged();
         }
 
-        public static void Stop()
+        internal static void Stop()
         {
             try { _sub?.Dispose(); } catch { }
             _sub = null;

@@ -31,7 +31,7 @@ namespace XQLite.AddIn
         private static readonly ConcurrentQueue<LogItem> _recent = new();
         private static int _recentCapacity = 2000;
 
-        public static void Start(string? dir = null, int recentCapacity = 2000)
+        internal static void Start(string? dir = null, int recentCapacity = 2000)
         {
             if (dir != null) { _logDir = dir; _logPath = Path.Combine(_logDir, "xqlite.log"); }
             _recentCapacity = Math.Max(100, recentCapacity);
@@ -41,7 +41,7 @@ namespace XQLite.AddIn
             if (!_worker.IsAlive) _worker.Start();
         }
 
-        public static void Stop()
+        internal static void Stop()
         {
             _running = false;
             _q.CompleteAdding();

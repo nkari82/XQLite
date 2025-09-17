@@ -30,7 +30,7 @@ namespace XQLite.AddIn
             catch { return string.Empty; }
         }
 
-        public static void Clear()
+        internal static void Clear()
         {
             try { if (File.Exists(PathKey)) File.Delete(PathKey); } catch { }
         }

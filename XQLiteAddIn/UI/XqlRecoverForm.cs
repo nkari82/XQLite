@@ -13,7 +13,13 @@ namespace XQLite.AddIn
     public sealed class XqlRecoverForm : Form
     {
         private static XqlRecoverForm? _inst;
-        public static void ShowSingleton() { if (_inst == null || _inst.IsDisposed) _inst = new XqlRecoverForm(); _inst.Show(); _inst.BringToFront(); }
+        internal static void ShowSingleton() 
+        { 
+            if (_inst == null || _inst.IsDisposed) 
+                _inst = new XqlRecoverForm(); 
+            _inst.Show(); 
+            _inst.BringToFront(); 
+        }
 
         private ProgressBar pb = new() { Dock = DockStyle.Top, Height = 18, Minimum = 0, Maximum = 100 };
         private Label lbl = new() { Dock = DockStyle.Top, Height = 22, Text = "Ready" };
