@@ -1,7 +1,9 @@
 ﻿using ExcelDna.Integration.CustomUI;
+using System.Runtime.InteropServices;
 
 namespace XQLite.AddIn
 {
+    [ComVisible(true)]
     public sealed class XqlRibbon : ExcelRibbon
     {
         public override string GetCustomUI(string ribbonId) => @"
