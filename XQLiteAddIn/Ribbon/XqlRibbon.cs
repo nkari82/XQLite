@@ -1,5 +1,4 @@
 ﻿using ExcelDna.Integration.CustomUI;
-using System.Xml.Schema;
 
 namespace XQLite.AddIn
 {

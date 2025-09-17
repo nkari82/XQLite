@@ -5,7 +5,6 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
-using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -31,11 +30,6 @@ namespace XQLite.AddIn
         private static string _outboxPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
             "XQLite", "outbox.ndjson");
-
-        private static readonly JsonSerializerOptions _jsonOpts = new()
-        {
-            WriteIndented = false
-        };
 
         // ---------------------------
         // 초기화 & 설정
@@ -232,12 +226,12 @@ mutation ($table:String!, $rows:[JSON!]!) {
                 foreach (var r in rows)
                 {
                     // NDJSON: { ts, table, row }
-                    var line = JsonSerializer.Serialize(new OutItem
+                    var line = XqlJson.Serialize(new OutItem
                     {
                         ts = now,
                         table = table,
                         row = r
-                    }, _jsonOpts);
+                    }, false);
                     await sw.WriteLineAsync(line, ct);
                 }
             }
@@ -264,7 +258,7 @@ mutation ($table:String!, $rows:[JSON!]!) {
             {
                 try
                 {
-                    var obj = JsonSerializer.Deserialize<OutItem>(line);
+                    var obj = XqlJson.Deserialize<OutItem>(line);
                     if (obj?.row is null || string.IsNullOrWhiteSpace(obj.table)) continue;
                     if (!byTable.TryGetValue(obj.table, out var list)) byTable[obj.table] = list = new();
                     list.Add(obj.row);

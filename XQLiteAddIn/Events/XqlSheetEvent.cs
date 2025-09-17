@@ -12,7 +12,7 @@ namespace XQLite.AddIn
         private static Excel.Application? _app;
         private static bool _hooked;
 
-        public static void Hook()
+        internal static void Hook()
         {
             if (_hooked) return;
             _app = (Excel.Application)ExcelDnaUtil.Application;
@@ -21,7 +21,7 @@ namespace XQLite.AddIn
             XqlLog.Info("SheetEvents hooked");
         }
 
-        public static void Unhook()
+        internal static void Unhook()
         {
             if (!_hooked || _app is null) return;
             try { _app.SheetChange -= App_SheetChange; } catch { }

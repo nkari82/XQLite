@@ -1,7 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Text.Json;
 
 namespace XQLite.AddIn
 {
@@ -24,7 +23,7 @@ namespace XQLite.AddIn
             {
                 Directory.CreateDirectory(Dir);
                 var it = new Item { table = table, row = row, at = DateTime.UtcNow };
-                var json = JsonSerializer.Serialize(it);
+                var json = XqlJson.Serialize(it);
                 lock (_gate) File.AppendAllText(PathBox, json + "\n");
             }
             catch { }
@@ -42,7 +41,7 @@ namespace XQLite.AddIn
                     foreach (var line in File.ReadLines(tmp))
                     {
                         if (string.IsNullOrWhiteSpace(line)) continue;
-                        Item? it = null; try { it = JsonSerializer.Deserialize<Item>(line); } catch { }
+                        Item? it = null; try { it = XqlJson.Deserialize<Item>(line); } catch { }
                         if (it != null) yield return it;
                     }
                 }

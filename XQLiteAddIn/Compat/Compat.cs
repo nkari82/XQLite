@@ -9,31 +9,31 @@ namespace XQLite.AddIn
 #if !NET5_0_OR_GREATER && !NETCOREAPP3_0_OR_GREATER
     internal static class Compat
     {
-        public static TValue? GetValueOrDefault<TKey, TValue>(
+        internal static TValue? GetValueOrDefault<TKey, TValue>(
             this IDictionary<TKey, TValue> dict, TKey key)
         {
             return dict.TryGetValue(key, out var value) ? value : default;
         }
 
-        public static TValue GetValueOrDefault<TKey, TValue>(
+        internal static TValue GetValueOrDefault<TKey, TValue>(
             this IDictionary<TKey, TValue> dict, TKey key, TValue defaultValue)
         {
             return dict.TryGetValue(key, out var value) ? value : defaultValue;
         }
 
-        public static TValue? GetValueOrDefault<TKey, TValue>(
+        internal static TValue? GetValueOrDefault<TKey, TValue>(
             this Dictionary<TKey, TValue> dict, TKey key)
         {
             return dict.TryGetValue(key, out var value) ? value : default;
         }
 
-        public static TValue GetValueOrDefault<TKey, TValue>(
+        internal static TValue GetValueOrDefault<TKey, TValue>(
             this Dictionary<TKey, TValue> dict, TKey key, TValue defaultValue)
         {
             return dict.TryGetValue(key, out var value) ? value : defaultValue;
         }
 
-        public static string ToHexString(byte[] bytes)
+        internal static string ToHexString(byte[] bytes)
         {
             if (bytes == null) throw new ArgumentNullException(nameof(bytes));
             // 빠른 대문자 HEX 변환 (할당 1회)
@@ -48,27 +48,27 @@ namespace XQLite.AddIn
             return new string(chars);
         }
 
-        public static void Deconstruct<TKey, TValue>(this KeyValuePair<TKey, TValue> kvp,
+        internal static void Deconstruct<TKey, TValue>(this KeyValuePair<TKey, TValue> kvp,
                                              out TKey key, out TValue value)
         {
             key = kvp.Key;
             value = kvp.Value;
         }
 
-        public static async Task WriteLineAsync(this StreamWriter sw, string str, CancellationToken ct)
+        internal static async Task WriteLineAsync(this StreamWriter sw, string str, CancellationToken ct)
         {
             ct.ThrowIfCancellationRequested();
             await sw.WriteLineAsync(str);
             ct.ThrowIfCancellationRequested();
         }
 
-        public static int Clamp(int value, int min, int max)
+        internal static int Clamp(int value, int min, int max)
             => value < min ? min : (value > max ? max : value);
 
-        public static long Clamp(long value, long min, long max)
+        internal static long Clamp(long value, long min, long max)
             => value < min ? min : (value > max ? max : value);
 
-        public static double Clamp(double value, double min, double max)
+        internal static double Clamp(double value, double min, double max)
             => value < min ? min : (value > max ? max : value);
     }
 #endif

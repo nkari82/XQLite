@@ -2,7 +2,6 @@
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
-using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -35,13 +34,13 @@ namespace XQLite.AddIn
         }
         internal static void Stop() { _timer?.Dispose(); _timer = null; _locksById.Clear(); _locksByKey.Clear(); }
 
-        public static async Task<bool> AcquireColumnAsync(string table, string column, int ttlSec = 10)
+        internal static async Task<bool> AcquireColumnAsync(string table, string column, int ttlSec = 10)
             => await AcquireAsync(new() { { "type", "column" }, { "table", table }, { "column", column } }, ttlSec);
 
-        public static async Task<bool> AcquireCellAsync(string sheet, string address, int ttlSec = 10)
+        internal static async Task<bool> AcquireCellAsync(string sheet, string address, int ttlSec = 10)
             => await AcquireAsync(new() { { "type", "cell" }, { "sheet", sheet }, { "address", address } }, ttlSec);
 
-        public static async Task<bool> ReleaseAsync(string lockId)
+        internal static async Task<bool> ReleaseAsync(string lockId)
         {
             try
             {
@@ -85,13 +84,13 @@ namespace XQLite.AddIn
             catch { /* 서버가 락을 지원 안하면 조용히 무시 */ }
         }
 
-        public static bool IsLockedColumn(string table, string column)
+        internal static bool IsLockedColumn(string table, string column)
         {
             var key = MakeKey(new() { { "type", "column" }, { "table", table }, { "column", column } });
             return _locksByKey.ContainsKey(key);
         }
 
-        public static bool IsLockedCell(string sheet, string address)
+        internal static bool IsLockedCell(string sheet, string address)
         {
             var key = MakeKey(new() { { "type", "cell" }, { "sheet", sheet }, { "address", address } });
             return _locksByKey.ContainsKey(key);

@@ -9,7 +9,7 @@ namespace XQLite.AddIn
 {
     public static class XqlRecoverService
     {
-        public static async Task RecoverAllTablesAsync(int batch = 500)
+        internal static async Task RecoverAllTablesAsync(int batch = 500)
         {
             var app = (Excel.Application)ExcelDnaUtil.Application;
             foreach (Excel.Worksheet ws in app.Worksheets)

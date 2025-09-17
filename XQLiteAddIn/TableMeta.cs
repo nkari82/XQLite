@@ -2,7 +2,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Text.Json.Serialization;
+using Newtonsoft.Json;
 using Excel = Microsoft.Office.Interop.Excel;
 
 namespace XQLite.AddIn
@@ -12,18 +12,18 @@ namespace XQLite.AddIn
     /// </summary>
     public sealed class ColMeta
     {
-        [JsonPropertyName("name")] public string Name { get; set; } = "";          // DB 컬럼명 (정규화)
-        [JsonPropertyName("header")] public string OriginalHeader { get; set; } = ""; // 엑셀 헤더 원문
-        [JsonPropertyName("type")] public string Type { get; set; } = "TEXT";       // SQLite 타입(가벼운 문자열)
-        [JsonPropertyName("nullable")] public bool Nullable { get; set; } = true;
-        [JsonPropertyName("locked")] public bool Locked { get; set; } = false;        // 컬럼 락(편집 금지)
-        [JsonPropertyName("is_meta")] public bool IsMeta { get; set; } = false;        // 메타 컬럼 여부(id/row_version/…)
-        [JsonPropertyName("default")] public string? Default { get; set; }             // DEFAULT expr
-        [JsonPropertyName("check")] public string? Check { get; set; }               // CHECK expr
-        [JsonPropertyName("ref_table")] public string? RefTable { get; set; }            // FK: 참조 테이블
-        [JsonPropertyName("ref_column")] public string? RefColumn { get; set; }           // FK: 참조 컬럼
-        [JsonPropertyName("ordinal")] public int Ordinal { get; set; }                 // 1-base 열 순서
-        [JsonPropertyName("max_len")] public int? MaxLen { get; set; }                 // TEXT 길이 힌트(검증용)
+        [JsonProperty("name")] public string Name { get; set; } = "";          // DB 컬럼명 (정규화)
+        [JsonProperty("header")] public string OriginalHeader { get; set; } = ""; // 엑셀 헤더 원문
+        [JsonProperty("type")] public string Type { get; set; } = "TEXT";       // SQLite 타입(가벼운 문자열)
+        [JsonProperty("nullable")] public bool Nullable { get; set; } = true;
+        [JsonProperty("locked")] public bool Locked { get; set; } = false;        // 컬럼 락(편집 금지)
+        [JsonProperty("is_meta")] public bool IsMeta { get; set; } = false;        // 메타 컬럼 여부(id/row_version/…)
+        [JsonProperty("default")] public string? Default { get; set; }             // DEFAULT expr
+        [JsonProperty("check")] public string? Check { get; set; }               // CHECK expr
+        [JsonProperty("ref_table")] public string? RefTable { get; set; }            // FK: 참조 테이블
+        [JsonProperty("ref_column")] public string? RefColumn { get; set; }           // FK: 참조 컬럼
+        [JsonProperty("ordinal")] public int Ordinal { get; set; }                 // 1-base 열 순서
+        [JsonProperty("max_len")] public int? MaxLen { get; set; }                 // TEXT 길이 힌트(검증용)
 
         public override string ToString() => $"{Name} {Type}{(Nullable ? "" : " NOT NULL")}{(Default != null ? " DEFAULT " + Default : "")}";
     }
@@ -33,13 +33,13 @@ namespace XQLite.AddIn
     /// </summary>
     public sealed class TableMeta
     {
-        [JsonPropertyName("name")] public string Name { get; set; } = "";           // DB 테이블명: "Sheet.ListObject"
-        [JsonPropertyName("display_name")] public string? DisplayName { get; set; }         // UI 표시명
-        [JsonPropertyName("worksheet")] public string WorksheetName { get; set; } = "";
-        [JsonPropertyName("list_object")] public string ListObjectName { get; set; } = "";
-        [JsonPropertyName("primary_key")] public string? PrimaryKey { get; set; }          // ex) "id"
-        [JsonPropertyName("unique_key")] public string? UniqueKey { get; set; }
-        [JsonPropertyName("columns")] public List<ColMeta> Columns { get; set; } = new();
+        [JsonProperty("name")] public string Name { get; set; } = "";           // DB 테이블명: "Sheet.ListObject"
+        [JsonProperty("display_name")] public string? DisplayName { get; set; }         // UI 표시명
+        [JsonProperty("worksheet")] public string WorksheetName { get; set; } = "";
+        [JsonProperty("list_object")] public string ListObjectName { get; set; } = "";
+        [JsonProperty("primary_key")] public string? PrimaryKey { get; set; }          // ex) "id"
+        [JsonProperty("unique_key")] public string? UniqueKey { get; set; }
+        [JsonProperty("columns")] public List<ColMeta> Columns { get; set; } = new();
 
         [JsonIgnore]
         public Dictionary<string, ColMeta> ByName =>

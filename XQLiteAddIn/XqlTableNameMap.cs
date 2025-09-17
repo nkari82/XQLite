@@ -2,7 +2,6 @@
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Text.Json;
 
 namespace XQLite.AddIn
 {
@@ -41,7 +40,7 @@ namespace XQLite.AddIn
                 var path = Path.Combine(dir, "tablemap.json");
                 if (!File.Exists(path)) return new();
                 var json = File.ReadAllText(path);
-                var dict = JsonSerializer.Deserialize<Dictionary<string, string>>(json) ?? new();
+                var dict = XqlJson.Deserialize<Dictionary<string, string>>(json) ?? new();
                 // 키를 Excel ListObject 이름 기준의 대/소문자 구분없이 취급
                 return new Dictionary<string, string>(dict, StringComparer.OrdinalIgnoreCase);
             }

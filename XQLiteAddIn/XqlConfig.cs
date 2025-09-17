@@ -1,8 +1,6 @@
-﻿#nullable enable
-using ExcelDna.Integration;
+﻿using ExcelDna.Integration;
 using System;
 using System.IO;
-using System.Text.Json;
 using Excel = Microsoft.Office.Interop.Excel;
 
 
@@ -47,7 +45,7 @@ namespace XQLite.AddIn
         {
             var sidecar = TryWorkbookSidecar();
             var path = preferSidecar && sidecar is not null ? sidecar : RoamingPath();
-            var json = JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true });
+            var json = XqlJson.Serialize(this, true);
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
             File.WriteAllText(path, json);
             _resolvedPath = path;
@@ -73,7 +71,7 @@ namespace XQLite.AddIn
 
         private static bool TryJson(string json, ref XqlConfig cfg)
         {
-            try { var x = JsonSerializer.Deserialize<XqlConfig>(json); if (x is null) return false; Copy(x, cfg); return true; }
+            try { var x = XqlJson.Deserialize<XqlConfig>(json); if (x is null) return false; Copy(x, cfg); return true; }
             catch { return false; }
         }
 

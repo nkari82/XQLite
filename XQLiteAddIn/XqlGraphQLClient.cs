@@ -1,7 +1,7 @@
 ﻿// XqlGraphQLClient.cs (추가/수정)
 using GraphQL;
 using GraphQL.Client.Http;
-using GraphQL.Client.Serializer.SystemTextJson;
+using GraphQL.Client.Serializer.Newtonsoft;
 using System;
 using System.Net.Http.Headers;
 using System.Threading;
@@ -27,7 +27,7 @@ namespace XQLite.AddIn
                 // 쿼리/뮤테이션은 HTTP, 구독은 WebSocket 사용(기본값)
             };
 
-            _client = new GraphQLHttpClient(options, new SystemTextJsonSerializer());
+            _client = new GraphQLHttpClient(options, new NewtonsoftJsonSerializer());
 
             string apiKey = cfg.ApiKey == "__DPAPI__" ? XqlSecrets.LoadApiKey() : cfg.ApiKey;
             if (!string.IsNullOrEmpty(apiKey))

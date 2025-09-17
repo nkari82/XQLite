@@ -6,7 +6,6 @@
 
 using System;
 using System.IO;
-using System.Text.Json;
 using System.Windows.Forms;
 using ExcelDna.Integration;
 
@@ -118,7 +117,7 @@ namespace XQLite.AddIn
             {
                 if (!File.Exists(CfgPath)) return null;
                 var json = File.ReadAllText(CfgPath);
-                return JsonSerializer.Deserialize<XqlConfig>(json);
+                return XqlJson.Deserialize<XqlConfig>(json);
             }
             catch { return null; }
         }
@@ -128,7 +127,7 @@ namespace XQLite.AddIn
             try
             {
                 Directory.CreateDirectory(AppDir);
-                var json = JsonSerializer.Serialize(cfg, new JsonSerializerOptions { WriteIndented = true });
+                var json = XqlJson.Serialize(cfg, true);
                 File.WriteAllText(CfgPath, json);
             }
             catch (Exception ex)

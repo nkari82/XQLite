@@ -11,7 +11,7 @@ namespace XQLite.AddIn
         private static XqlConfig? _cfg;
         private static long _sinceVersion;
 
-        public static void Start(XqlConfig cfg, long startSince = 0)
+        internal static void Start(XqlConfig cfg, long startSince = 0)
         {
             _cfg = cfg;
             _sinceVersion = startSince;

@@ -3,14 +3,13 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
-using System.Text.Json;
 using System.Threading.Tasks;
 
 namespace XQLite.AddIn
 {
     public static class XqlExportService
     {
-        public static async Task ExportSnapshotAsync(long since = 0, string? targetDir = null, bool csv = false)
+        internal static async Task ExportSnapshotAsync(long since = 0, string? targetDir = null, bool csv = false)
         {
             const string q = "query($since:Long){ rows(since_version:$since){ table, rows, max_row_version } }";
             var resp = await XqlGraphQLClient.QueryAsync<XqlUpsert.RowsResp>(q, new { since });
@@ -27,7 +26,8 @@ namespace XQLite.AddIn
                 {
                     // JSON
                     var path = Path.Combine(dir, $"{table}_{ts}.json");
-                    var json = JsonSerializer.Serialize(blk.rows ?? Array.Empty<Dictionary<string, object?>>(), new JsonSerializerOptions { WriteIndented = true });
+                    var json = XqlJson.Serialize(blk.rows ?? Array.Empty<Dictionary<string, object?>>(), true);
+
                     File.WriteAllText(path, json, Encoding.UTF8);
                 }
                 else
