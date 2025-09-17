@@ -6,101 +6,101 @@ using System.Text.Json;
 using Excel = Microsoft.Office.Interop.Excel;
 
 
-namespace XQLite.AddIn;
-
-
-public sealed class XqlConfig
+namespace XQLite.AddIn
 {
-    public string Endpoint { get; set; } = "http://localhost:3000/graphql";
-    public string ApiKey { get; set; } = "";
-    public string Nickname { get; set; } = Environment.UserName;
-    public string Project { get; set; } = "";
-
-
-    public int PullSec { get; set; } = 10;
-    public int DebounceMs { get; set; } = 2000;
-    public int HeartbeatSec { get; set; } = 3;
-    public int LockTtlSec { get; set; } = 10;
-
-
-    private string? _resolvedPath;
-
-
-    public static XqlConfig Load(string configSheetName = "XQLite")
+    public sealed class XqlConfig
     {
-        var cfg = new XqlConfig();
-        if (TryEnv("XQL_CONFIG", ref cfg)) return cfg;
+        public string Endpoint { get; set; } = "http://localhost:3000/graphql";
+        public string ApiKey { get; set; } = "";
+        public string Nickname { get; set; } = Environment.UserName;
+        public string Project { get; set; } = "";
 
 
-        var sidecar = TryWorkbookSidecar();
-        if (sidecar is not null && TryFile(sidecar, ref cfg)) return cfg;
+        public int PullSec { get; set; } = 10;
+        public int DebounceMs { get; set; } = 2000;
+        public int HeartbeatSec { get; set; } = 3;
+        public int LockTtlSec { get; set; } = 10;
 
 
-        var roaming = RoamingPath();
-        if (TryFile(roaming, ref cfg)) return cfg;
-
-        cfg._resolvedPath = sidecar ?? roaming;
-        return cfg;
-    }
+        private string? _resolvedPath;
 
 
-    public void Save(bool preferSidecar = true)
-    {
-        var sidecar = TryWorkbookSidecar();
-        var path = preferSidecar && sidecar is not null ? sidecar : RoamingPath();
-        var json = JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true });
-        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        File.WriteAllText(path, json);
-        _resolvedPath = path;
-    }
-
-
-    private static bool TryEnv(string name, ref XqlConfig cfg)
-    {
-        var v = Environment.GetEnvironmentVariable(name);
-        if (string.IsNullOrWhiteSpace(v)) return false;
-        if (v.TrimStart().StartsWith("{"))
-            return TryJson(v, ref cfg);
-        if (File.Exists(v))
-            return TryFile(v, ref cfg);
-        return false;
-    }
-
-    private static bool TryFile(string path, ref XqlConfig cfg)
-    {
-        try { return TryJson(File.ReadAllText(path), ref cfg) && (cfg._resolvedPath = path) == path; }
-        catch { return false; }
-    }
-
-    private static bool TryJson(string json, ref XqlConfig cfg)
-    {
-        try { var x = JsonSerializer.Deserialize<XqlConfig>(json); if (x is null) return false; Copy(x, cfg); return true; }
-        catch { return false; }
-    }
-
-    private static void Copy(XqlConfig s, XqlConfig d)
-    {
-        d.Endpoint = s.Endpoint; d.ApiKey = s.ApiKey; d.Nickname = s.Nickname; d.Project = s.Project;
-        d.PullSec = s.PullSec; d.DebounceMs = s.DebounceMs; d.HeartbeatSec = s.HeartbeatSec; d.LockTtlSec = s.LockTtlSec;
-    }
-
-    private static string RoamingPath()
-    {
-        var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "XQLite");
-        Directory.CreateDirectory(dir);
-        return Path.Combine(dir, "config.json");
-    }
-
-    private static string? TryWorkbookSidecar()
-    {
-        try
+        public static XqlConfig Load()
         {
-            var app = (Excel.Application)ExcelDnaUtil.Application;
-            var wb = (Excel.Workbook)app.ActiveWorkbook;
-            var full = wb?.FullName;
-            if (string.IsNullOrWhiteSpace(full)) return null;
-            return Path.ChangeExtension(full, ".xql.json");
+            var cfg = new XqlConfig();
+            if (TryEnv("XQL_CONFIG", ref cfg)) return cfg;
+
+
+            var sidecar = TryWorkbookSidecar();
+            if (sidecar is not null && TryFile(sidecar, ref cfg)) return cfg;
+
+
+            var roaming = RoamingPath();
+            if (TryFile(roaming, ref cfg)) return cfg;
+
+            cfg._resolvedPath = sidecar ?? roaming;
+            return cfg;
         }
-        catch { return null; }
+
+
+        public void Save(bool preferSidecar = true)
+        {
+            var sidecar = TryWorkbookSidecar();
+            var path = preferSidecar && sidecar is not null ? sidecar : RoamingPath();
+            var json = JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true });
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            File.WriteAllText(path, json);
+            _resolvedPath = path;
+        }
+
+
+        private static bool TryEnv(string name, ref XqlConfig cfg)
+        {
+            var v = Environment.GetEnvironmentVariable(name);
+            if (string.IsNullOrWhiteSpace(v)) return false;
+            if (v.TrimStart().StartsWith("{"))
+                return TryJson(v, ref cfg);
+            if (File.Exists(v))
+                return TryFile(v, ref cfg);
+            return false;
+        }
+
+        private static bool TryFile(string path, ref XqlConfig cfg)
+        {
+            try { return TryJson(File.ReadAllText(path), ref cfg) && (cfg._resolvedPath = path) == path; }
+            catch { return false; }
+        }
+
+        private static bool TryJson(string json, ref XqlConfig cfg)
+        {
+            try { var x = JsonSerializer.Deserialize<XqlConfig>(json); if (x is null) return false; Copy(x, cfg); return true; }
+            catch { return false; }
+        }
+
+        private static void Copy(XqlConfig s, XqlConfig d)
+        {
+            d.Endpoint = s.Endpoint; d.ApiKey = s.ApiKey; d.Nickname = s.Nickname; d.Project = s.Project;
+            d.PullSec = s.PullSec; d.DebounceMs = s.DebounceMs; d.HeartbeatSec = s.HeartbeatSec; d.LockTtlSec = s.LockTtlSec;
+        }
+
+        private static string RoamingPath()
+        {
+            var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "XQLite");
+            Directory.CreateDirectory(dir);
+            return Path.Combine(dir, "config.json");
+        }
+
+        private static string? TryWorkbookSidecar()
+        {
+            try
+            {
+                var app = (Excel.Application)ExcelDnaUtil.Application;
+                var wb = (Excel.Workbook)app.ActiveWorkbook;
+                var full = wb?.FullName;
+                if (string.IsNullOrWhiteSpace(full)) return null;
+                return Path.ChangeExtension(full, ".xql.json");
+            }
+            catch { return null; }
+        }
     }
 }

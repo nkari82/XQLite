@@ -1,39 +1,149 @@
-﻿using ExcelDna.Integration;
-using Excel = Microsoft.Office.Interop.Excel;
+﻿// XqlAddIn.cs (no partial)
+// - Excel-DNA IExcelAddIn 엔트리포인트를 단일 파일로 통합
+// - AutoOpen/AutoClose에서 런타임 시작/정지
+// - 리본/단축키에서 부르는 공개 명령 메서드(Commit/Recover/Inspector/Export/Presence/Schema/Diag)
+// - 정책: 시트엔 절대 쓰지 않음(표시/색칠/코멘트 X)
 
+using System;
+using System.IO;
+using System.Text.Json;
+using System.Windows.Forms;
+using ExcelDna.Integration;
 
-namespace XQLite.AddIn;
-
-
-public sealed class XqlAddIn : IExcelAddIn
+namespace XQLite.AddIn
 {
-    public static Excel.Application App => (Excel.Application)ExcelDnaUtil.Application;
-    private static XqlConfig? _cfg;
-
-
-    public void AutoOpen()
+    public sealed class XqlAddIn : IExcelAddIn
     {
-        // 외부 컨피그만 사용 (시트 읽지 않음)
-        _cfg = XqlConfig.Load();
+        // ====== Config ======
+        public static XqlConfig? Cfg { get; internal set; }
+        private static readonly string AppDir =
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "XQLite");
+        private static readonly string CfgPath = Path.Combine(AppDir, "config.json");
 
+        public void AutoOpen()
+        {
+            try
+            {
+                Directory.CreateDirectory(AppDir);
+                Cfg = LoadConfigWithOverrides();
+                StartRuntime(Cfg!);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"XQLite failed to start:\r\n{ex}", "XQLite", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
 
-        // GraphQL 클라이언트 초기화
-        XqlGraphQLClient.Init(_cfg);
+        public void AutoClose()
+        {
+            try
+            {
+                StopRuntime();
+            }
+            catch { /* ignore */ }
+        }
 
+        // ====== Runtime lifecycle ======
+        internal static void RestartRuntime(XqlConfig cfg)
+        {
+            StopRuntime();
+            StartRuntime(cfg);
+        }
 
-        // 타이머 기반 서비스 시작 (시트 반영 없이 왕복만)
-        XqlPresenceService.Start(_cfg);
-        XqlSyncService.Start(_cfg);
+        internal static void StartRuntime(XqlConfig cfg)
+        {
+            // 1) 기본 서비스 초기화
+            XqlGraphQLClient.Init(cfg);
+            XqlPresenceService.Start(cfg);
 
+            // 2) 락/동기화/구독 (필요 정책대로 택1/병행)
+            XqlLockService.Start();
 
-        // 옵션: 데모용 테스트 행 하나 큐에 넣기 (원하면 주석 해제)
-        // XqlSyncService.QueueUpsert("items", new Dictionary<string, object?>{ {"id", 1}, {"name", "Sword"}, {"deleted", 0} });
+            XqlUpsert.Init(cfg.DebounceMs);
+            XqlSubscriptionService.Start(cfg, startSince: 0);
+
+            // 3) 시트 이벤트 후킹
+            XqlSheetEvents.Hook();
+
+            // 4) 파일 로거(부트스트랩에서 이미 켰다면 생략 가능)
+            XqlFileLogger.Start();
+        }
+
+        internal static void StopRuntime()
+        {
+            XqlSheetEvents.Unhook();
+            try { XqlSubscriptionService.Stop(); } catch { }
+            try { XqlPresenceService.Stop(); } catch { }
+            try { XqlLockService.Stop(); } catch { }
+
+            // 3) 파일 로거 종료(부트스트랩에서 관리 중이면 생략)
+            try { XqlFileLogger.Stop(); } catch { }
+        }
+
+        // ====== Config load/save (Env → File → Defaults) ======
+        private static XqlConfig LoadConfigWithOverrides()
+        {
+            var cfg = LoadConfigFromFile() ?? new XqlConfig();
+
+            // 1) 환경변수 우선 적용
+            //    (이름이 다르면 적합하게 교체)
+            string? ep = Environment.GetEnvironmentVariable("XQLITE_ENDPOINT");
+            if (!string.IsNullOrWhiteSpace(ep)) cfg.Endpoint = ep.Trim();
+
+            string? k = Environment.GetEnvironmentVariable("XQLITE_APIKEY");
+            if (!string.IsNullOrWhiteSpace(k)) cfg.ApiKey = k.Trim();
+
+            string? nick = Environment.GetEnvironmentVariable("XQLITE_NICKNAME");
+            if (!string.IsNullOrWhiteSpace(nick)) cfg.Nickname = nick.Trim();
+
+            string? proj = Environment.GetEnvironmentVariable("XQLITE_PROJECT");
+            if (!string.IsNullOrWhiteSpace(proj)) cfg.Project = proj.Trim();
+
+            // 2) 기본값 보정 (없으면 안전한 값)
+            cfg.PullSec = cfg.PullSec <= 0 ? 10 : cfg.PullSec;
+            cfg.DebounceMs = cfg.DebounceMs <= 0 ? 2000 : cfg.DebounceMs;
+            cfg.HeartbeatSec = cfg.HeartbeatSec <= 0 ? 3 : cfg.HeartbeatSec;
+            cfg.LockTtlSec = cfg.LockTtlSec <= 0 ? 10 : cfg.LockTtlSec;
+
+            return cfg;
+        }
+
+        private static XqlConfig? LoadConfigFromFile()
+        {
+            try
+            {
+                if (!File.Exists(CfgPath)) return null;
+                var json = File.ReadAllText(CfgPath);
+                return JsonSerializer.Deserialize<XqlConfig>(json);
+            }
+            catch { return null; }
+        }
+
+        internal static void SaveConfigToFile(XqlConfig cfg)
+        {
+            try
+            {
+                Directory.CreateDirectory(AppDir);
+                var json = JsonSerializer.Serialize(cfg, new JsonSerializerOptions { WriteIndented = true });
+                File.WriteAllText(CfgPath, json);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Failed to save config: " + ex.Message, "XQLite", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
     }
 
-
-    public void AutoClose()
+    internal static class XqlDiagExport
     {
-        XqlPresenceService.Stop();
-        XqlSyncService.Stop();
+        public static string ExportZip()
+        {
+            // TODO: STEP14에서 구현한 실제 Zip 수집 로직으로 교체
+            var path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                                    "XQLite", "diag", "xql_diag_dummy.zip");
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            File.WriteAllBytes(path, Array.Empty<byte>());
+            return path;
+        }
     }
 }
