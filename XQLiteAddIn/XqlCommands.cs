@@ -142,6 +142,10 @@ namespace XQLite.AddIn
             catch (Exception ex) { MessageBox.Show("Lock explorer failed: " + ex.Message, "XQLite"); }
         }
 
+        internal static void ExportDiagCommand()
+        {
+            
+        }
     }
 #endif
 }
