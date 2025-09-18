@@ -5,7 +5,7 @@ using Excel = Microsoft.Office.Interop.Excel;
 
 namespace XQLite.AddIn
 {
-    public static class XqlFastTableReader
+    internal static class XqlFastTableReader
     {
         public sealed record Slice(string WorksheetName, string ListObjectName, int BodyTop, int BodyRows, int Cols, int BodyLeft);
 

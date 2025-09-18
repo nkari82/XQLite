@@ -4,7 +4,7 @@ using System.Threading.Tasks;
 
 namespace XQLite.AddIn
 {
-    public static class XqlNetPolicy
+    internal static class XqlNetPolicy
     {
         private static int _failCount;
         private static DateTime _halfOpenAt = DateTime.MinValue;

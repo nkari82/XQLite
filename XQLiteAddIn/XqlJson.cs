@@ -5,7 +5,7 @@ using Newtonsoft.Json;
 
 namespace XQLite.AddIn
 {
-    public static class XqlJson
+    internal static class XqlJson
     {
         // 공통 설정: camelCase, null 무시, ISO 날짜, 인덴트 옵션
         public static readonly JsonSerializerSettings Settings = new JsonSerializerSettings

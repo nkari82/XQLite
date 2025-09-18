@@ -7,7 +7,7 @@ using Excel = Microsoft.Office.Interop.Excel;
 
 namespace XQLite.AddIn
 {
-    public static class XqlSheetEvents
+    internal static class XqlSheetEvents
     {
         private static Excel.Application? _app;
         private static bool _hooked;

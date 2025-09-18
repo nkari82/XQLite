@@ -1,55 +1,53 @@
 ﻿using ExcelDna.Integration;
 using System;
+using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace XQLite.AddIn
 {
-#if true
-    public static class XqlCommands
+    internal static class XqlCommands
     {
         [ExcelCommand(Name = "XQL.CmdPalette", Description = "Open XQLite command palette", ShortCut = "Ctrl-Shift-K")]
-        public static void CmdPalette()
+        internal static void CmdPalette()
         {
             XqlCommandPaletteForm.ShowSingleton();
         }
 
         [ExcelCommand(Name = "XQL.Config", Description = "Open XQLite Config")]
-        public static void ConfigCommand()
+        internal static void ConfigCommand()
         {
-            // 1
-            try 
-            { 
-                XqlConfigForm.ShowSingleton(); 
+            try
+            {
+                XqlConfigForm.ShowSingleton();
             }
             catch (Exception ex) { MessageBox.Show(ex.Message, "XQLite", MessageBoxButtons.OK, MessageBoxIcon.Error); }
         }
 
         [ExcelCommand(Name = "XQL.Commit", Description = "Commit pending changes", ShortCut = "Ctrl-Shift-C")]
-        public static void CommitCommand()
+        internal static void CommitCommand()
         {
             try { _ = XqlUpsert.FlushAsync(); }
             catch (Exception ex) { MessageBox.Show("Commit failed: " + ex.Message, "XQLite"); }
         }
 
         [ExcelCommand(Name = "XQL.Recover", Description = "Recover (batch upsert from current workbook)", ShortCut = "Ctrl-Shift-R")]
-        public static void RecoverCommand()
+        internal static void RecoverCommand()
         {
-            // 2
             try { XqlRecoverForm.ShowSingleton(); }
             catch (Exception ex) { MessageBox.Show("Recover UI failed: " + ex.Message, "XQLite"); }
         }
 
         [ExcelCommand(Name = "XQL.Inspector", Description = "Open Inspector", ShortCut = "Ctrl-Shift-I")]
-        public static void InspectorCommand()
+        internal static void InspectorCommand()
         {
-            // 3
             try { XqlInspectorForm.ShowSingleton(); }
             catch (Exception ex) { MessageBox.Show("Inspector failed: " + ex.Message, "XQLite"); }
         }
 
-
         [ExcelCommand(Name = "XQL.ExportSnapshot", Description = "Export rows snapshot as JSON/CSV", ShortCut = "Ctrl-Shift-E")]
-        public static void ExportSnapshotCommand()
+        internal static async void ExportSnapshotCommand()
         {
             try
             {
@@ -81,8 +79,7 @@ namespace XQLite.AddIn
                 Cursor.Current = Cursors.WaitCursor;
 
                 // 4) 실행 (동기 래핑)
-                XqlExportService.ExportSnapshotAsync(since, targetDir, csv)
-                                .GetAwaiter().GetResult();
+                await XqlExportService.ExportSnapshotAsync(since, targetDir, csv);
 
                 Cursor.Current = Cursors.Default;
                 MessageBox.Show(
@@ -99,53 +96,66 @@ namespace XQLite.AddIn
         }
 
         [ExcelCommand(Name = "XQL.PresenceHUD", Description = "Show presence HUD", ShortCut = "Ctrl-Shift-P")]
-        public static void PresenceCommand()
+        internal static void PresenceCommand()
         {
-            // 4
-            try 
-            { 
-                XqlPresenceHudForm.ShowSingleton(); 
+            try
+            {
+                XqlPresenceHudForm.ShowSingleton();
             }
             catch (Exception ex) { MessageBox.Show("Presence HUD failed: " + ex.Message, "XQLite"); }
         }
 
         [ExcelCommand(Name = "XQL.Schema", Description = "Open schema explorer", ShortCut = "Ctrl-Shift-S")]
-        public static void SchemaCommand()
+        internal static void SchemaCommand()
         {
-            // 5
-            try 
-            { 
-                XqlSchemaForm.ShowSingleton(); 
+            try
+            {
+                XqlSchemaForm.ShowSingleton();
             }
             catch (Exception ex) { MessageBox.Show("Schema explorer failed: " + ex.Message, "XQLite"); }
         }
 
         [ExcelCommand(Name = "XQL.ExportDiagnostics", Description = "Export diagnostics zip", ShortCut = "Ctrl-Shift-D")]
-        public static void ExportDiagnosticsCommand()
+        internal static async void ExportDiagnosticsCommand()
         {
-            try
+
+            using (var dlg = new SaveFileDialog
             {
-                var path = XqlDiagExport.ExportZip();
-                MessageBox.Show("Saved:\r\n" + path, "XQLite", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                Title = "Save XQLite Diagnostic Bundle",
+                Filter = "ZIP Archive (*.zip)|*.zip",
+                FileName = Path.GetFileName(XqlDiagExport.DefaultDiagZipPath()),
+                AddExtension = true,
+                OverwritePrompt = true
+            })
+            {
+                if (dlg.ShowDialog() == DialogResult.OK)
+                {
+
+                    // UI 스레드 블로킹 없이 동작하도록 간단 래퍼
+                    try
+                    {
+                        await XqlDiagExport.ExportAsync(dlg.FileName);
+                    }
+                    catch (Exception ex)
+                    {
+                        MessageBox.Show("Diag export failed: " + ex.Message, "XQLite");
+
+                    }
+                }
             }
-            catch (Exception ex) { MessageBox.Show("Diagnostics export failed: " + ex.Message, "XQLite"); }
         }
 
         [ExcelCommand(Name = "XQL.Lock", Description = "Lock")]
-        public static void LockCommand()
+        internal static void LockCommand()
         {
-            // 6
-            try 
-            { 
-                XqlLockForm.ShowSingleton(); 
+            try
+            {
+                XqlLockForm.ShowSingleton();
             }
-            catch (Exception ex) { MessageBox.Show("Lock explorer failed: " + ex.Message, "XQLite"); }
-        }
-
-        internal static void ExportDiagCommand()
-        {
-            
+            catch (Exception ex)
+            {
+                MessageBox.Show("Lock explorer failed: " + ex.Message, "XQLite");
+            }
         }
     }
-#endif
 }

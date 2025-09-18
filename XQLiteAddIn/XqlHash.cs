@@ -7,7 +7,7 @@ using System.Text;
 
 namespace XQLite.AddIn
 {
-    public static class XqlHash
+    internal static class XqlHash
     {
         [ThreadStatic] private static SHA256? _sha;
         public static string RowHash(IReadOnlyDictionary<string, object?> row)

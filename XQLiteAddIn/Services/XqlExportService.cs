@@ -7,7 +7,7 @@ using System.Threading.Tasks;
 
 namespace XQLite.AddIn
 {
-    public static class XqlExportService
+    internal static class XqlExportService
     {
         internal static async Task ExportSnapshotAsync(long since = 0, string? targetDir = null, bool csv = false)
         {

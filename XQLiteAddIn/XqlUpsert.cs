@@ -16,7 +16,7 @@ namespace XQLite.AddIn
     /// - 디바운스 타이머가 발사되면 테이블별 배치 업서트
     /// - 실패/오류는 outbox 로 기록 후, 매 회 Drain 끝에 재시도
     /// </summary>
-    public static class XqlUpsert
+    internal static class XqlUpsert
     {
         // ---------------------------
         // 설정 & 상태
@@ -34,7 +34,7 @@ namespace XQLite.AddIn
         // ---------------------------
         // 초기화 & 설정
         // ---------------------------
-        public static void Init(int debounceMs = 2000, string? outboxPath = null, int? maxParallelTables = null)
+        internal static void Init(int debounceMs = 2000, string? outboxPath = null, int? maxParallelTables = null)
         {
             _debounceMs = Math.Max(200, debounceMs);
             if (!string.IsNullOrWhiteSpace(outboxPath))
@@ -47,13 +47,13 @@ namespace XQLite.AddIn
         }
 
         /// <summary>디바운스 간격 변경(밀리초)</summary>
-        public static void SetDebounce(int ms)
+        internal static void SetDebounce(int ms)
         {
             _debounceMs = Math.Max(200, ms);
         }
 
         /// <summary>아웃박스 경로 변경(폴더 자동 생성)</summary>
-        public static void SetOutboxPath(string path)
+        internal static void SetOutboxPath(string path)
         {
             _outboxPath = path ?? _outboxPath;
             var dir = Path.GetDirectoryName(_outboxPath)!;
@@ -66,7 +66,7 @@ namespace XQLite.AddIn
         /// <summary>
         /// 행을 전송 큐에 적재. 같은 테이블끼리 배치되어 전송됨.
         /// </summary>
-        public static void Enqueue(string table, Dictionary<string, object?> row)
+        internal static void Enqueue(string table, Dictionary<string, object?> row)
         {
             if (string.IsNullOrWhiteSpace(table) || row is null || row.Count == 0)
                 return;
@@ -78,7 +78,7 @@ namespace XQLite.AddIn
         /// <summary>
         /// 대기열을 즉시 비움(전송 시도). 호출자 취소 토큰 제공 가능.
         /// </summary>
-        public static Task FlushAsync(CancellationToken ct = default) => DrainAsync(ct);
+        internal static Task FlushAsync(CancellationToken ct = default) => DrainAsync(ct);
 
         // ---------------------------
         // 내부: 디바운스 타이머

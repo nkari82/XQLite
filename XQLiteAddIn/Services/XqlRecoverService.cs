@@ -7,7 +7,7 @@ using Excel = Microsoft.Office.Interop.Excel;
 
 namespace XQLite.AddIn
 {
-    public static class XqlRecoverService
+    internal static class XqlRecoverService
     {
         internal static async Task RecoverAllTablesAsync(int batch = 500)
         {
@@ -60,6 +60,5 @@ namespace XQLite.AddIn
                 }
             }
         }
-
     }
 }

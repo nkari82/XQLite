@@ -1,27 +1,20 @@
-﻿// XqlAddIn.cs (no partial)
-// - Excel-DNA IExcelAddIn 엔트리포인트를 단일 파일로 통합
-// - AutoOpen/AutoClose에서 런타임 시작/정지
-// - 리본/단축키에서 부르는 공개 명령 메서드(Commit/Recover/Inspector/Export/Presence/Schema/Diag)
-// - 정책: 시트엔 절대 쓰지 않음(표시/색칠/코멘트 X)
-
-using System;
+﻿using System;
 using System.IO;
 using System.Windows.Forms;
 using ExcelDna.Integration;
 
 namespace XQLite.AddIn
 {
-    public sealed class XqlAddIn : IExcelAddIn
+    internal sealed class XqlAddIn : IExcelAddIn
     {
         // ====== Config ======
-        public static XqlConfig? Cfg { get; internal set; }
+        internal static XqlConfig? Cfg { get; set; }
         private static readonly string AppDir =
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "XQLite");
         private static readonly string CfgPath = Path.Combine(AppDir, "config.json");
 
         public void AutoOpen()
         {
-#if true
             try
             {
                 Directory.CreateDirectory(AppDir);
@@ -32,18 +25,15 @@ namespace XQLite.AddIn
             {
                 MessageBox.Show($"XQLite failed to start:\r\n{ex}", "XQLite", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
-#endif
         }
 
         public void AutoClose()
         {
-#if true
             try
             {
                 StopRuntime();
             }
             catch { /* ignore */ }
-#endif
         }
 
         // ====== Runtime lifecycle ======
@@ -63,7 +53,7 @@ namespace XQLite.AddIn
             XqlLockService.Start();
 
             XqlUpsert.Init(cfg.DebounceMs);
-            XqlSubscriptionService.Start(cfg, startSince: 0);
+            XqlSubscriptionService.Start(startSince: 0);
 
             // 3) 시트 이벤트 후킹
             XqlSheetEvents.Hook();
@@ -137,6 +127,7 @@ namespace XQLite.AddIn
         }
     }
 
+#if false
     internal static class XqlDiagExport
     {
         public static string ExportZip()
@@ -149,4 +140,5 @@ namespace XQLite.AddIn
             return path;
         }
     }
+#endif
 }

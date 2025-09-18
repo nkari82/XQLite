@@ -3,7 +3,7 @@ using System.Diagnostics;
 
 namespace XQLite.AddIn
 {
-    public static class XqlLog
+    internal static class XqlLog
     {
         public static void Info(string msg, string table = "*")
         {

@@ -4,7 +4,7 @@ using System.Timers;
 
 namespace XQLite.AddIn
 {
-    public static class XqlPresenceService
+    internal static class XqlPresenceService
     {
         private static Timer? _hb;
         private static XqlConfig? _cfg;

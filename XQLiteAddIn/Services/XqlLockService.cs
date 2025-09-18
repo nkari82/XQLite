@@ -7,9 +7,9 @@ using System.Threading.Tasks;
 
 namespace XQLite.AddIn
 {
-    public static class XqlLockService
+    internal static class XqlLockService
     {
-        public sealed class LockInfo
+        internal sealed class LockInfo
         {
             public string lockId { get; set; } = string.Empty;
             public string owner { get; set; } = string.Empty;

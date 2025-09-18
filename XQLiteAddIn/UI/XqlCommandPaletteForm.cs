@@ -26,7 +26,7 @@ namespace XQLite.AddIn
             ("Export Snapshot", "Ctrl+Shift+E", XqlCommands.ExportSnapshotCommand),
             ("Presence HUD", "Ctrl+Shift+P", XqlCommands.PresenceCommand),
             ("Schema Explorer", "Ctrl+Shift+S", XqlCommands.SchemaCommand),
-            ("Export Diagnostics", "Ctrl+Shift+D", ()=> XqlCommands.ExportDiagnosticsCommand()),
+            ("Export Diagnostics", "Ctrl+Shift+D", XqlCommands.ExportDiagnosticsCommand),
             ("Open Config", "(Ribbon)", XqlCommands.ConfigCommand)
         ];
 

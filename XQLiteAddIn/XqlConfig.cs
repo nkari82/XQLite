@@ -6,7 +6,7 @@ using Excel = Microsoft.Office.Interop.Excel;
 
 namespace XQLite.AddIn
 {
-    public sealed class XqlConfig
+    internal sealed class XqlConfig
     {
         public string Endpoint { get; set; } = "http://localhost:3000/graphql";
         public string ApiKey { get; set; } = "";

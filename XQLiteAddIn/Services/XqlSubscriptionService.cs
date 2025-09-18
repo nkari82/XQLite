@@ -5,15 +5,13 @@ using System.Threading.Tasks;
 
 namespace XQLite.AddIn
 {
-    public static class XqlSubscriptionService
+    internal static class XqlSubscriptionService
     {
         private static IDisposable? _sub;
-        private static XqlConfig? _cfg;
         private static long _sinceVersion;
 
-        internal static void Start(XqlConfig cfg, long startSince = 0)
+        internal static void Start(long startSince = 0)
         {
-            _cfg = cfg;
             _sinceVersion = startSince;
 
             SubscribeRowsChanged();
@@ -68,15 +66,16 @@ namespace XQLite.AddIn
         }
 
         // 서버 응답 DTO
-        public sealed class RowsPayload
+        internal sealed class RowsPayload
         {
-            public RowBlock[]? rowsChanged { get; set; }
+            internal RowBlock[]? rowsChanged { get; set; }
         }
-        public sealed class RowBlock
+
+        internal sealed class RowBlock
         {
-            public string table { get; set; } = "";
-            public Dictionary<string, object?>[]? rows { get; set; }
-            public long max_row_version { get; set; }
+            internal string table { get; set; } = "";
+            internal Dictionary<string, object?>[]? rows { get; set; }
+            internal long max_row_version { get; set; }
         }
     }
 }

@@ -2,12 +2,12 @@
 
 namespace XQLite.AddIn
 {
-    public static class XqlPathParser
+    internal static class XqlPathParser
     {
         // 예상 예: "rows[3].price" or "rows[10].meta.name"
         private static readonly Regex RxIndex = new(@"rows\[(\d+)\](?:\.([A-Za-z0-9_\.]+))?", RegexOptions.Compiled);
 
-        public static (int? rowIndex1, string? columnPath) Parse(string? path)
+        internal static (int? rowIndex1, string? columnPath) Parse(string? path)
         {
             if (string.IsNullOrWhiteSpace(path)) return (null, null);
             var m = RxIndex.Match(path);

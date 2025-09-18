@@ -35,6 +35,6 @@ namespace XQLite.AddIn
         public void OnPresence(IRibbonControl _) => XqlCommands.PresenceCommand();
         public void OnSchema(IRibbonControl _) => XqlCommands.SchemaCommand();
         public void OnLockMgr(IRibbonControl _) => XqlCommands.LockCommand();
-        public void OnDiag(IRibbonControl _) => XqlCommands.ExportDiagCommand();
+        public void OnDiag(IRibbonControl _) => XqlCommands.ExportDiagnosticsCommand();
     }
 }

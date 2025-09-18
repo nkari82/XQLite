@@ -8,9 +8,9 @@ using System.Threading;
 
 namespace XQLite.AddIn
 {
-    public static class XqlFileLogger
+    internal static class XqlFileLogger
     {
-        public sealed class LogItem
+        internal sealed class LogItem
         {
             public DateTime At { get; init; }
             public string Level { get; init; } = "";

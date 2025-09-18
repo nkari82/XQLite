@@ -4,13 +4,13 @@ using System.IO;
 
 namespace XQLite.AddIn
 {
-    public static class XqlOutbox
+    internal static class XqlOutbox
     {
         private static readonly object _gate = new();
         private static string Dir => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "XQLite");
         private static string PathBox => System.IO.Path.Combine(Dir, "outbox.ndjson");
 
-        public sealed class Item
+        internal sealed class Item
         {
             public string table { get; set; } = string.Empty;
             public Dictionary<string, object?> row { get; set; } = new();

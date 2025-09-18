@@ -10,7 +10,7 @@ namespace XQLite.AddIn
     /// <summary>
     /// 단일 컬럼 메타 정보. 타입/널/락/기본값 등 최소 속성 제공.
     /// </summary>
-    public sealed class ColMeta
+    internal sealed class ColMeta
     {
         [JsonProperty("name")] public string Name { get; set; } = "";          // DB 컬럼명 (정규화)
         [JsonProperty("header")] public string OriginalHeader { get; set; } = ""; // 엑셀 헤더 원문
@@ -31,7 +31,7 @@ namespace XQLite.AddIn
     /// <summary>
     /// 테이블(엑셀 ListObject) 메타. 엑셀에서 유추하거나 외부 설정에서 로드.
     /// </summary>
-    public sealed class TableMeta
+    internal sealed class TableMeta
     {
         [JsonProperty("name")] public string Name { get; set; } = "";           // DB 테이블명: "Sheet.ListObject"
         [JsonProperty("display_name")] public string? DisplayName { get; set; }         // UI 표시명
@@ -159,7 +159,7 @@ namespace XQLite.AddIn
     /// 간단한 런타임 레지스트리: 테이블 메타 보관/조회.
     /// 외부 JSON 로드나 엑셀에서 유추한 메타를 등록해두고 재사용.
     /// </summary>
-    public static class XqlSchemaRegistry
+    internal static class XqlSchemaRegistry
     {
         private static readonly Dictionary<string, TableMeta> _byName = new(StringComparer.OrdinalIgnoreCase);
 

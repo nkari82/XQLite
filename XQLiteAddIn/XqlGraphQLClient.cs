@@ -9,7 +9,7 @@ using System.Threading.Tasks;
 
 namespace XQLite.AddIn
 {
-    public static class XqlGraphQLClient
+    internal static class XqlGraphQLClient
     {
         private static GraphQLHttpClient? _client;
         private static string _endpoint = "";

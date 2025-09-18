@@ -6,13 +6,13 @@ using System.Text;
 
 namespace XQLite.AddIn
 {
-    public static class XqlRowCache
+    internal static class XqlRowCache
     {
         // 캐시 키: table + '|' + keyValue  (keyValue가 없으면 행주소 키)
         private static readonly Dictionary<string, string> _hashByKey = new(StringComparer.Ordinal);
 
         // 딕셔너리 → 안정적 해시 문자열(정렬된 키, null/빈문자 규칙 포함)
-        public static string ComputeHash(IReadOnlyDictionary<string, object?> row)
+        internal static string ComputeHash(IReadOnlyDictionary<string, object?> row)
         {
             var sb = new StringBuilder();
             foreach (var kv in row.OrderBy(k => k.Key, StringComparer.Ordinal))
@@ -28,7 +28,7 @@ namespace XQLite.AddIn
             return Compat.ToHexString(hash);
         }
 
-        public static bool IsChanged(string table, string rowKey, string hash)
+        internal static bool IsChanged(string table, string rowKey, string hash)
         {
             var k = table + "|" + rowKey;
             if (!_hashByKey.TryGetValue(k, out var prev)) { _hashByKey[k] = hash; return true; }

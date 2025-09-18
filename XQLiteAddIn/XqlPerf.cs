@@ -3,9 +3,9 @@ using System.Diagnostics;
 
 namespace XQLite.AddIn
 {
-    public static class XqlPerf
+    internal static class XqlPerf
     {
-        public static (IDisposable scope, Action<long> done) Scope(string name, string table = "*")
+        internal static (IDisposable scope, Action<long> done) Scope(string name, string table = "*")
         {
             var sw = Stopwatch.StartNew();
             return (new ScopeDisposable(() =>
@@ -21,6 +21,10 @@ namespace XQLite.AddIn
         }
 
         private sealed class ScopeDisposable : IDisposable
-        { private readonly Action _on; public ScopeDisposable(Action on) { _on = on; } public void Dispose() { _on(); } }
+        { 
+            private readonly Action _on; 
+            public ScopeDisposable(Action on) { _on = on; } 
+            public void Dispose() { _on(); } 
+        }
     }
 }

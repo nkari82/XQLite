@@ -5,12 +5,12 @@ using System.Text;
 
 namespace XQLite.AddIn
 {
-    public static class XqlSecrets
+    internal static class XqlSecrets
     {
         private static string Dir => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "XQLite");
         private static string PathKey => System.IO.Path.Combine(Dir, "secrets.bin");
 
-        public static void SaveApiKey(string apiKey)
+        internal static void SaveApiKey(string apiKey)
         {
             Directory.CreateDirectory(Dir);
             var plain = Encoding.UTF8.GetBytes(apiKey ?? string.Empty);
@@ -18,7 +18,7 @@ namespace XQLite.AddIn
             File.WriteAllBytes(PathKey, protectedBytes);
         }
 
-        public static string LoadApiKey()
+        internal static string LoadApiKey()
         {
             try
             {

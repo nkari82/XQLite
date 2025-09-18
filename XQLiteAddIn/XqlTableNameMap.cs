@@ -5,10 +5,10 @@ using System.Linq;
 
 namespace XQLite.AddIn
 {
-    public static class XqlTableNameMap
+    internal static class XqlTableNameMap
     {
         // 규칙: 소문자화 → 선행 접두 제거(Table_, tbl_, t_) → 비영숫자 → '_'
-        public static string Normalize(string excelListObjectName, string? worksheetName = null)
+        internal static string Normalize(string excelListObjectName, string? worksheetName = null)
         {
             var s = (excelListObjectName ?? string.Empty).Trim();
             if (string.IsNullOrEmpty(s)) s = worksheetName ?? string.Empty;
@@ -25,7 +25,7 @@ namespace XQLite.AddIn
 
         // 추가 매핑: %APPDATA%/XQLite/tablemap.json 지원  { "excelName":"server_table" }
         private static Dictionary<string, string>? _map;
-        public static string Map(string excelListObjectName, string? worksheetName)
+        internal static string Map(string excelListObjectName, string? worksheetName)
         {
             _map ??= LoadMap();
             if (_map is not null && _map.TryGetValue(excelListObjectName, out var v)) return v;
