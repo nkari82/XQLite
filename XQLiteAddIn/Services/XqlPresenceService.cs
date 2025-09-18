@@ -21,7 +21,12 @@ namespace XQLite.AddIn
 
         internal static void Stop()
         {
-            if (_hb is not null) { _hb.Stop(); _hb.Dispose(); _hb = null; }
+            if (_hb is not null) 
+            { 
+                _hb.Stop(); 
+                _hb.Dispose(); 
+                _hb = null; 
+            }
             _cfg = null;
         }
 
@@ -31,22 +36,15 @@ namespace XQLite.AddIn
             if (_cfg is null) 
                 return;
 
-            // #FIXME: 예외 System.TypeInitializationException
-#if true
             const string q = "mutation($nick:String!){ presenceHeartbeat(nickname:$nick){ ok ttl } }";
-            try { 
+            try 
+            { 
                 await XqlGraphQLClient.MutateAsync<dynamic>(q, new { nick = _cfg.Nickname }); 
             }
             catch(Exception)
             {
                 /* 네트워크 오류 무시(다음 틱에 재시도) */
-#if false
-                XqlLog.Warn("TickAsync: " + ex.Message);
-#endif
             }
-
-#endif
-            
         }
     }
 }

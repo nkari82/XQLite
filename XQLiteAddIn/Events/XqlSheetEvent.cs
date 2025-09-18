@@ -23,8 +23,14 @@ namespace XQLite.AddIn
 
         internal static void Unhook()
         {
-            if (!_hooked || _app is null) return;
-            try { _app.SheetChange -= App_SheetChange; } catch { }
+            if (!_hooked || _app is null) 
+                return;
+
+            try 
+            { 
+                _app.SheetChange -= App_SheetChange; 
+            } 
+            catch { }
             _hooked = false;
             XqlLog.Info("SheetEvents unhooked");
         }
@@ -38,11 +44,16 @@ namespace XQLite.AddIn
                 if (ws == null) return;
 
                 // 테이블 바디가 아니면 무시
-                if (Target.ListObject is not Excel.ListObject lo) return;
+                if (Target.ListObject is not Excel.ListObject lo) 
+                    return;
+
                 var header = lo.HeaderRowRange;
                 var body = lo.DataBodyRange;
-                if (body == null) return;               // 빈 표
-                if (IsIntersect(Target, header)) return; // 헤더 수정 무시
+                if (body == null)
+                    return;               // 빈 표
+
+                if (IsIntersect(Target, header))
+                    return; // 헤더 수정 무시
 
                 // 락 검사 → Undo
                 if (IsLockedEdit(ws, lo, Target))
@@ -101,7 +112,8 @@ namespace XQLite.AddIn
                 for (int col = firstCol; col <= lastCol; col++)
                 {
                     int colIndex = col - header.Column + 1;
-                    if (colIndex < 1 || colIndex > header.Columns.Count) continue;
+                    if (colIndex < 1 || colIndex > header.Columns.Count) 
+                        continue;
 
                     var headerArr = (object[,])header.Value2;
                     string colName = Convert.ToString(headerArr[1, colIndex]) ?? "";

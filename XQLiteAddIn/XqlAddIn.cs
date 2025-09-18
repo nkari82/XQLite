@@ -126,19 +126,4 @@ namespace XQLite.AddIn
             }
         }
     }
-
-#if false
-    internal static class XqlDiagExport
-    {
-        public static string ExportZip()
-        {
-            // TODO: STEP14에서 구현한 실제 Zip 수집 로직으로 교체
-            var path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-                                    "XQLite", "diag", "xql_diag_dummy.zip");
-            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-            File.WriteAllBytes(path, Array.Empty<byte>());
-            return path;
-        }
-    }
-#endif
 }
