@@ -8,7 +8,7 @@ namespace XQLite.AddIn
 {
     internal sealed class XqlConfig
     {
-        public string Endpoint { get; set; } = "http://localhost:3000/graphql";
+        public string Endpoint { get; set; } = "http://localhost:4000/graphql";
         public string ApiKey { get; set; } = "";
         public string Nickname { get; set; } = Environment.UserName;
         public string Project { get; set; } = "";
