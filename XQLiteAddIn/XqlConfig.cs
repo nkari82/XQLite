@@ -46,7 +46,9 @@ namespace XQLite.AddIn
             var sidecar = TryWorkbookSidecar();
             var path = preferSidecar && sidecar is not null ? sidecar : RoamingPath();
             var json = XqlJson.Serialize(this, true);
-            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            var dir = Path.GetDirectoryName(path);
+            if(!string.IsNullOrEmpty(dir))
+                Directory.CreateDirectory(dir!);
             File.WriteAllText(path, json);
             _resolvedPath = path;
         }
@@ -84,7 +86,6 @@ namespace XQLite.AddIn
         private static string RoamingPath()
         {
             var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "XQLite");
-            Directory.CreateDirectory(dir);
             return Path.Combine(dir, "config.json");
         }
 

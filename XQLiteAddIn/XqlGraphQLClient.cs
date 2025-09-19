@@ -14,7 +14,7 @@ namespace XQLite.AddIn
         private static GraphQLHttpClient? _client;
         private static string _endpoint = "";
 
-        public static void Init(XqlConfig cfg)
+        internal static void Init(XqlConfig cfg)
         {
             _endpoint = cfg.Endpoint.Trim();
             var http = new Uri(_endpoint);
@@ -37,17 +37,23 @@ namespace XQLite.AddIn
             _client.HttpClient.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("XQLite.AddIn", "1.0"));
         }
 
-        public static Task<GraphQLResponse<T>> QueryAsync<T>(string q, object? vars = null, CancellationToken ct = default)
+        internal static Task<GraphQLResponse<T>> QueryAsync<T>(string q, object? vars = null, CancellationToken ct = default)
           => XqlNetPolicy.WithRetryAsync(() => _client!.SendQueryAsync<T>(new GraphQLRequest { Query = q, Variables = vars }, ct), ct);
 
-        public static Task<GraphQLResponse<T>> MutateAsync<T>(string q, object? vars = null, CancellationToken ct = default)
+        internal static Task<GraphQLResponse<T>> MutateAsync<T>(string q, object? vars = null, CancellationToken ct = default)
           => XqlNetPolicy.WithRetryAsync(() => _client!.SendMutationAsync<T>(new GraphQLRequest { Query = q, Variables = vars }, ct), ct);
 
         // ★ 구독 스트림
-        public static IObservable<GraphQLResponse<T>> Subscribe<T>(string sub, object? vars = null)
+        internal static IObservable<GraphQLResponse<T>> Subscribe<T>(string sub, object? vars = null)
         {
             var req = new GraphQLRequest { Query = sub, Variables = vars };
             return _client!.CreateSubscriptionStream<T>(req);
+        }
+
+        internal static void Dispose()
+        {
+            try { _client?.Dispose(); } catch { }
+            _client = null;
         }
     }
 }

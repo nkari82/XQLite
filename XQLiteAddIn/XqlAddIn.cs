@@ -45,32 +45,46 @@ namespace XQLite.AddIn
 
         internal static void StartRuntime(XqlConfig cfg)
         {
-            // 1) 기본 서비스 초기화
-            XqlGraphQLClient.Init(cfg);
-            XqlPresenceService.Start(cfg);
+            try
+            {
+                // 1) 기본 서비스 초기화
+                XqlGraphQLClient.Init(cfg);
+                XqlPresenceService.Start(cfg);
 
-            // 2) 락/동기화/구독 (필요 정책대로 택1/병행)
-            XqlLockService.Start();
+                // 2) 락/동기화/구독 (필요 정책대로 택1/병행)
+                XqlLockService.Start();
 
-            XqlUpsert.Init(cfg.DebounceMs);
-            XqlSubscriptionService.Start(startSince: 0);
+                XqlUpsert.Init(cfg.DebounceMs);
+                XqlSubscriptionService.Start(startSince: 0);
 
-            // 3) 시트 이벤트 후킹
-            XqlSheetEvents.Hook();
+                // 3) 시트 이벤트 후킹
+                XqlSheetEvents.Hook();
 
-            // 4) 파일 로거(부트스트랩에서 이미 켰다면 생략 가능)
-            XqlFileLogger.Start();
+                // 4) 파일 로거(부트스트랩에서 이미 켰다면 생략 가능)
+                XqlFileLogger.Start();
+            }
+            catch (Exception ex)
+            {
+                XqlLog.Error(ex.Message);
+            }
         }
 
         internal static void StopRuntime()
         {
-            XqlSheetEvents.Unhook();
-            try { XqlSubscriptionService.Stop(); } catch { }
-            try { XqlPresenceService.Stop(); } catch { }
-            try { XqlLockService.Stop(); } catch { }
+            try
+            {
+                XqlSheetEvents.Unhook();
+                XqlSubscriptionService.Stop();
+                XqlPresenceService.Stop();
+                XqlLockService.Stop();
 
-            // 3) 파일 로거 종료(부트스트랩에서 관리 중이면 생략)
-            try { XqlFileLogger.Stop(); } catch { }
+                // 3) 파일 로거 종료(부트스트랩에서 관리 중이면 생략)
+                XqlFileLogger.Stop();
+            }
+            catch (Exception ex)
+            {
+                XqlLog.Error(ex.Message);
+            }
         }
 
         // ====== Config load/save (Env → File → Defaults) ======
