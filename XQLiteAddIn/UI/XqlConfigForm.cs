@@ -357,7 +357,7 @@ namespace XQLite.AddIn
                 btnSaveApply.Enabled = btnSave.Enabled = false;
                 UseWaitCursor = true;
                 var cfgCopy = cfg;
-                BeginInvoke(async () =>
+                BeginInvoke(() =>
                 {
                     try
                     {

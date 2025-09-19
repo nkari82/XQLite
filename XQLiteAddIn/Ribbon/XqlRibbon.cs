@@ -21,12 +21,20 @@ namespace XQLite.AddIn
           <button id='btnLockMgr'   label='Locks'                      onAction='OnLockMgr'   imageMso='Lock'/>
           <button id='btnDiag'      label='Export Diag'                onAction='OnDiag'      imageMso='FileSaveAs'/>
         </group>
+        <group id='grpMeta' label='메타/테이블'>
+          <button id='btnInsertMeta' label='메타 헤더 삽입'
+                  size='large' onAction='OnInsertMeta' imageMso='TableInsertDialog'/>
+          <button id='btnMetaInfo' label='메타 정보'
+                  onAction='OnMetaInfo' imageMso='ZoomPrintPreviewExcel'/>
+          <button id='btnMetaRemove' label='메타 제거'
+                  onAction='OnMetaRemove' imageMso='TableDelete'/>
+        </group>
       </tab>
     </tabs>
   </ribbon>
 </customUI>";
 
-        // 콜백
+        // General
         public void OnConfig(IRibbonControl _) => XqlCommands.ConfigCommand();
         public void OnCommit(IRibbonControl _) => XqlCommands.CommitCommand();
         public void OnRecover(IRibbonControl _) => XqlCommands.RecoverCommand();
@@ -36,5 +44,10 @@ namespace XQLite.AddIn
         public void OnSchema(IRibbonControl _) => XqlCommands.SchemaCommand();
         public void OnLockMgr(IRibbonControl _) => XqlCommands.LockCommand();
         public void OnDiag(IRibbonControl _) => XqlCommands.ExportDiagnosticsCommand();
+
+        // Meta
+        public void OnInsertMeta(IRibbonControl _) => XqlCommands.InsertMetaHeaderFromSelection(true);
+        public void OnMetaInfo(IRibbonControl _) => XqlCommands.ShowMetaHeaderInfo();
+        public void OnMetaRemove(IRibbonControl _) => XqlCommands.RemoveMetaHeader();
     }
 }

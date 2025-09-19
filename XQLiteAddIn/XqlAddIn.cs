@@ -2,7 +2,7 @@
 using System.IO;
 using System.Windows.Forms;
 using ExcelDna.Integration;
-
+using Excel = Microsoft.Office.Interop.Excel;
 namespace XQLite.AddIn
 {
     internal sealed class XqlAddIn : IExcelAddIn

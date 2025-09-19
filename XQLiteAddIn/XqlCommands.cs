@@ -1,9 +1,9 @@
-﻿using ExcelDna.Integration;
-using System;
+﻿using System;
 using System.IO;
-using System.Threading;
-using System.Threading.Tasks;
 using System.Windows.Forms;
+using ExcelDna.Integration;
+using Excel = Microsoft.Office.Interop.Excel;
+
 
 namespace XQLite.AddIn
 {
@@ -155,6 +155,78 @@ namespace XQLite.AddIn
             catch (Exception ex)
             {
                 MessageBox.Show("Lock explorer failed: " + ex.Message, "XQLite");
+            }
+        }
+
+
+        /// <summary>현재 워크시트의 Selection을 이용해 메타 헤더를 설치</summary>
+        public static void InsertMetaHeaderFromSelection(bool freezePane = true)
+        {
+            try
+            {
+                var app = (Excel.Application)ExcelDnaUtil.Application;
+                var ws = (Excel.Worksheet)app.ActiveSheet;
+                var sel = (Excel.Range)app.Selection;
+
+                if (sel == null)
+                {
+                    MessageBox.Show("헤더로 사용할 셀(한 줄)을 선택한 후 다시 실행하세요.", "XQLite");
+                    return;
+                }
+
+                // 한 줄이 아니어도 동작: 첫 번째 행만 사용
+                if (sel.Columns.Count < 1)
+                {
+                    MessageBox.Show("선택된 열이 없습니다.", "XQLite");
+                    return;
+                }
+
+                if (SheetMetaRegistry.Exists(ws))
+                {
+                    MessageBox.Show("이 시트에는 이미 메타 헤더가 있습니다.", "XQLite");
+                    return;
+                }
+
+                // 생성
+                SheetMetaRegistry.CreateFromSelection(ws, sel, freezePane);
+                MessageBox.Show("메타 헤더가 설치되었습니다. 헤더 아래 행들이 데이터 행으로 취급됩니다.", "XQLite");
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("메타 헤더 설치에 실패했습니다:\r\n" + ex.Message, "XQLite");
+            }
+        }
+
+        /// <summary>현재 시트의 메타 헤더 정보를 확인</summary>
+        public static void ShowMetaHeaderInfo()
+        {
+            var app = (Excel.Application)ExcelDnaUtil.Application;
+            var ws = (Excel.Worksheet)app.ActiveSheet;
+            var meta = SheetMetaRegistry.Get(ws);
+            if (meta == null)
+            {
+                MessageBox.Show("이 시트에는 메타 헤더가 없습니다.", "XQLite");
+                return;
+            }
+            MessageBox.Show(
+                $"시트: {ws.Name}\nTopRow: {meta.TopRow}\nLeftCol: {meta.LeftCol}\nColCount: {meta.ColCount}",
+                "XQLite");
+        }
+
+        /// <summary>메타 헤더 제거(보호된 기능, 필요 시만 사용)</summary>
+        public static void RemoveMetaHeader()
+        {
+            var app = (Excel.Application)ExcelDnaUtil.Application;
+            var ws = (Excel.Worksheet)app.ActiveSheet;
+            if (!SheetMetaRegistry.Exists(ws))
+            {
+                MessageBox.Show("이 시트에는 메타 헤더가 없습니다.", "XQLite");
+                return;
+            }
+            if (DialogResult.Yes == MessageBox.Show("메타 헤더를 제거할까요?", "XQLite", MessageBoxButtons.YesNo))
+            {
+                SheetMetaRegistry.Remove(ws);
+                MessageBox.Show("메타 헤더가 제거되었습니다.", "XQLite");
             }
         }
     }
