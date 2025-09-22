@@ -96,100 +96,147 @@ namespace XQLite.AddIn
             return null;
         }
 
+        private static string Trunc(string s, int max)
+        {
+            if (string.IsNullOrEmpty(s)) return s;
+            return s.Length <= max ? s : s.Substring(0, max);
+        }
+
         private static void ApplyValidationForColumn(Excel.Worksheet ws, Excel.Range headerCell, string type)
         {
             int col = headerCell.Column;
             int startRow = headerCell.Row + 1;
-            int lastRow; try { lastRow = Math.Min(1048576, (ws.UsedRange?.Rows?.Count ?? 20000) + 5000); } catch { lastRow = 50000; }
+
+            int lastRow;
+            try { lastRow = Math.Min(1048576, (ws.UsedRange?.Rows?.Count ?? 20000) + 5000); }
+            catch { lastRow = 50000; }
 
             var range = ws.Range[ws.Cells[startRow, col], ws.Cells[lastRow, col]];
-            range.Validation.InputTitle = $"[{type}] column";
-            range.Validation.ShowInput = true;
-            try { range.Validation.Delete(); } catch { }
+            try { range.Validation.Delete(); } catch { /* ignore */ }
 
-            try
+            // A1 상대주소와 지역 구분자 확보
+            string a1 = (ws.Cells[startRow, col] as Excel.Range)!
+                .Address[RowAbsolute: false, ColumnAbsolute: false, ReferenceStyle: Excel.XlReferenceStyle.xlA1];
+            string sep = ws.Application.International[Excel.XlApplicationInternational.xlListSeparator] as string ?? ",";
+
+            // 헬퍼: Custom 규칙 추가(포뮬러1 only) — 로캘 구분자 재시도
+            void AddCustom(string formulaBody)
             {
-                // A1 주소(상대참조) 생성: 검증 수식은 A1 기준으로 작성해야 셀마다 자동 이동됨
-                string a1 = (ws.Cells[startRow, col] as Excel.Range)!.Address[RowAbsolute: false, ColumnAbsolute: false, ReferenceStyle: Excel.XlReferenceStyle.xlA1];
-
-                switch (type)
+                string f = "=" + formulaBody.Replace(",", sep);
+                try
                 {
-                    case "INT":
-                        range.NumberFormat = "0";
-                        range.Validation.Add(
-                            Excel.XlDVType.xlValidateWholeNumber,
-                            Excel.XlDVAlertStyle.xlValidAlertStop,
-                            Excel.XlFormatConditionOperator.xlBetween,
-                            -2147483648, 2147483647);
-                        range.Validation.IgnoreBlank = true;
-                        range.Validation.ErrorMessage = "정수만 입력하세요.";
-                        range.Validation.InputMessage = "정수만 허용 (예: 0, -42, 123456)";
-                        break;
+                    range.Validation.Add(
+                        Excel.XlDVType.xlValidateCustom,
+                        Excel.XlDVAlertStyle.xlValidAlertStop,
+                        Excel.XlFormatConditionOperator.xlBetween,
+                        f, Type.Missing); // <-- formula1 여기에!
+                }
+                catch
+                {
+                    // 혹시 반대로 설정된 환경 대비(거의 필요 없음)
+                    string alt = "=" + formulaBody.Replace(";", ",");
+                    range.Validation.Add(
+                        Excel.XlDVType.xlValidateCustom,
+                        Excel.XlDVAlertStyle.xlValidAlertStop,
+                        Excel.XlFormatConditionOperator.xlBetween,
+                        alt, Type.Missing);
+                }
+            }
 
-                    case "REAL":
-                        // ✅ locale/지수표기 문제 회피: 'Custom'으로 ISNUMBER로만 검증
-                        range.NumberFormat = "General"; // 지수표기도 자연스럽게 표시
-                        string fReal = $"=OR(ISBLANK({a1}),ISNUMBER({a1}))";
-                        range.Validation.Add(
-                            Excel.XlDVType.xlValidateCustom,
-                            Excel.XlDVAlertStyle.xlValidAlertStop,
-                            Type.Missing, fReal, Type.Missing);
-                        range.Validation.IgnoreBlank = true;
-                        range.Validation.ErrorMessage = "실수(숫자)만 입력하세요. (예: 3.14, 1E-6)";
-                        range.Validation.InputMessage = "실수(숫자)만 허용 (예: 3.14, -0.001, 1E-6)";
-                        break;
+            switch (type.ToUpperInvariant())
+            {
+                case "INT":
+                    range.NumberFormat = "0";
+                    range.Validation.Add(
+                        Excel.XlDVType.xlValidateWholeNumber,
+                        Excel.XlDVAlertStyle.xlValidAlertStop,
+                        Excel.XlFormatConditionOperator.xlBetween,
+                        int.MinValue, int.MaxValue);
+                    break;
 
-                    case "TEXT":
-                        range.NumberFormat = "@";
-                        range.Validation.InputMessage = "문자열 입력";
-                        // 텍스트는 별도 검증 없이 허용
-                        break;
+                case "REAL":
+                    range.NumberFormat = "General";
+                    // ISNUMBER(A1) 또는 빈칸 허용
+                    AddCustom($"OR(ISBLANK({a1}),ISNUMBER({a1}))");
+                    break;
 
-                    case "BOOL":
-                        range.NumberFormat = "General";
+                case "TEXT":
+                    range.NumberFormat = "@";
+                    // 항상 TRUE인 커스텀(메시지만 쓰기 위함)
+                    AddCustom("TRUE");
+                    break;
+
+                case "BOOL":
+                    range.NumberFormat = "General";
+                    // 리스트는 로캘 구분자 영향 안 받는 경우가 많지만 재시도 가드
+                    try
+                    {
                         range.Validation.Add(
                             Excel.XlDVType.xlValidateList,
                             Excel.XlDVAlertStyle.xlValidAlertStop,
                             Excel.XlFormatConditionOperator.xlBetween,
                             "\"0,1,TRUE,FALSE,Yes,No,True,False\"",
                             Type.Missing);
-                        range.Validation.IgnoreBlank = true;
-                        range.Validation.InCellDropdown = true;
-                        range.Validation.ErrorMessage = "0/1 또는 TRUE/FALSE만 허용됩니다.";
-                        range.Validation.InputMessage = "TRUE/FALSE 또는 0/1";
-                        break;
-
-                    case "DATE":
-                        range.NumberFormat = "yyyy-mm-dd";
+                    }
+                    catch
+                    {
                         range.Validation.Add(
-                            Excel.XlDVType.xlValidateDate,
+                            Excel.XlDVType.xlValidateList,
                             Excel.XlDVAlertStyle.xlValidAlertStop,
                             Excel.XlFormatConditionOperator.xlBetween,
-                            new DateTime(1900, 1, 1), new DateTime(9999, 12, 31));
-                        range.Validation.IgnoreBlank = true;
-                        range.Validation.ErrorMessage = "유효한 날짜를 입력하세요.";
-                        range.Validation.InputMessage = "날짜 (yyyy-mm-dd)";
-                        break;
+                            "\"0;1;TRUE;FALSE;Yes;No;True;False\"",
+                            Type.Missing);
+                    }
+                    range.Validation.InCellDropdown = true;
+                    break;
 
-                    case "JSON":
-                        // ✅ JSON(간단 검증): 비어있거나, {..} 또는 [..] 로 감싸진 텍스트
-                        range.NumberFormat = "@";
-                        try { range.Font.Name = "Consolas"; } catch { } // 가독성(선택)
-                        string fJson =
-                            $"=OR(LEN(TRIM({a1}))=0," +
-                            $"AND(LEFT(TRIM({a1}),1)=\"{{\",RIGHT(TRIM({a1}),1)=\"}}\")," +
-                            $"AND(LEFT(TRIM({a1}),1)=\"[\",RIGHT(TRIM({a1}),1)=\"]\"))";
-                        range.Validation.Add(
-                            Excel.XlDVType.xlValidateCustom,
-                            Excel.XlDVAlertStyle.xlValidAlertStop,
-                            Type.Missing, fJson, Type.Missing);
-                        range.Validation.IgnoreBlank = true;
-                        range.Validation.ErrorMessage = "유효한 JSON이어야 합니다. (예: {\"k\":1} 또는 [1,2])";
-                        range.Validation.InputMessage = "JSON 텍스트 (예: {\"k\":1} 또는 [1,2])";
-                        break;
-                }
+                case "DATE":
+                    range.NumberFormat = "yyyy-mm-dd";
+                    range.Validation.Add(
+                        Excel.XlDVType.xlValidateDate,
+                        Excel.XlDVAlertStyle.xlValidAlertStop,
+                        Excel.XlFormatConditionOperator.xlBetween,
+                        new DateTime(1900, 1, 1), new DateTime(9999, 12, 31));
+                    break;
+
+                case "JSON":
+                    range.NumberFormat = "@";
+                    try { range.Font.Name = "Consolas"; } catch { }
+                    // 빈칸 or {..} or [..]
+                    AddCustom(
+                        $"OR(LEN(TRIM({a1}))=0," +
+                        $"AND(LEFT(TRIM({a1}),1)=\"{{\",RIGHT(TRIM({a1}),1)=\"}}\")," +
+                        $"AND(LEFT(TRIM({a1}),1)=\"[\",RIGHT(TRIM({a1}),1)=\"]\"))");
+                    break;
+
+                default:
+                    AddCustom("TRUE");
+                    break;
             }
-            catch { /* best-effort */ }
+
+            // (중요) 규칙 만든 뒤에 메시지/옵션
+            try
+            {
+                string title = Trunc($"[{type}] column", 32);
+
+                string msg = type.ToUpperInvariant() switch
+                {
+                    "INT" => "정수만 허용 (예: 0, -42, 123456)",
+                    "REAL" => "실수(숫자)만 허용 (예: 3.14, -0.001, 1E-6)",
+                    "TEXT" => "문자열 입력",
+                    "BOOL" => "TRUE/FALSE 또는 0/1",
+                    "DATE" => "날짜 (yyyy-mm-dd)",
+                    "JSON" => "JSON 텍스트 (예: {\"k\":1} 또는 [1,2])",
+                    _ => "입력 도움말"
+                };
+                if (msg.Length > 255) msg = Trunc(msg, 255);
+
+                range.Validation.InputTitle = title;
+                range.Validation.InputMessage = msg;
+                range.Validation.ShowInput = true;
+                range.Validation.IgnoreBlank = true;
+            }
+            catch { /* 일부 환경 제한 → 무시 */ }
         }
 
         private static void ClearValidationForColumn(Excel.Worksheet ws, Excel.Range headerCell)
