@@ -160,7 +160,7 @@ namespace XQLite.AddIn
 
 
         /// <summary>현재 워크시트의 Selection을 이용해 메타 헤더를 설치</summary>
-        public static void InsertMetaHeaderFromSelection(bool freezePane = true)
+        public static void InsertMetaHeaderFromSelection()
         {
             try
             {
@@ -188,7 +188,7 @@ namespace XQLite.AddIn
                 }
 
                 // 생성
-                SheetMetaRegistry.CreateFromSelection(ws, sel, freezePane);
+                SheetMetaRegistry.CreateFromSelection(ws, sel, false);
                 MessageBox.Show("메타 헤더가 설치되었습니다. 헤더 아래 행들이 데이터 행으로 취급됩니다.", "XQLite");
             }
             catch (Exception ex)
@@ -229,5 +229,20 @@ namespace XQLite.AddIn
                 MessageBox.Show("메타 헤더가 제거되었습니다.", "XQLite");
             }
         }
-    }
+
+        public static void RefreshMetaHeader()
+        {
+            try
+            {
+                var app = (Excel.Application)ExcelDnaUtil.Application; // 또는 여러분 환경에 맞는 Excel.Application 참조
+                var ws = app.ActiveSheet as Excel.Worksheet;
+                if (ws == null) return;
+                SheetMetaRegistry.RefreshHeaderBorders(ws);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("메타 새로고침 중 오류: " + ex.Message);
+            }
+        }
+        }
 }

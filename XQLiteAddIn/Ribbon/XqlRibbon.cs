@@ -28,6 +28,8 @@ namespace XQLite.AddIn
                   onAction='OnMetaInfo' imageMso='ZoomPrintPreviewExcel'/>
           <button id='btnMetaRemove' label='메타 제거'
                   onAction='OnMetaRemove' imageMso='TableDelete'/>
+          <button id='btnRefreshMeta' label='새로고침'
+                  onAction='OnRefreshMeta' imageMso='Refresh'/>
         </group>
       </tab>
     </tabs>
@@ -46,8 +48,9 @@ namespace XQLite.AddIn
         public void OnDiag(IRibbonControl _) => XqlCommands.ExportDiagnosticsCommand();
 
         // Meta
-        public void OnInsertMeta(IRibbonControl _) => XqlCommands.InsertMetaHeaderFromSelection(true);
+        public void OnInsertMeta(IRibbonControl _) => XqlCommands.InsertMetaHeaderFromSelection();
         public void OnMetaInfo(IRibbonControl _) => XqlCommands.ShowMetaHeaderInfo();
         public void OnMetaRemove(IRibbonControl _) => XqlCommands.RemoveMetaHeader();
+        public void OnRefreshMeta(IRibbonControl _) => XqlCommands.RefreshMetaHeader();
     }
 }
