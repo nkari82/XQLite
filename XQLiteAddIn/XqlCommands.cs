@@ -1,9 +1,9 @@
-﻿using System;
+﻿// 리본 명령어 브릿지
+using System;
 using System.IO;
 using System.Windows.Forms;
 using ExcelDna.Integration;
 using Excel = Microsoft.Office.Interop.Excel;
-
 
 namespace XQLite.AddIn
 {
@@ -181,14 +181,14 @@ namespace XQLite.AddIn
                     return;
                 }
 
-                if (SheetMetaRegistry.Exists(ws))
+                if (XqlSheetMetaRegistry.Exists(ws))
                 {
                     MessageBox.Show("이 시트에는 이미 메타 헤더가 있습니다.", "XQLite");
                     return;
                 }
 
                 // 생성
-                SheetMetaRegistry.CreateFromSelection(ws, sel, false);
+                XqlSheetMetaRegistry.CreateFromSelection(ws, sel, false);
                 MessageBox.Show("메타 헤더가 설치되었습니다. 헤더 아래 행들이 데이터 행으로 취급됩니다.", "XQLite");
             }
             catch (Exception ex)
@@ -202,7 +202,7 @@ namespace XQLite.AddIn
         {
             var app = (Excel.Application)ExcelDnaUtil.Application;
             var ws = (Excel.Worksheet)app.ActiveSheet;
-            var meta = SheetMetaRegistry.Get(ws);
+            var meta = XqlSheetMetaRegistry.Get(ws);
             if (meta == null)
             {
                 MessageBox.Show("이 시트에는 메타 헤더가 없습니다.", "XQLite");
@@ -218,14 +218,14 @@ namespace XQLite.AddIn
         {
             var app = (Excel.Application)ExcelDnaUtil.Application;
             var ws = (Excel.Worksheet)app.ActiveSheet;
-            if (!SheetMetaRegistry.Exists(ws))
+            if (!XqlSheetMetaRegistry.Exists(ws))
             {
                 MessageBox.Show("이 시트에는 메타 헤더가 없습니다.", "XQLite");
                 return;
             }
             if (DialogResult.Yes == MessageBox.Show("메타 헤더를 제거할까요?", "XQLite", MessageBoxButtons.YesNo))
             {
-                SheetMetaRegistry.Remove(ws);
+                XqlSheetMetaRegistry.Remove(ws);
                 MessageBox.Show("메타 헤더가 제거되었습니다.", "XQLite");
             }
         }
@@ -237,12 +237,32 @@ namespace XQLite.AddIn
                 var app = (Excel.Application)ExcelDnaUtil.Application; // 또는 여러분 환경에 맞는 Excel.Application 참조
                 var ws = app.ActiveSheet as Excel.Worksheet;
                 if (ws == null) return;
-                SheetMetaRegistry.RefreshHeaderBorders(ws);
+                XqlSheetMetaRegistry.RefreshHeaderBorders(ws);
             }
             catch (Exception ex)
             {
                 MessageBox.Show("메타 새로고침 중 오류: " + ex.Message);
             }
         }
+
+        public static void SetType(string type)
+        {
+            var app = (Excel.Application)ExcelDnaUtil.Application;
+            if (app.ActiveSheet is not Excel.Worksheet ws || app.Selection is not Excel.Range sel) return;
+
+            // 헤더 한 칸만 기준: 사용자가 범위 선택해도 첫 셀만 취급
+            var cell = (Excel.Range)sel.Cells[1, 1];
+
+            // 현재 셀이 메타헤더 “행”에 있는지 간단 검증(선택 사항: 스킵 가능)
+            var meta = XqlSheetMetaRegistry.Get(ws);
+            if (meta == null || cell.Row != meta.TopRow)
+            {
+                MessageBox.Show("메타 헤더의 셀을 선택한 후 타입을 지정하세요.");
+                return;
+            }
+
+            XqlColumnTypeRegistry.SetColumnType(ws, cell, type);
+            XqlSheetMetaRegistry.RefreshHeaderBorders(ws);
         }
+    }
 }

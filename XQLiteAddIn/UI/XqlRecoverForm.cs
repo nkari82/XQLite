@@ -1,6 +1,7 @@
 ﻿using ExcelDna.Integration;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -11,6 +12,8 @@ namespace XQLite.AddIn
 {
     public sealed class XqlRecoverForm : Form
     {
+        public sealed record Slice(string WorksheetName, string ListObjectName, int BodyTop, int BodyRows, int Cols, int BodyLeft);
+
         private static XqlRecoverForm? _inst;
         internal static void ShowSingleton() 
         { 
@@ -40,31 +43,39 @@ namespace XQLite.AddIn
             btnCancel.Click += (_, __) => _cts?.Cancel();
         }
 
+        internal static int PickBatchSize(int rowCount, int min = 200, int max = 2000)
+        {
+            // 행이 매우 많은 경우 작은 배치로 시작, 적으면 크게
+            if (rowCount > 20000) return min;  // 1k 미만 추천
+            if (rowCount > 5000) return Math.Min(1000, max);
+            return Math.Min(max, 1500);
+        }
+
         private async Task RunAsync()
         {
             if (_cts != null) return;
             _cts = new CancellationTokenSource(); btnCancel.Enabled = true; btnRun.Enabled = false; pb.Value = 0; lbl.Text = "Collecting tables...";
             try
             {
-                var tables = XqlFastTableReader.Collect();
+                var tables = Collect();
                 int totalRows = tables.Sum(t => t.BodyRows);
                 int doneRows = 0; int failures = 0;
 
                 await Task.WhenAll(tables.Select(t => Task.Run(async () =>
                 {
                     string tableName = XqlTableNameMap.Map(t.ListObjectName, t.WorksheetName);
-                    var headers = XqlFastTableReader.ReadHeader(t);
-                    int adaptive = XqlAdaptiveBatcher.PickBatchSize(t.BodyRows, (int)numBatch.Minimum, (int)numBatch.Maximum);
+                    var headers = ReadHeader(t);
+                    int adaptive = PickBatchSize(t.BodyRows, (int)numBatch.Minimum, (int)numBatch.Maximum);
                     int batch = Math.Min((int)numBatch.Value, adaptive);
 
-                    int idx = 1; var (scope, rate) = XqlPerf.Scope("Recover:" + tableName, tableName);
+                    int idx = 1; var (scope, rate) = Scope("Recover:" + tableName, tableName);
                     using (scope)
                     {
                         while (idx <= t.BodyRows)
                         {
                             _cts!.Token.ThrowIfCancellationRequested();
                             int take = Math.Min(batch, t.BodyRows - (idx - 1));
-                            var rows = XqlFastTableReader.ReadBodyChunks(t, headers, idx, take).ToList();
+                            var rows = ReadBodyChunks(t, headers, idx, take).ToList();
                             // 대강의 바이트 추정(키/값 문자열 길이 합)
                             long approxBytes = rows.Sum(r => r.Sum(kv => (kv.Key.Length + (kv.Value?.ToString()?.Length ?? 0))));
 
@@ -94,37 +105,93 @@ namespace XQLite.AddIn
 
         private void UpdateUi(int cur, int total, string text) { if (total <= 0) total = 1; int pct = Math.Min(100, Math.Max(0, (int)(100.0 * cur / total))); pb.Value = pct; lbl.Text = text; }
 
-        private static List<TableSlice> CollectTables()
+        internal static List<Slice> Collect()
         {
-            var app = (Excel.Application)ExcelDnaUtil.Application; var list = new List<TableSlice>();
+            var app = (Excel.Application)ExcelDnaUtil.Application;
+            var list = new List<Slice>();
             foreach (Excel.Worksheet ws in app.Worksheets)
             {
-                if (ws.ListObjects.Count == 0) continue;
+                if (ws.ListObjects.Count == 0)
+                    continue;
+
                 foreach (Excel.ListObject lo in ws.ListObjects)
                 {
-                    var body = lo.DataBodyRange; if (body == null) continue; var header = lo.HeaderRowRange; int cols = header.Columns.Count;
-                    list.Add(new TableSlice(ws.Name, lo.Name, body.Row, body.Rows.Count, cols, body.Column));
+                    var body = lo.DataBodyRange;
+                    if (body == null)
+                        continue;
+
+                    var header = lo.HeaderRowRange;
+                    int cols = header.Columns.Count;
+                    list.Add(new Slice(ws.Name, lo.Name, body.Row, body.Rows.Count, cols, body.Column));
                 }
             }
             return list;
         }
 
-        private static List<Dictionary<string, object?>> ReadRows(TableSlice t, int start1, int take)
+        internal static string[] ReadHeader(Slice s)
         {
-            var app = (Excel.Application)ExcelDnaUtil.Application; var ws = (Excel.Worksheet)app.Worksheets[t.WorksheetName];
-            var lo = ws.ListObjects[t.ListObjectName]; var header = lo.HeaderRowRange; var body = lo.DataBodyRange!;
-            int colCount = header.Columns.Count; var headerArr = (object[,])header.Value2; var cols = Enumerable.Range(1, colCount).Select(c => Convert.ToString(headerArr[1, c]) ?? "C" + c).ToArray();
-            var seg = body.Range[body.Cells[start1, 1], body.Cells[start1 + take - 1, colCount]]; var arr = (object[,])seg.Value2;
-            var rows = new List<Dictionary<string, object?>>(take);
-            for (int r = 1; r <= take; r++)
-            {
-                var d = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
-                for (int c = 1; c <= colCount; c++) { var v = arr[r, c]; if (v is string s && string.IsNullOrWhiteSpace(s)) v = null; d[cols[c - 1]] = v; }
-                rows.Add(d);
-            }
-            return rows;
+            var app = (Excel.Application)ExcelDnaUtil.Application;
+            var ws = (Excel.Worksheet)app.Worksheets[s.WorksheetName];
+            var lo = ws.ListObjects[s.ListObjectName];
+            var header = lo.HeaderRowRange;
+            int colCount = header.Columns.Count;
+            var arr = (object[,])header.Value2;
+            var headers = new string[colCount];
+            for (int c = 1; c <= colCount; c++)
+                headers[c - 1] = Convert.ToString(arr[1, c]) ?? $"C{c}";
+            return headers;
         }
 
-        private sealed record TableSlice(string WorksheetName, string ListObjectName, int BodyTop, int BodyRows, int Cols, int BodyLeft);
+        internal static IEnumerable<Dictionary<string, object?>> ReadBodyChunks(Slice s, string[] headers, int startRow1, int take)
+        {
+            var app = (Excel.Application)ExcelDnaUtil.Application;
+            var ws = (Excel.Worksheet)app.Worksheets[s.WorksheetName];
+            var lo = ws.ListObjects[s.ListObjectName];
+            var body = lo.DataBodyRange!;
+            int colCount = headers.Length;
+            int endRow1 = Math.Min(startRow1 + take - 1, s.BodyRows);
+            var seg = body.Range[body.Cells[startRow1, 1], body.Cells[endRow1, colCount]];
+            var arr = (object[,])seg.Value2;
+            for (int r = 1; r <= endRow1 - startRow1 + 1; r++)
+            {
+                var d = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+                for (int c = 1; c <= colCount; c++)
+                {
+                    var v = arr[r, c];
+                    if (v is string ss)
+                    {
+                        ss = ss.Trim();
+                        if (ss.Length == 0)
+                            v = null;
+                        else
+                            v = ss;
+                    }
+                    d[headers[c - 1]] = v; // 숫자/날짜 등은 Value2 원본 유지
+                }
+                yield return d;
+            }
+        }
+
+        internal static (IDisposable scope, Action<long> done) Scope(string name, string table = "*")
+        {
+            var sw = Stopwatch.StartNew();
+            return (new ScopeDisposable(() =>
+            {
+                var ms = sw.ElapsedMilliseconds; XqlLog.Info($"{name} took {ms} ms");
+            }), bytes =>
+            {
+                var ms = Math.Max(1, sw.ElapsedMilliseconds);
+                var kbps = (bytes / 1024.0) / (ms / 1000.0);
+                XqlLog.Info($"{name}: ~{kbps:F1} KB/s (approx) on {table}");
+            }
+            );
+        }
+
+        private sealed class ScopeDisposable : IDisposable
+        {
+            private readonly Action _on;
+            public ScopeDisposable(Action on) { _on = on; }
+            public void Dispose() { _on(); }
+        }
     }
 }

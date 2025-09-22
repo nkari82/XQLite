@@ -3,7 +3,7 @@
   <PropertyGroup>
     <TargetFramework>net48</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms> <!-- UserForm용 -->
-    <LangVersion>latest</LangVersion>         <!-- or 12.0 / 11.0 등 명시 -->
+    <LangVersion>preview</LangVersion>         <!-- or 12.0 / 11.0 등 명시 -->
 	<Nullable>enable</Nullable> <!-- Excel은 32/64비트 맞춰야 함 -->
     <EnableComHosting>true</EnableComHosting>
     <PlatformTarget>x64</PlatformTarget>

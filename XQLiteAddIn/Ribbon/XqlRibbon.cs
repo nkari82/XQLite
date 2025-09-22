@@ -30,6 +30,13 @@ namespace XQLite.AddIn
                   onAction='OnMetaRemove' imageMso='TableDelete'/>
           <button id='btnRefreshMeta' label='새로고침'
                   onAction='OnRefreshMeta' imageMso='Refresh'/>
+          <menu id='menuColType' label='Column Type' imageMso='TableInsertDialog'>
+            <button id='typeInt'  label='INT (정수)'  onAction='OnSetType' tag='INT' />
+            <button id='typeReal' label='REAL (실수)' onAction='OnSetType' tag='REAL' />
+            <button id='typeText' label='TEXT (문자)' onAction='OnSetType' tag='TEXT' />
+            <button id='typeBool' label='BOOL'       onAction='OnSetType' tag='BOOL' />
+            <button id='typeDate' label='DATE (날짜)' onAction='OnSetType' tag='DATE' />
+          </menu>
         </group>
       </tab>
     </tabs>
@@ -52,5 +59,12 @@ namespace XQLite.AddIn
         public void OnMetaInfo(IRibbonControl _) => XqlCommands.ShowMetaHeaderInfo();
         public void OnMetaRemove(IRibbonControl _) => XqlCommands.RemoveMetaHeader();
         public void OnRefreshMeta(IRibbonControl _) => XqlCommands.RefreshMetaHeader();
+
+        // 드롭다운 항목 공통 핸들러
+        public void OnSetType(IRibbonControl c)
+        {
+            var type = (c.Tag ?? "").Trim().ToUpperInvariant();
+            XqlCommands.SetType(type);
+        }
     }
 }

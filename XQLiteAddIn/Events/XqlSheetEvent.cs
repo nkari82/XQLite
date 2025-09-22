@@ -183,13 +183,7 @@ namespace XQLite.AddIn
             var d = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
             for (int c = 1; c <= colCount; c++)
             {
-                var v = arr[1, c];
-                if (v is string s)
-                {
-                    s = s.Trim();
-                    v = s.Length == 0 ? null : s;
-                }
-                d[headers[c - 1]] = v;
+                d[headers[c - 1]] = NormalizeCellValue(arr[1, c]);
             }
             return d;
         }
@@ -202,6 +196,41 @@ namespace XQLite.AddIn
                 if (kv.Value != null && kv.Value is not string) return false;
             }
             return true;
+        }
+
+        private static object? NormalizeCellValue(object? v)
+        {
+            if (v == null) return null;
+
+            if (v is double d)
+            {
+                // Excel 수치는 double → 정수 여부 판별
+                if (Math.Abs(d % 1) < 1e-9) return (long)d;
+                return d;
+            }
+
+            if (v is string s)
+            {
+                s = s.Trim();
+                if (s.Length == 0) return null;
+
+                // bool
+                if (bool.TryParse(s, out var b)) return b;
+
+                // number as string
+                if (double.TryParse(s, out var dn)) return dn;
+
+                // JSON?
+                if ((s.StartsWith("{") && s.EndsWith("}")) || (s.StartsWith("[") && s.EndsWith("]")))
+                {
+                    try { return XqlJson.Deserialize<object>(s); }
+                    catch { return s; }
+                }
+
+                return s;
+            }
+
+            return v; // fallback
         }
     }
 }
