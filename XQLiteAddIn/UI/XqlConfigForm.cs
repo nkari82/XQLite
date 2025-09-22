@@ -349,7 +349,10 @@ namespace XQLite.AddIn
             cfg.LockTtlSec = (int)numLockTtl.Value;
 
             cfg.Save(preferSidecar: true);
-            if (chkSecure.Checked) XqlSecrets.SaveApiKey(txtApiKey.Text); else XqlSecrets.Clear();
+            if (chkSecure.Checked) 
+                XqlGraphQLClient.Secrets.SaveApiKey(txtApiKey.Text); 
+            else 
+                XqlGraphQLClient.Secrets.Clear();
             XqlAddIn.Cfg = cfg;
 
             if (apply)

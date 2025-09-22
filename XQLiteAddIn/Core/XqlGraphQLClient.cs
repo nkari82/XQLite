@@ -3,7 +3,10 @@ using GraphQL;
 using GraphQL.Client.Http;
 using GraphQL.Client.Serializer.Newtonsoft;
 using System;
+using System.IO;
 using System.Net.Http.Headers;
+using System.Security.Cryptography;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -11,6 +14,37 @@ namespace XQLite.AddIn
 {
     internal static class XqlGraphQLClient
     {
+        internal static class Secrets
+        {
+            private static string Dir => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "XQLite");
+            private static string PathKey => System.IO.Path.Combine(Dir, "secrets.bin");
+
+            internal static void SaveApiKey(string apiKey)
+            {
+                Directory.CreateDirectory(Dir);
+                var plain = Encoding.UTF8.GetBytes(apiKey ?? string.Empty);
+                var protectedBytes = ProtectedData.Protect(plain, optionalEntropy: null, scope: DataProtectionScope.CurrentUser);
+                File.WriteAllBytes(PathKey, protectedBytes);
+            }
+
+            internal static string LoadApiKey()
+            {
+                try
+                {
+                    if (!File.Exists(PathKey)) return string.Empty;
+                    var bytes = File.ReadAllBytes(PathKey);
+                    var unprot = ProtectedData.Unprotect(bytes, optionalEntropy: null, scope: DataProtectionScope.CurrentUser);
+                    return Encoding.UTF8.GetString(unprot);
+                }
+                catch { return string.Empty; }
+            }
+
+            internal static void Clear()
+            {
+                try { if (File.Exists(PathKey)) File.Delete(PathKey); } catch { }
+            }
+        }
+
         internal static class NetPolicy
         {
             private static int _failCount;
@@ -81,7 +115,7 @@ namespace XQLite.AddIn
 
             _client = new GraphQLHttpClient(options, new NewtonsoftJsonSerializer());
 
-            string apiKey = cfg.ApiKey == "__DPAPI__" ? XqlSecrets.LoadApiKey() : cfg.ApiKey;
+            string apiKey = cfg.ApiKey == "__DPAPI__" ? Secrets.LoadApiKey() : cfg.ApiKey;
             if (!string.IsNullOrEmpty(apiKey))
                 _client.HttpClient.DefaultRequestHeaders.Add("x-api-key", apiKey);
             if (!string.IsNullOrEmpty(cfg.Nickname))

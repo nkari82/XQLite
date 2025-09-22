@@ -123,7 +123,7 @@ namespace XQLite.AddIn
             {
                 Title = "Save XQLite Diagnostic Bundle",
                 Filter = "ZIP Archive (*.zip)|*.zip",
-                FileName = Path.GetFileName(XqlDiagExport.DefaultDiagZipPath()),
+                FileName = Path.GetFileName(XqlDiagExportService.DefaultDiagZipPath()),
                 AddExtension = true,
                 OverwritePrompt = true
             })
@@ -134,7 +134,7 @@ namespace XQLite.AddIn
                     // UI 스레드 블로킹 없이 동작하도록 간단 래퍼
                     try
                     {
-                        await XqlDiagExport.ExportAsync(dlg.FileName);
+                        await XqlDiagExportService.ExportAsync(dlg.FileName);
                     }
                     catch (Exception ex)
                     {

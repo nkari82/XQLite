@@ -1,4 +1,4 @@
-﻿// XqlDiagExport.cs
+﻿// XqlDiagExportService.cs
 using ExcelDna.Integration;
 using Microsoft.Win32;
 using Newtonsoft.Json;
@@ -27,13 +27,12 @@ namespace XQLite.AddIn
     /// - graph/*.json : 서버 health, presence, (선택)rows 일부
     /// - xl/selection.txt : 현재 선택 정보
     /// </summary>
-    internal static class XqlDiagExport
+    internal static class XqlDiagExportService
     {
         // 기본 위치: %APPDATA%\XQLite\diag\XQLite_Diag_yyyyMMdd_HHmmss.zip
         internal static string DefaultDiagZipPath()
         {
             var root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "XQLite", "diag");
-            Directory.CreateDirectory(root);
             var ts = DateTime.Now.ToString("yyyyMMdd_HHmmss");
             return Path.Combine(root, $"XQLite_Diag_{ts}.zip");
         }

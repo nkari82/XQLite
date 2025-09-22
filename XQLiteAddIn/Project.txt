@@ -8,10 +8,13 @@ XqlJson.cs
 XqlTableNameMap.cs
 
 Events/XqlSheetEvent.cs 핵심요소
+
 Services/XqlLockService.cs 핵심요소
 Services/XqlPresenceService.cs 핵심요소
 Services/XqlSubscriptionService.cs 핵심요소
 Services/XqlRowSyncServices.cs 핵심요소
+Services/XqlDiagExportService.cs
+Services/XqlExportService.cs
 
 Core/XqlGraphQLClient.cs 핵심요소
 Core/XqlColumnTypeRegistry.cs 핵심요소
