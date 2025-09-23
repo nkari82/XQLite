@@ -25,6 +25,7 @@ namespace XQLite.AddIn
         private readonly XqlSync _sync;
         private readonly XqlCollab _collab;
         private readonly XqlMetaRegistry _meta;
+        private readonly XqlBackup _backup;
 
         private bool _started;
         private readonly object _uiGate = new();
@@ -33,12 +34,13 @@ namespace XQLite.AddIn
         private readonly System.Threading.Timer _heartbeatDebounce;
         private volatile string _lastCellRef = string.Empty;
 
-        public XqlExcelInterop(Excel.Application app, XqlSync sync, XqlCollab collab, XqlMetaRegistry meta)
+        public XqlExcelInterop(Excel.Application app, XqlSync sync, XqlCollab collab, XqlMetaRegistry meta, XqlBackup backup)
         {
             _app = app ?? throw new ArgumentNullException(nameof(app));
             _sync = sync ?? throw new ArgumentNullException(nameof(sync));
             _collab = collab ?? throw new ArgumentNullException(nameof(collab));
             _meta = meta ?? throw new ArgumentNullException(nameof(meta));
+            _backup = backup ?? throw new ArgumentNullException(nameof(backup));
 
             _heartbeatDebounce = new System.Threading.Timer(_ => SendHeartbeat(), null, Timeout.Infinite, Timeout.Infinite);
         }
@@ -89,8 +91,7 @@ namespace XQLite.AddIn
         public void Cmd_RecoverFromExcel()
         {
             // 원클릭 복구: 엑셀 파일을 원본으로 DB 재생성
-            // #FIXME Backup
-            //Backup?.RecoverFromExcel();
+            _backup.RecoverFromExcel();
         }
 
         public void Cmd_SetHeaderTooltipsForActiveSheet()

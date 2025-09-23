@@ -3,6 +3,7 @@ using System.IO;
 using System.Windows.Forms;
 using ExcelDna.Integration;
 using Excel = Microsoft.Office.Interop.Excel;
+
 namespace XQLite.AddIn
 {
     internal sealed class XqlAddIn : IExcelAddIn
@@ -12,6 +13,14 @@ namespace XQLite.AddIn
         private static readonly string AppDir =
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "XQLite");
         private static readonly string CfgPath = Path.Combine(AppDir, "config.json");
+
+        // ====== Singletons (런타임 구성요소) ======
+        private static IXqlBackend? _backend;
+        private static XqlMetaRegistry? _meta;
+        private static XqlSync? _sync;
+        private static XqlCollab? _collab;
+        private static XqlBackup? _backup;
+        private static XqlExcelInterop? _interop;
 
         public void AutoOpen()
         {
@@ -29,10 +38,7 @@ namespace XQLite.AddIn
 
         public void AutoClose()
         {
-            try
-            {
-                StopRuntime();
-            }
+            try { StopRuntime(); }
             catch { /* ignore */ }
         }
 
@@ -47,25 +53,33 @@ namespace XQLite.AddIn
         {
             try
             {
-                // 1) 기본 서비스 초기화
-                XqlGraphQLClient.Init(cfg);
-                XqlPresenceService.Start(cfg);
+                // 1) 백엔드 & 메타
+                _backend = new XqlGqlBackend(cfg.Endpoint, cfg.ApiKey); // GraphQL 클라이언트(HTTP/WS) 공용 인스턴스
+                _meta = new XqlMetaRegistry();
 
-                // 2) 락/동기화/구독 (필요 정책대로 택1/병행)
-                XqlLockService.Start();
+                // 2) 동기화/협업/백업
+                //    - XqlSync: push(업서트) ms, pull(증분) ms
+                _sync = new XqlSync(_backend, _meta,
+                    pushIntervalMs: Math.Max(250, cfg.DebounceMs),
+                    pullIntervalMs: Math.Max(1000, cfg.PullSec * 1000)); // Start/Stop 지원
+                _sync.Start(); // 구독 시작 포함 :contentReference[oaicite:5]{index=5}
 
-                XqlUpsert.Init(cfg.DebounceMs);
-                XqlSubscriptionService.Start(startSince: 0);
+                //    - XqlCollab: TTL/Heartbeat 간격 (초→ms)
+                _collab = new XqlCollab(_backend,
+                    ttlSeconds: Math.Max(5, cfg.LockTtlSec),
+                    heartbeatMs: Math.Max(1000, cfg.HeartbeatSec * 1000)); // 내부 타이머 운용 :contentReference[oaicite:6]{index=6}
 
-                // 3) 시트 이벤트 후킹
-                XqlSheetEvents.Hook();
+                //    - XqlBackup: 진단/복구/풀덤프
+                _backup = new XqlBackup(_backend, _meta, cfg.Endpoint, cfg.ApiKey); // 현재 시그니처 기준 :contentReference[oaicite:7]{index=7}
 
-                // 4) 파일 로거(부트스트랩에서 이미 켰다면 생략 가능)
-                XqlFileLogger.Start();
+                // 3) Excel 이벤트 훅
+                var app = (Excel.Application)ExcelDnaUtil.Application;
+                _interop = new XqlExcelInterop(app, _sync, _collab, _meta, _backup);
+                _interop.Start(); // Excel SheetChange/SelectionChange/Workbook 이벤트 연결 :contentReference[oaicite:8]{index=8}
             }
             catch (Exception ex)
             {
-                XqlLog.Error(ex.Message);
+                MessageBox.Show("Failed to start runtime: " + ex.Message, "XQLite", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
         }
 
@@ -73,17 +87,33 @@ namespace XQLite.AddIn
         {
             try
             {
-                XqlSheetEvents.Unhook();
-                XqlSubscriptionService.Stop();
-                XqlPresenceService.Stop();
-                XqlLockService.Stop();
+                // Excel 이벤트 해제
+                try { _interop?.Stop(); } catch { }
+                try { _interop?.Dispose(); } catch { }
+                _interop = null;
 
-                // 3) 파일 로거 종료(부트스트랩에서 관리 중이면 생략)
-                XqlFileLogger.Stop();
+                // 동기화/협업 정리
+                try { _sync?.Stop(); } catch { }
+                try { _sync?.Dispose(); } catch { }
+                _sync = null;
+
+                try { _collab?.Dispose(); } catch { }
+                _collab = null;
+
+                // 백업 객체 정리
+                try { _backup?.Dispose(); } catch { }
+                _backup = null;
+
+                // 백엔드 정리(마지막에)
+                try { _backend?.Dispose(); } catch { }
+                _backend = null;
+
+                // 메타는 관리 객체이므로 GC에 맡김
+                _meta = null;
             }
             catch (Exception ex)
             {
-                XqlLog.Error(ex.Message);
+                MessageBox.Show("Failed to stop runtime: " + ex.Message, "XQLite", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
         }
 
@@ -93,7 +123,6 @@ namespace XQLite.AddIn
             var cfg = LoadConfigFromFile() ?? new XqlConfig();
 
             // 1) 환경변수 우선 적용
-            //    (이름이 다르면 적합하게 교체)
             string? ep = Environment.GetEnvironmentVariable("XQLITE_ENDPOINT");
             if (!string.IsNullOrWhiteSpace(ep)) cfg.Endpoint = ep.Trim();
 
@@ -106,7 +135,7 @@ namespace XQLite.AddIn
             string? proj = Environment.GetEnvironmentVariable("XQLITE_PROJECT");
             if (!string.IsNullOrWhiteSpace(proj)) cfg.Project = proj.Trim();
 
-            // 2) 기본값 보정 (없으면 안전한 값)
+            // 2) 기본값 보정
             cfg.PullSec = cfg.PullSec <= 0 ? 10 : cfg.PullSec;
             cfg.DebounceMs = cfg.DebounceMs <= 0 ? 2000 : cfg.DebounceMs;
             cfg.HeartbeatSec = cfg.HeartbeatSec <= 0 ? 3 : cfg.HeartbeatSec;
