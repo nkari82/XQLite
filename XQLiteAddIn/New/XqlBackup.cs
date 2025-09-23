@@ -51,7 +51,7 @@ namespace XQLite.AddIn
         {
             try
             {
-                var tmp = CreateTempDir("xql_diag_");
+                var tmp = XqlCommon.CreateTempDir("xql_diag_");
                 try
                 {
                     // meta.json
@@ -79,11 +79,11 @@ namespace XQLite.AddIn
                     catch { /* 서버가 미구현이어도 무시 */ }
 
                     // zip
-                    SafeZipDirectory(tmp, outZipPath);
+                    XqlCommon.SafeZipDirectory(tmp, outZipPath);
                 }
                 finally
                 {
-                    TryDeleteDir(tmp);
+                    XqlCommon.TryDeleteDir(tmp);
                 }
             }
             catch (Exception ex)
@@ -118,7 +118,7 @@ namespace XQLite.AddIn
 
                     // 3) 배치 업서트 (upsertCells 기반)
                     var cells = RowsToCellEdits(sm.TableName ?? sheetName, rows);
-                    foreach (var chunk in Chunk(cells, batchSize))
+                    foreach (var chunk in XqlCommon.Chunk(cells, batchSize))
                         _backend.UpsertCells(chunk); // 에러는 내부에서 삼킴/반환
                 }
             }
@@ -136,7 +136,7 @@ namespace XQLite.AddIn
         {
             try
             {
-                var tmp = CreateTempDir("xql_export_");
+                var tmp = XqlCommon.CreateTempDir("xql_export_");
                 try
                 {
                     // 1) 서버가 풀 덤프를 지원하면 그 결과를 그대로 보관
@@ -154,11 +154,11 @@ namespace XQLite.AddIn
                     Directory.CreateDirectory(sheetsDir);
                     ExportAllSheetsCsv(sheetsDir);
 
-                    SafeZipDirectory(tmp, outZipPath);
+                    XqlCommon.SafeZipDirectory(tmp, outZipPath);
                 }
                 finally
                 {
-                    TryDeleteDir(tmp);
+                    XqlCommon.TryDeleteDir(tmp);
                 }
             }
             catch (Exception ex)
@@ -237,8 +237,8 @@ namespace XQLite.AddIn
             catch { }
             finally
             {
-                ReleaseCom(used);
-                ReleaseCom(ws);
+                XqlCommon.ReleaseCom(used);
+                XqlCommon.ReleaseCom(ws);
             }
             return list;
         }
@@ -313,7 +313,7 @@ namespace XQLite.AddIn
                 foreach (Excel.Worksheet w in app.Worksheets)
                 {
                     try { list.Add(w.Name); }
-                    finally { ReleaseCom(w); }
+                    finally { XqlCommon.ReleaseCom(w); }
                 }
             }
             catch { }
@@ -339,34 +339,15 @@ namespace XQLite.AddIn
                 // 헤더: 모든 키의 합집합 (메타로 제한되어 있지만 혹시 모를 차이를 위해 합집합)
                 var headers = rows.SelectMany(r => r.Keys).Distinct(StringComparer.Ordinal).ToList();
                 using var sw = new StreamWriter(path, false, new UTF8Encoding(false));
-                sw.WriteLine(string.Join(",", headers.Select(CsvEscape)));
+                sw.WriteLine(string.Join(",", headers.Select(XqlCommon.CsvEscape)));
 
                 foreach (var r in rows)
                 {
-                    var line = string.Join(",", headers.Select(h => CsvEscape(ValueToString(r.TryGetValue(h, out var v) ? v : null))));
+                    var line = string.Join(",", headers.Select(h => XqlCommon.CsvEscape(XqlCommon.ValueToString(r.TryGetValue(h, out var v) ? v : null))));
                     sw.WriteLine(line);
                 }
             }
             catch { }
-        }
-
-        private static string ValueToString(object? v)
-        {
-            if (v == null) return "";
-            if (v is bool b) return b ? "TRUE" : "FALSE";
-            if (v is DateTime dt) return dt.ToString("o");
-            if (v is double d) return d.ToString("R", CultureInfo.InvariantCulture);
-            if (v is float f) return ((double)f).ToString("R", CultureInfo.InvariantCulture);
-            if (v is decimal m) return ((double)m).ToString("R", CultureInfo.InvariantCulture);
-            return Convert.ToString(v, CultureInfo.InvariantCulture) ?? "";
-        }
-
-        private static string CsvEscape(string s)
-        {
-            if (s == null) return "";
-            bool needQuote = s.Contains(',') || s.Contains('"') || s.Contains('\n') || s.Contains('\r');
-            if (!needQuote) return s;
-            return "\"" + s.Replace("\"", "\"\"") + "\"";
         }
 
         private static string SafeFileName(string name)
@@ -376,34 +357,6 @@ namespace XQLite.AddIn
             foreach (var ch in name)
                 sb.Append(invalid.Contains(ch) ? '_' : ch);
             return sb.ToString();
-        }
-
-        private static string CreateTempDir(string prefix)
-        {
-            var root = Path.Combine(Path.GetTempPath(), prefix + Guid.NewGuid().ToString("N"));
-            Directory.CreateDirectory(root);
-            return root;
-        }
-
-        private static void SafeZipDirectory(string dir, string outZip)
-        {
-            try
-            {
-                if (File.Exists(outZip)) File.Delete(outZip);
-                ZipFile.CreateFromDirectory(dir, outZip, CompressionLevel.Fastest, includeBaseDirectory: false);
-            }
-            catch { }
-        }
-
-        private static void TryDeleteDir(string dir)
-        {
-            try { if (Directory.Exists(dir)) Directory.Delete(dir, true); } catch { }
-        }
-
-        private static void ReleaseCom(object? o)
-        {
-            try { if (o != null && Marshal.IsComObject(o)) Marshal.FinalReleaseComObject(o); }
-            catch { }
         }
 
         // ============================================================
@@ -418,13 +371,6 @@ namespace XQLite.AddIn
         }
 
         private readonly record struct EditCell(string Table, object RowKey, string Column, object? Value);
-
-        private static IEnumerable<List<T>> Chunk<T>(IReadOnlyList<T> list, int size)
-        {
-            if (size <= 0) size = 1000;
-            for (int i = 0; i < list.Count; i += size)
-                yield return list.Skip(i).Take(Math.Min(size, list.Count - i)).ToList();
-        }
 
         // ---------------- GraphQL Backend ----------------
         private sealed class Backend : IDisposable

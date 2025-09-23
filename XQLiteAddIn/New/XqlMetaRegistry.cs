@@ -78,8 +78,10 @@ namespace XQLite.AddIn
                 case ColumnKind.Real:
                     {
                         if (IsNullish(value)) return ValidationResult.Ok();
+#pragma warning disable CS8604 // 가능한 null 참조 인수입니다.
                         if (!TryToDouble(value, out var dv))
                             return ValidationResult.Fail(ErrCode.E_TYPE_MISMATCH, "Expect REAL.");
+#pragma warning restore CS8604 // 가능한 null 참조 인수입니다.
                         if (ct.Min.HasValue && dv < ct.Min.Value)
                             return ValidationResult.Fail(ErrCode.E_RANGE, $"REAL < Min({ct.Min})");
                         if (ct.Max.HasValue && dv > ct.Max.Value)
@@ -89,14 +91,18 @@ namespace XQLite.AddIn
                 case ColumnKind.Bool:
                     {
                         if (IsNullish(value)) return ValidationResult.Ok();
+#pragma warning disable CS8604 // 가능한 null 참조 인수입니다.
                         if (!TryToBool(value, out _))
                             return ValidationResult.Fail(ErrCode.E_TYPE_MISMATCH, "Expect BOOL.");
+#pragma warning restore CS8604 // 가능한 null 참조 인수입니다.
                         break;
                     }
                 case ColumnKind.Text:
                     {
                         if (IsNullish(value)) return ValidationResult.Ok();
+#pragma warning disable CS8604 // 가능한 null 참조 인수입니다.
                         var s = NormalizeToString(value);
+#pragma warning restore CS8604 // 가능한 null 참조 인수입니다.
                         if (ct.Regex != null && !ct.Regex.IsMatch(s))
                             return ValidationResult.Fail(ErrCode.E_CHECK_FAIL, "TEXT regex mismatch.");
                         break;
@@ -120,8 +126,10 @@ namespace XQLite.AddIn
                 case ColumnKind.Date:
                     {
                         if (IsNullish(value)) return ValidationResult.Ok();
+#pragma warning disable CS8604 // 가능한 null 참조 인수입니다.
                         if (!TryToDate(value, out _))
                             return ValidationResult.Fail(ErrCode.E_TYPE_MISMATCH, "Expect DATE.");
+#pragma warning restore CS8604 // 가능한 null 참조 인수입니다.
                         break;
                     }
                 default:
@@ -166,7 +174,7 @@ namespace XQLite.AddIn
                 return false;
             }
 
-            var tokens = spec.Split(new[] { ' ', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            var tokens = spec.Split([' ', '\t', '\r', '\n'], StringSplitOptions.RemoveEmptyEntries);
             if (tokens.Length == 0) return true;
 
             // 첫 토큰: 타입
@@ -453,8 +461,8 @@ namespace XQLite.AddIn
         public Regex? Regex;
 
         /// <summary>사용자 정의 체크(선택)</summary>
-        public Func<object?, bool>? CustomCheck;
-        public string? CustomCheckDescription;
+        public Func<object?, bool>? CustomCheck = null;
+        public string? CustomCheckDescription = null;
 
         /// <summary>툴팁용 요약 문자열</summary>
         public string ToTooltip()

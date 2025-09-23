@@ -23,18 +23,17 @@ namespace XQLite.AddIn
         private readonly Timer _ttlSweep;
         private readonly Timer _hbTimer;
 
-        private readonly Backend? _backend; // 서버 연동은 선택
+        private readonly IXqlBackend? _backend; // 서버 연동은 선택
 
         private readonly int _ttlSec;
         private readonly int _hbMs;
 
-        public XqlCollab(string? endpoint = null, string? apiKey = null, int ttlSeconds = 10, int heartbeatMs = 2500)
+        public XqlCollab(IXqlBackend backend, int ttlSeconds = 10, int heartbeatMs = 2500)
         {
             _ttlSec = Math.Max(5, ttlSeconds);
             _hbMs = Math.Max(1000, heartbeatMs);
 
-            if (!string.IsNullOrWhiteSpace(endpoint))
-                _backend = new Backend(new Uri(endpoint!), apiKey ?? "");
+            _backend = backend;
 
             _ttlSweep = new Timer(_ => Sweep(), null, 5000, 2000);
             _hbTimer = new Timer(_ => SendPeriodicHeartbeat(), null, Timeout.Infinite, Timeout.Infinite);
@@ -130,73 +129,6 @@ namespace XQLite.AddIn
             if (_cellLocks.TryGetValue(sheetExAddr, out by!)) return true;
             by = "";
             return false;
-        }
-
-        // ===== Backend (GraphQL.Client) =====
-        private sealed class Backend : IDisposable
-        {
-            // 🔧 프로젝트 스키마에 맞게 필요시 이름/필드 교체
-            private const string MUT_HEARTBEAT =
-@"
-mutation($nickname:String!, $cell:String){
-  presenceHeartbeat(nickname:$nickname, cell:$cell) { ok }
-}";
-            private const string MUT_ACQUIRE =
-@"
-mutation($cell:String!, $by:String!){
-  acquireLock(cell:$cell, by:$by) { ok }
-}";
-            private const string MUT_RELEASE_BY =
-@"
-mutation($by:String!){
-  releaseLocksBy(by:$by) { ok }
-}";
-
-            private readonly GraphQLHttpClient _http;
-
-            public Backend(Uri httpEndpoint, string apiKey)
-            {
-                _http = new GraphQLHttpClient(
-                    new GraphQLHttpClientOptions { EndPoint = httpEndpoint },
-                    new NewtonsoftJsonSerializer());
-                if (!string.IsNullOrWhiteSpace(apiKey))
-                    _http.HttpClient.DefaultRequestHeaders.Add("x-api-key", apiKey);
-            }
-
-            public void Dispose()
-            {
-                try { _http.Dispose(); } catch { }
-            }
-
-            public void PresenceHeartbeat(string nickname, string? cell)
-            {
-                try
-                {
-                    var req = new GraphQLRequest { Query = MUT_HEARTBEAT, Variables = new { nickname, cell } };
-                    _http.SendMutationAsync<JObject>(req).GetAwaiter().GetResult();
-                }
-                catch { }
-            }
-
-            public void AcquireLock(string cell, string by)
-            {
-                try
-                {
-                    var req = new GraphQLRequest { Query = MUT_ACQUIRE, Variables = new { cell, by } };
-                    _http.SendMutationAsync<JObject>(req).GetAwaiter().GetResult();
-                }
-                catch { }
-            }
-
-            public void ReleaseLocksBy(string by)
-            {
-                try
-                {
-                    var req = new GraphQLRequest { Query = MUT_RELEASE_BY, Variables = new { by } };
-                    _http.SendMutationAsync<JObject>(req).GetAwaiter().GetResult();
-                }
-                catch { }
-            }
         }
     }
 }

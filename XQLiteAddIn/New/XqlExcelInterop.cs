@@ -90,9 +90,7 @@ namespace XQLite.AddIn
         {
             // 원클릭 복구: 엑셀 파일을 원본으로 DB 재생성
             // #FIXME Backup
-#if false
-            XqlAddIn.Backup?.RecoverFromExcel();
-#endif
+            //Backup?.RecoverFromExcel();
         }
 
         public void Cmd_SetHeaderTooltipsForActiveSheet()
@@ -111,8 +109,8 @@ namespace XQLite.AddIn
                         kv => kv.Value.ToTooltip(),
                         StringComparer.Ordinal)
                     : new Dictionary<string, string>(StringComparer.Ordinal);
-                SetHeaderTooltips(sh, dict);
-                ReleaseCom(sh);
+                XqlSheetUtil.SetHeaderTooltips(sh, dict);
+                XqlCommon.ReleaseCom(sh);
             });
         }
 
@@ -121,7 +119,7 @@ namespace XQLite.AddIn
         private void App_WorkbookOpen(Excel.Workbook wb)
         {
             // 필요 시 통합문서 메타 초기화 등
-            ReleaseCom(wb);
+            XqlCommon.ReleaseCom(wb);
         }
 
         private void App_WorkbookBeforeClose(Excel.Workbook wb, ref bool Cancel)
@@ -129,7 +127,7 @@ namespace XQLite.AddIn
             // 락 해제, 프레즌스 정리 등
             var nickname = XqlAddIn.Cfg?.Nickname ?? "anonymous";
             _collab.ReleaseLocksBy(nickname);
-            ReleaseCom(wb);
+            XqlCommon.ReleaseCom(wb);
         }
 
         private void App_SheetSelectionChange(object Sh, Excel.Range Target)
@@ -145,8 +143,8 @@ namespace XQLite.AddIn
                 // 2초 디바운스 하트비트
                 _heartbeatDebounce.Change(2000, Timeout.Infinite);
 
-                ReleaseCom(Target);
-                ReleaseCom(sh);
+                XqlCommon.ReleaseCom(Target);
+                XqlCommon.ReleaseCom(sh);
             }
             catch { /* swallow */ }
         }
@@ -179,12 +177,12 @@ namespace XQLite.AddIn
                     }
                     finally
                     {
-                        ReleaseCom(cell);
+                        XqlCommon.ReleaseCom(cell);
                     }
                 }
 
-                ReleaseCom(Target);
-                ReleaseCom(sh);
+                XqlCommon.ReleaseCom(Target);
+                XqlCommon.ReleaseCom(sh);
             }
             catch { /* swallow */ }
         }
@@ -206,74 +204,6 @@ namespace XQLite.AddIn
             catch { /* swallow */ }
         }
 
-        // ========= 헤더 범위 / 툴팁 / 주석 =========
-
-        /// <summary>
-        /// 헤더: 1행의 연속된 타이틀 영역으로 가정(빈 셀을 만나면 종료).
-        /// </summary>
-        public Excel.Range GetHeaderRange(Excel.Worksheet sh)
-        {
-            Excel.Range? lastCell = null;
-            try
-            {
-                int col = 1;
-                for (; col <= sh.UsedRange.Columns.Count; col++)
-                {
-                    var cell = (Excel.Range)sh.Cells[1, col];
-                    var txt = (cell?.Value2 as string)?.Trim();
-                    if (string.IsNullOrEmpty(txt))
-                    {
-                        ReleaseCom(cell);
-                        break;
-                    }
-                    ReleaseCom(lastCell);
-                    lastCell = cell;
-                }
-
-                var lastCol = Math.Max(1, (lastCell?.Column as int?) ?? 1);
-                var rg = sh.Range[sh.Cells[1, 1], sh.Cells[1, lastCol]];
-                ReleaseCom(lastCell);
-                return rg;
-            }
-            catch
-            {
-                ReleaseCom(lastCell);
-                // fallback: A1
-                return (Excel.Range)sh.Cells[1, 1];
-            }
-        }
-
-        /// <summary>
-        /// 헤더 셀에 컬럼 타입/체크 제약을 툴팁(주석)으로 표시한다.
-        /// </summary>
-        public void SetHeaderTooltips(Excel.Worksheet sh, IReadOnlyDictionary<string, string> colToTip)
-        {
-            Excel.Range? header = null;
-            try
-            {
-                header = GetHeaderRange(sh);
-                foreach (Excel.Range cell in header.Cells)
-                {
-                    try
-                    {
-                        var colName = (cell.Value2 as string)?.Trim();
-                        if (string.IsNullOrEmpty(colName)) continue;
-                        if (!colToTip.TryGetValue(colName, out var tip)) continue;
-
-                        SafeClearComment(cell);
-                        SafeSetComment(cell, tip);
-                    }
-                    finally
-                    {
-                        ReleaseCom(cell);
-                    }
-                }
-            }
-            finally
-            {
-                ReleaseCom(header);
-            }
-        }
 
         private static void ApplyValidationVisual(Excel.Range cell, ValidationResult vr)
         {
@@ -387,18 +317,6 @@ namespace XQLite.AddIn
                     try { action(); } catch { /* swallow */ }
                 }
             }
-        }
-
-        // ========= COM 해제 유틸 =========
-
-        private static void ReleaseCom(object? com)
-        {
-            try
-            {
-                if (com != null && Marshal.IsComObject(com))
-                    Marshal.FinalReleaseComObject(com);
-            }
-            catch { /* ignore */ }
         }
     }
 }
