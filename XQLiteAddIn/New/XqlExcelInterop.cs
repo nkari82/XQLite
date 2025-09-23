@@ -26,6 +26,7 @@ namespace XQLite.AddIn
         private readonly XqlCollab _collab;
         private readonly XqlMetaRegistry _meta;
         private readonly XqlBackup _backup;
+        internal static XqlExcelInterop? Instance = null;
 
         private bool _started;
         private readonly object _uiGate = new();
@@ -36,6 +37,8 @@ namespace XQLite.AddIn
 
         public XqlExcelInterop(Excel.Application app, XqlSync sync, XqlCollab collab, XqlMetaRegistry meta, XqlBackup backup)
         {
+            Instance = this;
+
             _app = app ?? throw new ArgumentNullException(nameof(app));
             _sync = sync ?? throw new ArgumentNullException(nameof(sync));
             _collab = collab ?? throw new ArgumentNullException(nameof(collab));
@@ -85,7 +88,7 @@ namespace XQLite.AddIn
         public void Cmd_CommitSync()
         {
             // 서버에서 증분 Pull → Excel 반영은 XqlSync가 수행 (머지/충돌 로직 포함)
-            _ = _sync.PullSince(_sync.MaxRowVersion);
+            _sync.PullSince(_sync.MaxRowVersion);
         }
 
         public void Cmd_RecoverFromExcel()
@@ -199,8 +202,8 @@ namespace XQLite.AddIn
                 _collab.Heartbeat(nickname, cellRef);
 
                 // 선택 셀에 대한 락(낙관적으로 시도)
-                if (!string.IsNullOrEmpty(cellRef))
-                    _collab.TryAcquireCellLock(cellRef, nickname);
+                //if (!string.IsNullOrEmpty(cellRef))
+                //    _collab.TryAcquireCellLock(cellRef, nickname);
             }
             catch { /* swallow */ }
         }

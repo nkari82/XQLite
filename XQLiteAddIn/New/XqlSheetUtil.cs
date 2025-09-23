@@ -2,9 +2,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using ExcelDna.Integration;
 using Excel = Microsoft.Office.Interop.Excel;
-using static XQLite.AddIn.XqlCommon;
 
 namespace XQLite.AddIn
 {
@@ -20,15 +18,15 @@ namespace XQLite.AddIn
                 {
                     var cell = (Excel.Range)sh.Cells[1, col];
                     var txt = (cell?.Value2 as string)?.Trim();
-                    if (string.IsNullOrEmpty(txt)) { ReleaseCom(cell); break; }
-                    ReleaseCom(lastCell); lastCell = cell;
+                    if (string.IsNullOrEmpty(txt)) { XqlCommon.ReleaseCom(cell); break; }
+                    XqlCommon.ReleaseCom(lastCell); lastCell = cell;
                 }
                 var lastCol = Math.Max(1, (lastCell?.Column as int?) ?? 1);
                 var rg = sh.Range[sh.Cells[1, 1], sh.Cells[1, lastCol]];
-                ReleaseCom(lastCell);
+                XqlCommon.ReleaseCom(lastCell);
                 return rg;
             }
-            catch { ReleaseCom(lastCell); return (Excel.Range)sh.Cells[1, 1]; }
+            catch { XqlCommon.ReleaseCom(lastCell); return (Excel.Range)sh.Cells[1, 1]; }
         }
 
         public static (Excel.Range header, List<string> names) GetHeaderAndNames(Excel.Worksheet ws)
@@ -44,7 +42,7 @@ namespace XQLite.AddIn
                 return (header, names.Select(s => s.Trim()).ToList());
             }
             catch { return ((Excel.Range)ws.Cells[1, 1], names); }
-            finally { ReleaseCom(header); }
+            finally { XqlCommon.ReleaseCom(header); }
         }
 
         public static int FindKeyColumnIndex(List<string> headers, string keyName)
@@ -65,7 +63,7 @@ namespace XQLite.AddIn
         {
             try
             {
-                var used = ws.UsedRange; int lastRow = used.Row + used.Rows.Count - 1; ReleaseCom(used);
+                var used = ws.UsedRange; int lastRow = used.Row + used.Rows.Count - 1; XqlCommon.ReleaseCom(used);
                 for (int r = firstDataRow; r <= lastRow; r++)
                 {
                     Excel.Range? cell = null;
@@ -75,7 +73,7 @@ namespace XQLite.AddIn
                         var v = cell.Value2;
                         if (EqualKey(v, key)) return r;
                     }
-                    finally { ReleaseCom(cell); }
+                    finally { XqlCommon.ReleaseCom(cell); }
                 }
             }
             catch { }
@@ -106,10 +104,10 @@ namespace XQLite.AddIn
 #pragma warning restore CS8604 // 가능한 null 참조 인수입니다.
                         clear?.Invoke(cell); set?.Invoke(cell, tip);
                     }
-                    finally { ReleaseCom(cell); }
+                    finally { XqlCommon.ReleaseCom(cell); }
                 }
             }
-            finally { ReleaseCom(header); }
+            finally { XqlCommon.ReleaseCom(header); }
         }
     }
 }

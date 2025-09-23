@@ -1,4 +1,4 @@
-﻿// XqlGqlBackend.cs
+﻿// XqlGqlBackend.cs (async-first)
 using GraphQL;
 using GraphQL.Client.Http;
 using GraphQL.Client.Serializer.Newtonsoft;
@@ -7,10 +7,11 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace XQLite.AddIn
 {
-    
+    // ==== 공용 DTO ====
     internal readonly record struct EditCell(string Table, object RowKey, string Column, object? Value);
 
     internal sealed class RowPatch
@@ -44,25 +45,26 @@ namespace XQLite.AddIn
         public string? Check;
     }
 
+    // ==== Backend 인터페이스 (Async 전용) ====
     internal interface IXqlBackend : IDisposable
     {
         // sync
-        UpsertResult UpsertCells(IReadOnlyList<EditCell> cells);
-        PullResult PullRows(long since);
+        Task<UpsertResult> UpsertCells(IReadOnlyList<EditCell> cells, CancellationToken ct = default);
+        Task<PullResult> PullRows(long since, CancellationToken ct = default);
         void StartSubscription(Action<ServerEvent> onEvent, long since);
         void StopSubscription();
 
         // collab
-        void PresenceHeartbeat(string nickname, string? cell);
-        void AcquireLock(string cell, string by);
-        void ReleaseLocksBy(string by);
+        Task PresenceHeartbeat(string nickname, string? cell, CancellationToken ct = default);
+        Task AcquireLock(string cellOrResourceKey, string by, CancellationToken ct = default);
+        Task ReleaseLocksBy(string by, CancellationToken ct = default);
 
         // backup/schema
-        void TryCreateTable(string table, string key);
-        void TryAddColumns(string table, IEnumerable<ColumnDef> cols);
-        JObject? TryFetchServerMeta();
-        JArray? TryFetchAuditLog(long? since = null);
-        byte[]? TryExportDatabase();
+        Task TryCreateTable(string table, string key, CancellationToken ct = default);
+        Task TryAddColumns(string table, IEnumerable<ColumnDef> cols, CancellationToken ct = default);
+        Task<JObject?> TryFetchServerMeta(CancellationToken ct = default);
+        Task<JArray?> TryFetchAuditLog(long? since = null, CancellationToken ct = default);
+        Task<byte[]?> TryExportDatabase(CancellationToken ct = default);
     }
 
     internal sealed class XqlGqlBackend : IXqlBackend
@@ -116,45 +118,38 @@ namespace XQLite.AddIn
             }
         }
 
-        public void Dispose() 
-        { 
-            try 
-            { 
-                StopSubscription(); 
-            } 
-            catch { } 
-            
-            try 
-            { 
-                _http.Dispose(); 
-            } 
-            catch { } 
-            
-            try 
-            { 
-                _ws.Dispose(); 
-            } catch { } 
+        public void Dispose()
+        {
+            try { StopSubscription(); } catch { }
+            try { _http.Dispose(); } catch { }
+            try { _ws.Dispose(); } catch { }
         }
 
         // --- Sync ---
-        public UpsertResult UpsertCells(IReadOnlyList<EditCell> cells)
+        public async Task<UpsertResult> UpsertCells(IReadOnlyList<EditCell> cells, CancellationToken ct = default)
         {
             var req = new GraphQLRequest
             {
                 Query = MUT_UPSERT,
                 Variables = new
                 {
-                    cells = cells.Select(c => new { table = c.Table, row_key = c.RowKey, column = c.Column, value = c.Value }).ToArray()
+                    cells = cells.Select(c => new {
+                        table = c.Table,
+                        row_key = c.RowKey,
+                        column = c.Column,
+                        value = c.Value
+                    }).ToArray()
                 }
             };
-            var resp = _http.SendQueryAsync<JObject>(req).GetAwaiter().GetResult();
+            // ✅ 뮤테이션은 SendMutationAsync 사용
+            var resp = await _http.SendMutationAsync<JObject>(req, ct).ConfigureAwait(false);
             return ParseUpsert(resp.Data);
         }
 
-        public PullResult PullRows(long since)
+        public async Task<PullResult> PullRows(long since, CancellationToken ct = default)
         {
             var req = new GraphQLRequest { Query = Q_PULL, Variables = new { since } };
-            var resp = _http.SendQueryAsync<JObject>(req).GetAwaiter().GetResult();
+            var resp = await _http.SendQueryAsync<JObject>(req, ct).ConfigureAwait(false);
             return ParsePull(resp.Data);
         }
 
@@ -169,67 +164,80 @@ namespace XQLite.AddIn
                 () => { new Timer(_ => StartSubscription(onEvent, since), null, 2000, Timeout.Infinite); });
         }
 
-        public void StopSubscription() { try { _subscription?.Dispose(); } catch { } _subscription = null; }
+        public void StopSubscription()
+        {
+            try { _subscription?.Dispose(); } catch { }
+            _subscription = null;
+        }
 
         // --- Collab ---
-        public void PresenceHeartbeat(string nickname, string? cell)
-            => _http.SendMutationAsync<JObject>(new GraphQLRequest { Query = MUT_HEARTBEAT, Variables = new { nickname, cell } }).GetAwaiter().GetResult();
-        public void AcquireLock(string cell, string by)
-            => _http.SendMutationAsync<JObject>(new GraphQLRequest { Query = MUT_ACQUIRE, Variables = new { cell, by } }).GetAwaiter().GetResult();
-        public void ReleaseLocksBy(string by)
-            => _http.SendMutationAsync<JObject>(new GraphQLRequest { Query = MUT_RELEASE_BY, Variables = new { by } }).GetAwaiter().GetResult();
+        public async Task PresenceHeartbeat(string nickname, string? cell, CancellationToken ct = default)
+            => await _http.SendMutationAsync<JObject>(new GraphQLRequest { Query = MUT_HEARTBEAT, Variables = new { nickname, cell } }, ct).ConfigureAwait(false);
+
+        public async Task AcquireLock(string cellOrResourceKey, string by, CancellationToken ct = default)
+            => await _http.SendMutationAsync<JObject>(new GraphQLRequest { Query = MUT_ACQUIRE, Variables = new { cell = cellOrResourceKey, by } }, ct).ConfigureAwait(false);
+
+        public async Task ReleaseLocksBy(string by, CancellationToken ct = default)
+            => await _http.SendMutationAsync<JObject>(new GraphQLRequest { Query = MUT_RELEASE_BY, Variables = new { by } }, ct).ConfigureAwait(false);
 
         // --- Backup/Schema ---
-        public void TryCreateTable(string table, string key)
-            => _http.SendMutationAsync<JObject>(new GraphQLRequest { Query = MUT_CREATE_TABLE, Variables = new { table, key } }).GetAwaiter().GetResult();
-        public void TryAddColumns(string table, IEnumerable<ColumnDef> cols)
-            => _http.SendMutationAsync<JObject>(new GraphQLRequest
+        public async Task TryCreateTable(string table, string key, CancellationToken ct = default)
+            => await _http.SendMutationAsync<JObject>(new GraphQLRequest { Query = MUT_CREATE_TABLE, Variables = new { table, key } }, ct).ConfigureAwait(false);
+
+        public async Task TryAddColumns(string table, IEnumerable<ColumnDef> cols, CancellationToken ct = default)
+        {
+            await _http.SendMutationAsync<JObject>(new GraphQLRequest
             {
                 Query = MUT_ADD_COLUMNS,
-                Variables = new { table, columns = cols }
-            }).GetAwaiter().GetResult();
-        public JObject? TryFetchServerMeta()
-            => _http.SendQueryAsync<JObject>(new GraphQLRequest { Query = Q_META }).GetAwaiter().GetResult()?.Data?["meta"] as JObject;
-        public JArray? TryFetchAuditLog(long? since = null)
-            => _http.SendQueryAsync<JObject>(new GraphQLRequest { Query = Q_AUDIT, Variables = new { since } }).GetAwaiter().GetResult()?.Data?["audit_log"] as JArray;
-        public byte[]? TryExportDatabase()
+                Variables = new
+                {
+                    table,
+                    columns = cols.Select(c => new {
+                        name = c.Name,
+                        kind = c.Kind,
+                        notnull = c.NotNull,
+                        check = c.Check
+                    }).ToArray()
+                }
+            }, ct).ConfigureAwait(false);
+        }
+
+        public async Task<JObject?> TryFetchServerMeta(CancellationToken ct = default)
         {
-            var d = _http.SendQueryAsync<JObject>(new GraphQLRequest { Query = Q_EXPORT_DB }).GetAwaiter().GetResult()?.Data?["exportDatabase"]?.ToString();
+            var resp = await _http.SendQueryAsync<JObject>(new GraphQLRequest { Query = Q_META }, ct).ConfigureAwait(false);
+            return resp.Data?["meta"] as JObject;
+        }
+
+        public async Task<JArray?> TryFetchAuditLog(long? since = null, CancellationToken ct = default)
+        {
+            var resp = await _http.SendQueryAsync<JObject>(new GraphQLRequest { Query = Q_AUDIT, Variables = new { since } }, ct).ConfigureAwait(false);
+            return resp.Data?["audit_log"] as JArray;
+        }
+
+        public async Task<byte[]?> TryExportDatabase(CancellationToken ct = default)
+        {
+            var resp = await _http.SendQueryAsync<JObject>(new GraphQLRequest { Query = Q_EXPORT_DB }, ct).ConfigureAwait(false);
+            var d = resp.Data?["exportDatabase"]?.ToString();
             if (string.IsNullOrWhiteSpace(d)) return null;
             try { return Convert.FromBase64String(d); } catch { return null; }
         }
 
-        // --- Parsers (기존 XqlSync 파서 이동) ---
-        private static UpsertResult ParseUpsert(JObject? data) 
-        { 
-            /* XqlSync.ParseUpsert 내용 이동 */ 
-            return UpsertResult.From(data); 
-        }
-
-        private static PullResult ParsePull(JObject? data) 
-        { 
-            /* XqlSync.ParsePull  내용 이동 */ 
-            return PullResult.From(data); 
-        }
-
-        private static ServerEvent ParseSub(JObject? data) 
-        { 
-            /* XqlSync.ParseSub   내용 이동 */ 
-            return ServerEvent.From(data); 
-        }
+        // --- Parsers ---
+        private static UpsertResult ParseUpsert(JObject? data) => UpsertResult.From(data);
+        private static PullResult ParsePull(JObject? data) => PullResult.From(data);
+        private static ServerEvent ParseSub(JObject? data) => ServerEvent.From(data);
     }
 
-    // DTO들: XqlSync의 형식 재사용(팩토리 메서드 추가)
+    // ==== Parser DTO ====
     internal sealed class UpsertResult
     {
-        public long MaxRowVersion; 
-        public List<string>? Errors; 
+        public long MaxRowVersion;
+        public List<string>? Errors;
         public List<Conflict>? Conflicts;
 
-        public static UpsertResult From(JObject? data) 
+        public static UpsertResult From(JObject? data)
         {
-            /* 기존 로직 이식 */
-            var res = new UpsertResult { MaxRowVersion = 0, Errors = new List<string>(), Conflicts = new List<Conflict>() };
+            var res = new UpsertResult { MaxRowVersion = 0, Errors = [], Conflicts = new List<Conflict>() };
             if (data == null) return res;
 
             var root = data["upsertCells"] ?? data["upsertRows"];
@@ -259,12 +267,13 @@ namespace XQLite.AddIn
             return res;
         }
     }
+
     internal sealed class PullResult
     {
-        public long MaxRowVersion; 
+        public long MaxRowVersion;
         public List<RowPatch>? Patches;
 
-        public static PullResult From(JObject? data) 
+        public static PullResult From(JObject? data)
         {
             var res = new PullResult { MaxRowVersion = 0, Patches = new List<RowPatch>() };
             if (data == null) return res;
@@ -278,7 +287,7 @@ namespace XQLite.AddIn
             {
                 foreach (var p in pts.OfType<JObject>())
                 {
-#pragma warning disable CS8604 // 가능한 null 참조 인수입니다.
+#pragma warning disable CS8604
                     var rp = new RowPatch
                     {
                         Table = p["table"]?.ToString() ?? "",
@@ -287,8 +296,7 @@ namespace XQLite.AddIn
                         Deleted = p["deleted"]?.Type == JTokenType.Boolean && (bool)p["deleted"],
                         Cells = new Dictionary<string, object?>(StringComparer.Ordinal)
                     };
-#pragma warning restore CS8604 // 가능한 null 참조 인수입니다.
-
+#pragma warning restore CS8604
                     if (p["cells"] is JObject cc)
                         foreach (var prop in cc.Properties())
                             rp.Cells[prop.Name] = prop.Value.Type == JTokenType.Null ? null : prop.Value.ToObject<object?>();
@@ -299,11 +307,13 @@ namespace XQLite.AddIn
             return res;
         }
     }
+
     internal sealed class ServerEvent
     {
-        public long MaxRowVersion; 
+        public long MaxRowVersion;
         public List<RowPatch>? Patches;
-        public static ServerEvent From(JObject? data) 
+
+        public static ServerEvent From(JObject? data)
         {
             var ev = new ServerEvent { MaxRowVersion = 0, Patches = new List<RowPatch>() };
             if (data == null) return ev;
@@ -319,7 +329,7 @@ namespace XQLite.AddIn
             {
                 foreach (var p in pts.OfType<JObject>())
                 {
-#pragma warning disable CS8604 // 가능한 null 참조 인수입니다.
+#pragma warning disable CS8604
                     var rp = new RowPatch
                     {
                         Table = p["table"]?.ToString() ?? "",
@@ -328,8 +338,7 @@ namespace XQLite.AddIn
                         Deleted = p["deleted"]?.Type == JTokenType.Boolean && (bool)p["deleted"],
                         Cells = new Dictionary<string, object?>(StringComparer.Ordinal)
                     };
-#pragma warning restore CS8604 // 가능한 null 참조 인수입니다.
-
+#pragma warning restore CS8604
                     if (p["cells"] is JObject cc)
                         foreach (var prop in cc.Properties())
                             rp.Cells[prop.Name] = prop.Value.Type == JTokenType.Null ? null : prop.Value.ToObject<object?>();

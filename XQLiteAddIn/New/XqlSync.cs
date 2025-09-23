@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Threading;
+using System.Threading.Tasks;
 using ExcelDna.Integration;
 using Excel = Microsoft.Office.Interop.Excel;
 
@@ -33,7 +34,7 @@ namespace XQLite.AddIn
         private readonly ConcurrentQueue<Conflict> _conflicts = new();
         public bool TryDequeueConflict(out Conflict c) => _conflicts.TryDequeue(out c);
 
-        // ⬇️ 새로 추가: 엑셀 반영기
+        // ⬇️ 엑셀 반영기
         private readonly ExcelPatchApplier _applier;
 
         public XqlSync(IXqlBackend backend, XqlMetaRegistry meta, int pushIntervalMs = 2000, int pullIntervalMs = 10000)
@@ -42,20 +43,22 @@ namespace XQLite.AddIn
             _pushIntervalMs = Math.Max(250, pushIntervalMs);
             _pullIntervalMs = Math.Max(1000, pullIntervalMs);
 
-            _backend = backend;
+            _backend = backend ?? throw new ArgumentNullException(nameof(backend));
             _applier = new ExcelPatchApplier(_meta);
 
             _pushTimer = new Timer(_ => SafeFlushUpserts(), null, Timeout.Infinite, Timeout.Infinite);
-            _pullTimer = new Timer(_ => SafePull(), null, Timeout.Infinite, Timeout.Infinite);
+            _pullTimer = new Timer(_ => _ = SafePull(), null, Timeout.Infinite, Timeout.Infinite);
         }
 
         public void Start()
         {
             if (_disposed || _started) return;
             _started = true;
+
             _pushTimer.Change(_pushIntervalMs, _pushIntervalMs);
             _pullTimer.Change(_pullIntervalMs, _pullIntervalMs);
 
+            // ✅ 구독 시작은 동기 메서드 사용
             _backend.StartSubscription(OnServerEvent, MaxRowVersion);
         }
 
@@ -63,6 +66,7 @@ namespace XQLite.AddIn
         {
             if (!_started) return;
             _started = false;
+
             _pushTimer.Change(Timeout.Infinite, Timeout.Infinite);
             _pullTimer.Change(Timeout.Infinite, Timeout.Infinite);
 
@@ -87,57 +91,82 @@ namespace XQLite.AddIn
         }
 
         public void FlushUpsertsNow() => SafeFlushUpserts();
-        public PullResult? PullSince(long sinceVersion) => SafePull(sinceVersion);
+
+        public Task<PullResult?> PullSince(long sinceVersion) => SafePull(sinceVersion);
 
         private void SafeFlushUpserts()
         {
             if (!_started || _disposed) return;
+
             lock (_flushGate)
             {
-                try { FlushUpsertsCore(); }
-                catch (Exception ex) { _conflicts.Enqueue(Conflict.System("flush", ex.Message)); }
+                try
+                {
+                    // 비동기 코어 실행 (락 밖에서 await되도록 async void 유지)
+                    FlushUpsertsCore();
+                }
+                catch (Exception ex)
+                {
+                    _conflicts.Enqueue(Conflict.System("flush", ex.Message));
+                }
             }
         }
 
-        private PullResult? SafePull(long? sinceOverride = null)
+        private async Task<PullResult?> SafePull(long? sinceOverride = null)
         {
-            if (!_started || _disposed) 
+            if (!_started || _disposed)
                 return null;
+
+            Task<PullResult>? result;
 
             lock (_pullGate)
             {
-                try 
-                { 
-                    return PullCore(sinceOverride ?? MaxRowVersion); 
+                try
+                {
+                    result = PullCore(sinceOverride ?? MaxRowVersion);
                 }
-                catch (Exception ex) 
-                { 
+                catch (Exception ex)
+                {
                     _conflicts.Enqueue(Conflict.System("pull", ex.Message));
                     return null;
                 }
             }
+
+            return await result.ConfigureAwait(false);
         }
 
-        private void FlushUpsertsCore()
+        private async void FlushUpsertsCore()
         {
-            if (_outbox.IsEmpty) return;
-            var batch = DrainDedupCells(_outbox, 512);
-            if (batch.Count == 0) return;
+            try
+            {
+                if (_outbox.IsEmpty) return;
 
-            var resp = _backend.UpsertCells(batch);
-            if (resp.Errors?.Count > 0)
-                foreach (var e in resp.Errors) _conflicts.Enqueue(Conflict.System("upsert", e));
+                var batch = DrainDedupCells(_outbox, 512);
+                if (batch.Count == 0) return;
 
-            if (resp.MaxRowVersion > 0)
-                XqlCommon.InterlockedMax(ref _maxRowVersion, resp.MaxRowVersion);
+                var resp = await _backend.UpsertCells(batch).ConfigureAwait(false);
 
-            if (resp.Conflicts is { Count: > 0 })
-                foreach (var c in resp.Conflicts) _conflicts.Enqueue(c);
+                if (resp.Errors?.Count > 0)
+                    foreach (var e in resp.Errors)
+                        _conflicts.Enqueue(Conflict.System("upsert", e));
+
+                if (resp.MaxRowVersion > 0)
+                    XqlCommon.InterlockedMax(ref _maxRowVersion, resp.MaxRowVersion);
+
+                if (resp.Conflicts is { Count: > 0 })
+                    foreach (var c in resp.Conflicts)
+                        _conflicts.Enqueue(c);
+            }
+            catch (Exception ex)
+            {
+                _conflicts.Enqueue(Conflict.System("upsert.core", ex.Message));
+            }
         }
 
-        private PullResult PullCore(long sinceVersion)
+        private async Task<PullResult> PullCore(long sinceVersion)
         {
-            var resp = _backend.PullRows(sinceVersion);
+            var resp = await _backend.PullRows(sinceVersion).ConfigureAwait(false);
+
             if (resp.MaxRowVersion > 0)
                 XqlCommon.InterlockedMax(ref _maxRowVersion, resp.MaxRowVersion);
 
@@ -159,7 +188,7 @@ namespace XQLite.AddIn
                 if (ev.Patches is { Count: > 0 })
                     _applier.ApplyOnUiThread(ev.Patches);
 
-                // 안전성 위해 한 번 더 Pull
+                // 안전성 위해 한 번 더 Pull (fire-and-forget)
                 SafePull();
             }
             catch (Exception ex)
@@ -176,7 +205,7 @@ namespace XQLite.AddIn
 
             var map = new Dictionary<CellKey, EditCell>(temp.Count);
             foreach (var e in temp) map[new CellKey(e.Table, e.RowKey, e.Column)] = e;
-            return map.Values.ToList();
+            return [.. map.Values];
         }
 
         private readonly record struct CellKey(string Table, object RowKey, string Column);
@@ -191,7 +220,10 @@ namespace XQLite.AddIn
             public void ApplyOnUiThread(List<RowPatch> patches)
             {
                 if (patches == null || patches.Count == 0) return;
-                ExcelAsyncUtil.QueueAsMacro(() => { try { ApplyNow(patches); } catch { } });
+                ExcelAsyncUtil.QueueAsMacro(() =>
+                {
+                    try { ApplyNow(patches); } catch { }
+                });
             }
 
             private void ApplyNow(List<RowPatch> patches)

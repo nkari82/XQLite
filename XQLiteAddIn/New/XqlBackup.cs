@@ -1,4 +1,10 @@
 ﻿// XqlBackup.cs
+using ExcelDna.Integration;
+using GraphQL;
+using GraphQL.Client.Http;
+using GraphQL.Client.Serializer.Newtonsoft;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -7,14 +13,7 @@ using System.IO.Compression;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
-using Newtonsoft.Json;
-using Newtonsoft.Json.Linq;
-
-using GraphQL;
-using GraphQL.Client.Http;
-using GraphQL.Client.Serializer.Newtonsoft;
-
-using ExcelDna.Integration;
+using System.Threading.Tasks;
 using Excel = Microsoft.Office.Interop.Excel;
 
 namespace XQLite.AddIn
@@ -30,8 +29,11 @@ namespace XQLite.AddIn
         private readonly XqlMetaRegistry _meta;
         private readonly IXqlBackend _backend;
 
+        internal static XqlBackup? Instance = null;
+
         public XqlBackup(IXqlBackend backend, XqlMetaRegistry meta, string endpoint, string apiKey)
         {
+            Instance = this;
             _meta = meta ?? throw new ArgumentNullException(nameof(meta));
             _backend = backend;
         }
@@ -47,7 +49,7 @@ namespace XQLite.AddIn
         //   - sheets/*.csv
         //   - server/meta.json, server/audit_log.json (가능시)
         // ============================================================
-        public void ExportDiagnostics(string outZipPath)
+        public async Task ExportDiagnostics(string outZipPath)
         {
             try
             {
@@ -68,13 +70,14 @@ namespace XQLite.AddIn
                     {
                         var serverDir = Path.Combine(tmp, "server");
                         Directory.CreateDirectory(serverDir);
-                        var sMeta = _backend.TryFetchServerMeta();
-                        if (sMeta != null)
-                            File.WriteAllText(Path.Combine(serverDir, "meta.json"), sMeta.ToString(Formatting.Indented), new UTF8Encoding(false));
+                        var sMeta = await _backend.TryExportDatabase();
+                        
+                        //if (sMeta != null)
+                        //    File.WriteAllText(Path.Combine(serverDir, "meta.json"), sMeta.ToString(Formatting.Indented), new UTF8Encoding(false));
 
-                        var audit = _backend.TryFetchAuditLog();
-                        if (audit != null)
-                            File.WriteAllText(Path.Combine(serverDir, "audit_log.json"), audit.ToString(Formatting.Indented), new UTF8Encoding(false));
+                        var audit = await _backend.TryExportDatabase();
+                        //if (audit != null)
+                        //    File.WriteAllText(Path.Combine(serverDir, "audit_log.json"), audit.ToString(Formatting.Indented), new UTF8Encoding(false));
                     }
                     catch { /* 서버가 미구현이어도 무시 */ }
 
@@ -89,7 +92,7 @@ namespace XQLite.AddIn
             catch (Exception ex)
             {
                 // 실패는 무시(Excel 안정성 우선), 필요시 로그
-                System.Diagnostics.Debug.WriteLine("ExportDiagnostics failed: " + ex.Message);
+                XqlLog.Warn("ExportDiagnostics failed: " + ex.Message);
             }
         }
 
@@ -98,7 +101,7 @@ namespace XQLite.AddIn
         //   - 원칙: Excel 파일 = 동기화된 DB 원본
         //   - 절차: 스키마 생성/보강 → 배치 업서트 → 무결성 검사(서버 쪽) → 완료
         // ============================================================
-        public void RecoverFromExcel(int batchSize = 500)
+        public async void RecoverFromExcel(int batchSize = 500)
         {
             try
             {
@@ -106,33 +109,26 @@ namespace XQLite.AddIn
 
                 foreach (var sheetName in GetWorkbookSheets(app))
                 {
-                    // 메타가 등록된 시트만 처리
                     if (!_meta.TryGetSheet(sheetName, out var sm)) continue;
 
-                    // 1) 스키마 보강
-                    try { EnsureTableSchema(sm); } catch { /* 계속 진행 */ }
+                    await EnsureTableSchema(sm);
 
-                    // 2) 시트 → rows
                     var rows = ReadSheetRows(app, sheetName, sm);
                     if (rows.Count == 0) continue;
 
-                    // 3) 배치 업서트 (upsertCells 기반)
                     var cells = RowsToCellEdits(sm.TableName ?? sheetName, rows);
                     foreach (var chunk in XqlCommon.Chunk(cells, batchSize))
-                        _backend.UpsertCells(chunk); // 에러는 내부에서 삼킴/반환
+                        await _backend.UpsertCells(chunk);
                 }
             }
-            catch (Exception ex)
-            {
-                System.Diagnostics.Debug.WriteLine("RecoverFromExcel failed: " + ex.Message);
-            }
+            catch { }
         }
 
         // ============================================================
         // 3) Export DB (가능한 경우)
         //   - 서버 풀 덤프가 없다면 CSV 기반 진단 zip과 동일하게 동작
         // ============================================================
-        public void ExportDb(string outZipPath)
+        public async Task ExportDb(string outZipPath)
         {
             try
             {
@@ -140,7 +136,7 @@ namespace XQLite.AddIn
                 try
                 {
                     // 1) 서버가 풀 덤프를 지원하면 그 결과를 그대로 보관
-                    var dbBytes = _backend.TryExportDatabase();
+                    var dbBytes = await _backend.TryExportDatabase();
                     if (dbBytes != null)
                     {
                         var dbPath = Path.Combine(tmp, "database.sqlite");
@@ -170,23 +166,19 @@ namespace XQLite.AddIn
         // ============================================================
         // 내부: 스키마/행/셀 변환 유틸
         // ============================================================
-        private void EnsureTableSchema(SheetMeta sm)
+        private async Task EnsureTableSchema(SheetMeta sm)
         {
-            // 1) createTable (없으면 생성)
-            _backend.TryCreateTable(sm.TableName, sm.KeyColumn);
-
-            // 2) addColumns
+            await _backend.TryCreateTable(sm.TableName, sm.KeyColumn);
             var defs = sm.Columns.Select(kv => new ColumnDef
             {
                 Name = kv.Key,
                 Kind = kv.Value.Kind.ToString().ToLowerInvariant(),
                 NotNull = !kv.Value.Nullable,
-                // min/max/regex 등은 서버 CHECK로 넘길 수 있으면 전달(여기서는 간단화)
                 Check = null
             }).ToList();
-
-            _backend.TryAddColumns(sm.TableName, defs);
+            await _backend.TryAddColumns(sm.TableName, defs);
         }
+
 
         private static List<Dictionary<string, object?>> ReadSheetRows(Excel.Application app, string sheetName, SheetMeta sm)
         {
