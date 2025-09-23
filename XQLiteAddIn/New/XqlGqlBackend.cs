@@ -36,6 +36,14 @@ namespace XQLite.AddIn
             new Conflict { Kind = "system", Message = $"[{where}] {msg}" };
     }
 
+    internal sealed class ColumnDef
+    {
+        public string Name = "";
+        public string Kind = "text";   // int/real/text/bool/json/date
+        public bool NotNull = false;
+        public string? Check;
+    }
+
     internal interface IXqlBackend : IDisposable
     {
         // sync
@@ -51,7 +59,7 @@ namespace XQLite.AddIn
 
         // backup/schema
         void TryCreateTable(string table, string key);
-        void TryAddColumns(string table, IEnumerable<(string name, string kind, bool notnull, string? check)> cols);
+        void TryAddColumns(string table, IEnumerable<ColumnDef> cols);
         JObject? TryFetchServerMeta();
         JArray? TryFetchAuditLog(long? since = null);
         byte[]? TryExportDatabase();
@@ -174,11 +182,11 @@ namespace XQLite.AddIn
         // --- Backup/Schema ---
         public void TryCreateTable(string table, string key)
             => _http.SendMutationAsync<JObject>(new GraphQLRequest { Query = MUT_CREATE_TABLE, Variables = new { table, key } }).GetAwaiter().GetResult();
-        public void TryAddColumns(string table, IEnumerable<(string name, string kind, bool notnull, string? check)> cols)
+        public void TryAddColumns(string table, IEnumerable<ColumnDef> cols)
             => _http.SendMutationAsync<JObject>(new GraphQLRequest
             {
                 Query = MUT_ADD_COLUMNS,
-                Variables = new { table, columns = cols.Select(c => new { name = c.name, kind = c.kind, notnull = c.notnull, check = c.check }).ToArray() }
+                Variables = new { table, columns = cols }
             }).GetAwaiter().GetResult();
         public JObject? TryFetchServerMeta()
             => _http.SendQueryAsync<JObject>(new GraphQLRequest { Query = Q_META }).GetAwaiter().GetResult()?.Data?["meta"] as JObject;

@@ -28,12 +28,12 @@ namespace XQLite.AddIn
     internal sealed class XqlBackup : IDisposable
     {
         private readonly XqlMetaRegistry _meta;
-        private readonly Backend _backend;
+        private readonly IXqlBackend _backend;
 
-        public XqlBackup(XqlMetaRegistry meta, string endpoint, string apiKey)
+        public XqlBackup(IXqlBackend backend, XqlMetaRegistry meta, string endpoint, string apiKey)
         {
             _meta = meta ?? throw new ArgumentNullException(nameof(meta));
-            _backend = new Backend(new Uri(endpoint ?? throw new ArgumentNullException(nameof(endpoint))), apiKey ?? "");
+            _backend = backend;
         }
 
         public void Dispose()
@@ -357,164 +357,6 @@ namespace XQLite.AddIn
             foreach (var ch in name)
                 sb.Append(invalid.Contains(ch) ? '_' : ch);
             return sb.ToString();
-        }
-
-        // ============================================================
-        // DTO/백엔드
-        // ============================================================
-        private sealed class ColumnDef
-        {
-            public string Name = "";
-            public string Kind = "text";   // int/real/text/bool/json/date
-            public bool NotNull = false;
-            public string? Check;
-        }
-
-        private readonly record struct EditCell(string Table, object RowKey, string Column, object? Value);
-
-        // ---------------- GraphQL Backend ----------------
-        private sealed class Backend : IDisposable
-        {
-            // 스키마 이름은 프로젝트에 맞게 교체 가능
-            private const string MUT_CREATE_TABLE =
-@"
-mutation($table:String!, $key:String!){
-  createTable(table:$table, key:$key){ ok }
-}";
-            private const string MUT_ADD_COLUMNS =
-@"
-mutation($table:String!, $columns:[ColumnDefInput!]!){
-  addColumns(table:$table, columns:$columns){ ok }
-}";
-            private const string MUT_UPSERT_CELLS =
-@"
-mutation($cells:[CellEditInput!]!){
-  upsertCells(cells:$cells){
-    max_row_version
-    errors
-  }
-}";
-            private const string Q_META =
-@"
-query{
-  meta{ schema_hash max_row_version tables{ name cols{ name kind notnull } } }
-}";
-            private const string Q_AUDIT =
-@"
-query($since:Long){
-  audit_log(since_version:$since){ ts user table row_key column old_value new_value row_version }
-}";
-            private const string Q_EXPORT_DB =
-@"
-query{ exportDatabase }"; // base64 string 혹은 null (서버 미지원시 null)
-
-            private readonly GraphQLHttpClient _http;
-
-            public Backend(Uri endpoint, string apiKey)
-            {
-                _http = new GraphQLHttpClient(
-                    new GraphQLHttpClientOptions { EndPoint = endpoint },
-                    new NewtonsoftJsonSerializer());
-                if (!string.IsNullOrWhiteSpace(apiKey))
-                    _http.HttpClient.DefaultRequestHeaders.Add("x-api-key", apiKey);
-            }
-
-            public void Dispose()
-            {
-                try { _http.Dispose(); } catch { }
-            }
-
-            public void TryCreateTable(string table, string key)
-            {
-                try
-                {
-                    var req = new GraphQLRequest { Query = MUT_CREATE_TABLE, Variables = new { table, key } };
-                    _http.SendMutationAsync<JObject>(req).GetAwaiter().GetResult();
-                }
-                catch { }
-            }
-
-            public void TryAddColumns(string table, List<ColumnDef> cols)
-            {
-                try
-                {
-                    var req = new GraphQLRequest
-                    {
-                        Query = MUT_ADD_COLUMNS,
-                        Variables = new
-                        {
-                            table,
-                            columns = cols.Select(c => new
-                            {
-                                name = c.Name,
-                                kind = c.Kind,
-                                notnull = c.NotNull,
-                                check = c.Check
-                            }).ToArray()
-                        }
-                    };
-                    _http.SendMutationAsync<JObject>(req).GetAwaiter().GetResult();
-                }
-                catch { }
-            }
-
-            public void UpsertCells(List<EditCell> cells)
-            {
-                try
-                {
-                    var req = new GraphQLRequest
-                    {
-                        Query = MUT_UPSERT_CELLS,
-                        Variables = new
-                        {
-                            cells = cells.Select(c => new
-                            {
-                                table = c.Table,
-                                row_key = c.RowKey,
-                                column = c.Column,
-                                value = c.Value
-                            }).ToArray()
-                        }
-                    };
-                    _http.SendMutationAsync<JObject>(req).GetAwaiter().GetResult();
-                }
-                catch { }
-            }
-
-            public JObject? TryFetchServerMeta()
-            {
-                try
-                {
-                    var req = new GraphQLRequest { Query = Q_META };
-                    var resp = _http.SendQueryAsync<JObject>(req).GetAwaiter().GetResult();
-                    return resp.Data as JObject;
-                }
-                catch { return null; }
-            }
-
-            public JArray? TryFetchAuditLog(long sinceVersion = 0)
-            {
-                try
-                {
-                    var req = new GraphQLRequest { Query = Q_AUDIT, Variables = new { since = sinceVersion } };
-                    var resp = _http.SendQueryAsync<JObject>(req).GetAwaiter().GetResult();
-                    return resp.Data?["audit_log"] as JArray;
-                }
-                catch { return null; }
-            }
-
-            public byte[]? TryExportDatabase()
-            {
-                try
-                {
-                    var req = new GraphQLRequest { Query = Q_EXPORT_DB };
-                    var resp = _http.SendQueryAsync<JObject>(req).GetAwaiter().GetResult();
-                    var base64 = resp.Data?["exportDatabase"]?.ToString();
-                    if (string.IsNullOrEmpty(base64)) return null;
-                    return Convert.FromBase64String(base64);
-                }
-                catch { return null; }
-            }
         }
     }
 }
