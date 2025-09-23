@@ -8,6 +8,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
+#if false
 namespace XQLite.AddIn
 {
     /// <summary>
@@ -347,3 +348,4 @@ mutation ($table:String!, $rows:[JSON!]!) {
         }
     }
 }
+#endif

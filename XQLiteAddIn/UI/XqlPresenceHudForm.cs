@@ -28,6 +28,8 @@ namespace XQLite.AddIn
 
         private async Task RefreshAsync()
         {
+            // #FIXME
+#if false
             try
             {
                 const string q = "query{ presence{ nickname sheet cell updated_at } }";
@@ -39,6 +41,8 @@ namespace XQLite.AddIn
                 lv.EndUpdate();
             }
             catch { /* 서버가 지원 안하면 조용히 */ }
+#endif
+            
         }
 
         private sealed class PresenceResp { public PresenceItem[]? presence { get; set; } }

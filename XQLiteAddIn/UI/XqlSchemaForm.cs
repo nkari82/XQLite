@@ -212,6 +212,8 @@ namespace XQLite.AddIn
                 const string q1 = "query{ schema{ tables{ name rowCount columns{ name type notNull default } } } }";
                 try
                 {
+                    // #FIXME
+#if false
                     var r = await XqlGraphQLClient.QueryAsync<DbSchemaResp>(q1, null);
                     var srvTables = r.Data?.schema?.tables;
                     if (srvTables != null)
@@ -242,6 +244,7 @@ namespace XQLite.AddIn
                         BindTables(items);
                         return;
                     }
+#endif
                 }
                 catch
                 {
@@ -249,6 +252,7 @@ namespace XQLite.AddIn
                 }
 
                 // 2차: 인트로스펙션으로 'rows' 필드 갖는 타입을 테이블로 추정
+#if false
                 const string q2 = "query{ __schema{ types{ name kind fields{ name } } } }";
                 var ir = await XqlGraphQLClient.QueryAsync<IntrospectResp>(q2, null);
                 var types = ir.Data?.__schema?.types ?? Array.Empty<IntrospectType>();
@@ -269,6 +273,7 @@ namespace XQLite.AddIn
                     .ToArray();
 
                 BindTables(approx);
+#endif
             }
             catch
             {
@@ -310,6 +315,8 @@ namespace XQLite.AddIn
             // 없으면 rows(table, limit:1)로 추정
             try
             {
+                // #FIXME
+#if false
                 const string q = "query($t:String!){ rows(table:$t, limit:1){ rows } }";
                 var r = await XqlGraphQLClient.QueryAsync<RowsOnlyResp>(q, new { t = meta.Name });
                 var rows = r.Data?.rows?.FirstOrDefault()?.rows ?? Array.Empty<Dictionary<string, object?>>();
@@ -325,6 +332,7 @@ namespace XQLite.AddIn
                 }).ToArray();
 
                 BindCols(cols);
+#endif
             }
             catch
             {

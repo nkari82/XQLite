@@ -82,9 +82,12 @@ namespace XQLite.AddIn
                             const string m = @"mutation ($table:String!,$rows:[JSON!]!){ upsertRows(table:$table, rows:$rows){ affected, errors{code,message}, max_row_version } }";
                             try
                             {
+                                // #FIXME 
+#if false
                                 var resp = await XqlGraphQLClient.MutateAsync<XqlUpsert.UpsertResp>(m, new { table = tableName, rows });
                                 var data = resp.Data?.upsertRows;
                                 if (data?.errors?.Length > 0) Interlocked.Add(ref failures, data.errors.Length);
+#endif
                             }
                             catch { Interlocked.Increment(ref failures); }
 

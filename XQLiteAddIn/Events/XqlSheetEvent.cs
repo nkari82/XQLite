@@ -5,6 +5,7 @@ using System.Linq;
 using ExcelDna.Integration;
 using Excel = Microsoft.Office.Interop.Excel;
 
+#if false
 namespace XQLite.AddIn
 {
     internal static class XqlSheetEvents
@@ -234,3 +235,4 @@ namespace XQLite.AddIn
         }
     }
 }
+#endif

@@ -3,6 +3,7 @@ using System;
 using System.Collections.Generic;
 using System.Threading.Tasks;
 
+#if false
 namespace XQLite.AddIn
 {
     internal static class XqlSubscriptionService
@@ -79,3 +80,4 @@ namespace XQLite.AddIn
         }
     }
 }
+#endif

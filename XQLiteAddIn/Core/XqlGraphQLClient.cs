@@ -10,6 +10,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
+#if false
 namespace XQLite.AddIn
 {
     internal static class XqlGraphQLClient
@@ -143,3 +144,4 @@ namespace XQLite.AddIn
         }
     }
 }
+#endif

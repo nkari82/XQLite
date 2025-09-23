@@ -5,6 +5,7 @@ using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 
+#if false
 namespace XQLite.AddIn
 {
     internal static class XqlExportService
@@ -56,3 +57,4 @@ namespace XQLite.AddIn
         }
     }
 }
+#endif

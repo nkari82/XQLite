@@ -2,6 +2,7 @@
 using System.Drawing;
 using System.Windows.Forms;
 
+#if false
 namespace XQLite.AddIn
 {
     public sealed class XqlCommandPaletteForm : Form
@@ -61,3 +62,4 @@ namespace XQLite.AddIn
         }
     }
 }
+#endif

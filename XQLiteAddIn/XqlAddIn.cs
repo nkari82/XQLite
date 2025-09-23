@@ -10,6 +10,13 @@ namespace XQLite.AddIn
     {
         // ====== Config ======
         internal static XqlConfig? Cfg { get; set; }
+        internal static IXqlBackend? Backend { get; }
+        internal static XqlMetaRegistry? MetaRegistry { get; }
+        internal static XqlSync? Sync { get; }
+        internal static XqlCollab? Collab { get; }
+        internal static XqlBackup? Backup { get; }
+        internal static XqlExcelInterop? ExcelInterop { get; }
+
         private static readonly string AppDir =
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "XQLite");
         private static readonly string CfgPath = Path.Combine(AppDir, "config.json");

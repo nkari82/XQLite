@@ -31,7 +31,6 @@ namespace XQLite.AddIn
         private readonly int _ttlSec;
         private readonly int _hbMs;
 
-        private volatile string _lastNickname = "anonymous";
         private volatile string _lastCellRef = ""; // "Sheet!A1"
 
         internal static XqlCollab? Instance = null;
@@ -60,7 +59,6 @@ namespace XQLite.AddIn
         /// <summary>선택 변경 시 호출: 현재 선택 셀을 알려주면 디바운스된 하트비트로 반영됩니다.</summary>
         public void NotifySelection(string nickname, string sheetExAddr)
         {
-            _lastNickname = string.IsNullOrWhiteSpace(nickname) ? "anonymous" : nickname;
             _lastCellRef = sheetExAddr ?? "";
             _hbTimer.Change(_hbMs, Timeout.Infinite);
         }
@@ -87,7 +85,8 @@ namespace XQLite.AddIn
 
         private void SendPeriodicHeartbeat()
         {
-            try { Heartbeat(_lastNickname, _lastCellRef); }
+            var nickname = XqlAddIn.Cfg?.Nickname ?? "anonymous";
+            try { Heartbeat(nickname, _lastCellRef); }
             catch { }
         }
 
@@ -139,15 +138,18 @@ namespace XQLite.AddIn
         }
 
         /// <summary>셀 락 시도(동기). 성공 시 로컬/서버에 반영.</summary>
-        public bool TryAcquireCellLock(string sheet, string address, string byNickname)
+        public async Task<bool> TryAcquireCellLock(string sheet, string address, string byNickname)
         {
+            if (_backend == null)
+                return false;
+
             try
             {
                 var key = BuildCellKey(sheet, address);
                 if (_locks.TryAdd(key, byNickname))
                 {
                     // 서버에는 통합 acquireLock(key, by)로 전달
-                    _backend?.AcquireLock(key, byNickname);
+                    await _backend.AcquireLock(key, byNickname);
                     return true;
                 }
                 return false;
@@ -156,29 +158,23 @@ namespace XQLite.AddIn
         }
 
         /// <summary>컬럼 락 시도(동기). 성공 시 로컬/서버에 반영.</summary>
-        public bool TryAcquireColumnLock(string table, string column, string byNickname)
+        public async Task<bool> TryAcquireColumnLock(string table, string column, string byNickname)
         {
+            if (_backend == null)
+                return false;
+
             try
             {
                 var key = BuildColumnKey(table, column);
                 if (_locks.TryAdd(key, byNickname))
                 {
                     // 서버에는 통합 acquireLock(key, by)로 전달
-                    _backend?.AcquireLock(key, byNickname);
+                    await _backend.AcquireLock(key, byNickname);
                     return true;
                 }
                 return false;
             }
             catch { return false; }
         }
-        public Task<bool> AcquireColumnAsync(string table, string column, int ttlSec = 10)
-            => Task.Run(() => TryAcquireColumnLock(table, column, _lastNickname));
-
-        /// <summary>
-        /// 기존: XqlLockService.AcquireCellAsync(sheet, address)
-        /// - 닉네임은 내부 Presence 상태(_lastNickname) 사용
-        /// </summary>
-        public Task<bool> AcquireCellAsync(string sheet, string address, int ttlSec = 10)
-            => Task.Run(() => TryAcquireCellLock(sheet, address, _lastNickname));
     }
 }

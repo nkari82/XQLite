@@ -33,6 +33,7 @@ namespace XQLite.AddIn
 
         // 선택 변경 스팸 억제를 위한 디바운서
         private readonly System.Threading.Timer _heartbeatDebounce;
+        private volatile string _lastNickname = string.Empty;
         private volatile string _lastCellRef = string.Empty;
 
         public XqlExcelInterop(Excel.Application app, XqlSync sync, XqlCollab collab, XqlMetaRegistry meta, XqlBackup backup)
@@ -129,8 +130,7 @@ namespace XQLite.AddIn
         private void App_WorkbookBeforeClose(Excel.Workbook wb, ref bool Cancel)
         {
             // 락 해제, 프레즌스 정리 등
-            var nickname = XqlAddIn.Cfg?.Nickname ?? "anonymous";
-            _collab.ReleaseLocksBy(nickname);
+            _collab.ReleaseLocksBy(_lastNickname);
             XqlCommon.ReleaseCom(wb);
         }
 
@@ -197,7 +197,7 @@ namespace XQLite.AddIn
         {
             try
             {
-                var nickname = XqlAddIn.Cfg?.Nickname ?? "anonymous";
+                var nickname = _lastNickname;
                 var cellRef = _lastCellRef;
                 _collab.Heartbeat(nickname, cellRef);
 

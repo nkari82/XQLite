@@ -2,6 +2,7 @@
 using System.Threading.Tasks;
 using System.Timers;
 
+#if false
 namespace XQLite.AddIn
 {
     internal static class XqlPresenceService
@@ -48,3 +49,4 @@ namespace XQLite.AddIn
         }
     }
 }
+#endif

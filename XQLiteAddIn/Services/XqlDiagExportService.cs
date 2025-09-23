@@ -16,6 +16,7 @@ using System.Threading.Tasks;
 using System.Windows.Forms;
 using Excel = Microsoft.Office.Interop.Excel;
 
+#if false
 namespace XQLite.AddIn
 {
     /// <summary>
@@ -280,3 +281,4 @@ namespace XQLite.AddIn
         }
     }
 }
+#endif

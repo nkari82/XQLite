@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Text.RegularExpressions;
 using Excel = Microsoft.Office.Interop.Excel;
 
+#if false
 namespace XQLite.AddIn
 {
     internal static class XqlColumnTypeRegistry
@@ -324,3 +325,4 @@ namespace XQLite.AddIn
 
     }
 }
+#endif

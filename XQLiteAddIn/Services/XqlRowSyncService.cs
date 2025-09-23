@@ -10,6 +10,7 @@ using System.Linq;
 using System.Threading.Tasks;
 using Excel = Microsoft.Office.Interop.Excel;
 
+#if false
 namespace XQLite.AddIn
 {
     internal static class XqlRowSyncService
@@ -283,3 +284,4 @@ namespace XQLite.AddIn
         }
     }
 }
+#endif

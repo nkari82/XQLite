@@ -1,4 +1,9 @@
-﻿using ExcelDna.Integration.CustomUI;
+﻿using ExcelDna.Integration;
+using ExcelDna.Integration.CustomUI;
+using System;
+using System.IO;
+using System.Windows.Forms;
+using Excel = Microsoft.Office.Interop.Excel;
 
 namespace XQLite.AddIn
 {
@@ -43,28 +48,156 @@ namespace XQLite.AddIn
   </ribbon>
 </customUI>";
 
-        // General
-        public void OnConfig(IRibbonControl _) => XqlCommands.ConfigCommand();
-        public void OnCommit(IRibbonControl _) => XqlCommands.CommitCommand();
-        public void OnRecover(IRibbonControl _) => XqlCommands.RecoverCommand();
-        public void OnInspector(IRibbonControl _) => XqlCommands.InspectorCommand();
-        public void OnExport(IRibbonControl _) => XqlCommands.ExportSnapshotCommand();
-        public void OnPresence(IRibbonControl _) => XqlCommands.PresenceCommand();
-        public void OnSchema(IRibbonControl _) => XqlCommands.SchemaCommand();
-        public void OnLockMgr(IRibbonControl _) => XqlCommands.LockCommand();
-        public void OnDiag(IRibbonControl _) => XqlCommands.ExportDiagnosticsCommand();
+        // ===== General =====
+        public void OnConfig(IRibbonControl _)
+        {
+            try
+            {
+                XqlConfigForm.ShowSingleton();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(ex.Message, "XQLite", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
 
-        // Meta
-        public void OnInsertMeta(IRibbonControl _) => XqlCommands.InsertMetaHeaderFromSelection();
-        public void OnMetaInfo(IRibbonControl _) => XqlCommands.ShowMetaHeaderInfo();
-        public void OnMetaRemove(IRibbonControl _) => XqlCommands.RemoveMetaHeader();
-        public void OnRefreshMeta(IRibbonControl _) => XqlCommands.RefreshMetaHeader();
+        public void OnCommit(IRibbonControl _)
+            => XqlExcelInterop.Instance?.Cmd_CommitSync();
 
+        public void OnRecover(IRibbonControl _)
+        {
+            try
+            {
+                XqlRecoverForm.ShowSingleton();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Recover UI failed: " + ex.Message, "XQLite");
+            }
+        }
+
+        public void OnInspector(IRibbonControl _)
+        {
+            try
+            {
+                XqlInspectorForm.ShowSingleton();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Inspector failed: " + ex.Message, "XQLite");
+            }
+        }
+
+        public void OnExport(IRibbonControl _)
+        {
+            if (XqlBackup.Instance == null)
+            {
+                MessageBox.Show("Backup 모듈이 초기화되지 않았습니다.", "XQLite");
+                return;
+            }
+
+            using (var sfd = new SaveFileDialog
+            {
+                Title = "Export (zip)",
+                Filter = "Zip (*.zip)|*.zip",
+                FileName = $"xql_export_{DateTime.Now:yyyyMMdd_HHmm}.zip",
+                OverwritePrompt = true
+            })
+            {
+                if (sfd.ShowDialog() == DialogResult.OK)
+                {
+                    XqlBackup.Instance?.ExportDb(sfd.FileName);
+                }
+            }
+        }
+
+        public void OnPresence(IRibbonControl _)
+        {
+            try
+            {
+                XqlPresenceHudForm.ShowSingleton();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Presence HUD failed: " + ex.Message, "XQLite");
+            }
+        }
+
+        public void OnSchema(IRibbonControl _)
+        {
+            try
+            {
+                XqlSchemaForm.ShowSingleton();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Schema explorer failed: " + ex.Message, "XQLite");
+            }
+        }
+
+        public void OnLockMgr(IRibbonControl _)
+        {
+            try
+            {
+                XqlSchemaForm.ShowSingleton();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Schema explorer failed: " + ex.Message, "XQLite");
+            }
+        }
+
+        public void OnDiag(IRibbonControl _)
+        {
+            if (XqlBackup.Instance == null)
+            {
+                MessageBox.Show("Backup 모듈이 초기화되지 않았습니다.", "XQLite");
+                return;
+            }
+
+            using (var sfd = new SaveFileDialog
+            {
+                Title = "Export Diagnostics (zip)",
+                Filter = "Zip (*.zip)|*.zip",
+                FileName = $"xql_diag_{DateTime.Now:yyyyMMdd_HHmm}.zip",
+                OverwritePrompt = true
+            })
+            {
+                if (sfd.ShowDialog() == DialogResult.OK)
+                    XqlBackup.Instance?.ExportDiagnostics(sfd.FileName);
+            }
+        }
+
+        // ===== Meta =====
+#if false
+        public void OnInsertMeta(IRibbonControl _) => XqlSheetUtil.InsertMetaHeaderFromSelection();
+        public void OnMetaInfo(IRibbonControl _) => XqlSheetUtil.ShowMetaHeaderInfo();
+        public void OnMetaRemove(IRibbonControl _) => XqlSheetUtil.RemoveMetaHeader();
+        public void OnRefreshMeta(IRibbonControl _) => XqlSheetUtil.RefreshMetaHeader();
+#endif
         // 드롭다운 항목 공통 핸들러
         public void OnSetType(IRibbonControl c)
         {
+#if false
             var type = (c.Tag ?? "").Trim().ToUpperInvariant();
-            XqlCommands.SetType(type);
+
+            var app = (Excel.Application)ExcelDnaUtil.Application;
+            if (app.ActiveSheet is not Excel.Worksheet ws || app.Selection is not Excel.Range sel) return;
+
+            // 헤더 한 칸만 기준: 사용자가 범위 선택해도 첫 셀만 취급
+            var cell = (Excel.Range)sel.Cells[1, 1];
+
+            // 현재 셀이 메타헤더 “행”에 있는지 간단 검증(선택 사항: 스킵 가능)
+            var meta = XqlSheetMetaRegistry.Get(ws);
+            if (meta == null || cell.Row != meta.TopRow)
+            {
+                MessageBox.Show("메타 헤더의 셀을 선택한 후 타입을 지정하세요.");
+                return;
+            }
+
+            XqlColumnTypeRegistry.SetColumnType(ws, cell, type);
+            XqlSheetMetaRegistry.RefreshHeaderBorders(ws);
+#endif
         }
     }
 }

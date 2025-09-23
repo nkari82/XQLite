@@ -7,6 +7,7 @@ using Excel = Microsoft.Office.Interop.Excel;
 
 namespace XQLite.AddIn
 {
+#if false
     internal static class XqlCommands
     {
         [ExcelCommand(Name = "XQL.CmdPalette", Description = "Open XQLite command palette", ShortCut = "Ctrl-Shift-K")]
@@ -22,28 +23,49 @@ namespace XQLite.AddIn
             {
                 XqlConfigForm.ShowSingleton();
             }
-            catch (Exception ex) { MessageBox.Show(ex.Message, "XQLite", MessageBoxButtons.OK, MessageBoxIcon.Error); }
+            catch (Exception ex) 
+            { 
+                MessageBox.Show(ex.Message, "XQLite", MessageBoxButtons.OK, MessageBoxIcon.Error); 
+            }
         }
 
         [ExcelCommand(Name = "XQL.Commit", Description = "Commit pending changes", ShortCut = "Ctrl-Shift-C")]
         internal static void CommitCommand()
         {
-            try { _ = XqlUpsert.FlushAsync(); }
-            catch (Exception ex) { MessageBox.Show("Commit failed: " + ex.Message, "XQLite"); }
+            try 
+            { 
+                _ = XqlUpsert.FlushAsync(); 
+            }
+            catch (Exception ex) 
+            { 
+                MessageBox.Show("Commit failed: " + ex.Message, "XQLite"); 
+            }
         }
 
         [ExcelCommand(Name = "XQL.Recover", Description = "Recover (batch upsert from current workbook)", ShortCut = "Ctrl-Shift-R")]
         internal static void RecoverCommand()
         {
-            try { XqlRecoverForm.ShowSingleton(); }
-            catch (Exception ex) { MessageBox.Show("Recover UI failed: " + ex.Message, "XQLite"); }
+            try 
+            { 
+                XqlRecoverForm.ShowSingleton(); 
+            }
+            catch (Exception ex) 
+            { 
+                MessageBox.Show("Recover UI failed: " + ex.Message, "XQLite"); 
+            }
         }
 
         [ExcelCommand(Name = "XQL.Inspector", Description = "Open Inspector", ShortCut = "Ctrl-Shift-I")]
         internal static void InspectorCommand()
         {
-            try { XqlInspectorForm.ShowSingleton(); }
-            catch (Exception ex) { MessageBox.Show("Inspector failed: " + ex.Message, "XQLite"); }
+            try 
+            { 
+                XqlInspectorForm.ShowSingleton(); 
+            }
+            catch (Exception ex) 
+            { 
+                MessageBox.Show("Inspector failed: " + ex.Message, "XQLite"); 
+            }
         }
 
         [ExcelCommand(Name = "XQL.ExportSnapshot", Description = "Export rows snapshot as JSON/CSV", ShortCut = "Ctrl-Shift-E")]
@@ -102,7 +124,10 @@ namespace XQLite.AddIn
             {
                 XqlPresenceHudForm.ShowSingleton();
             }
-            catch (Exception ex) { MessageBox.Show("Presence HUD failed: " + ex.Message, "XQLite"); }
+            catch (Exception ex) 
+            { 
+                MessageBox.Show("Presence HUD failed: " + ex.Message, "XQLite"); 
+            }
         }
 
         [ExcelCommand(Name = "XQL.Schema", Description = "Open schema explorer", ShortCut = "Ctrl-Shift-S")]
@@ -112,7 +137,10 @@ namespace XQLite.AddIn
             {
                 XqlSchemaForm.ShowSingleton();
             }
-            catch (Exception ex) { MessageBox.Show("Schema explorer failed: " + ex.Message, "XQLite"); }
+            catch (Exception ex) 
+            { 
+                MessageBox.Show("Schema explorer failed: " + ex.Message, "XQLite"); 
+            }
         }
 
         [ExcelCommand(Name = "XQL.ExportDiagnostics", Description = "Export diagnostics zip", ShortCut = "Ctrl-Shift-D")]
@@ -265,4 +293,5 @@ namespace XQLite.AddIn
             XqlSheetMetaRegistry.RefreshHeaderBorders(ws);
         }
     }
+#endif
 }

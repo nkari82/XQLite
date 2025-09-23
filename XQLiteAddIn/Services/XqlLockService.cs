@@ -5,6 +5,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 
+#if false
 namespace XQLite.AddIn
 {
     internal static class XqlLockService
@@ -65,7 +66,9 @@ namespace XQLite.AddIn
                 var r = await XqlGraphQLClient.MutateAsync<AcquireResp>(m, new { res = resKey, scope, ttl = ttlSec });
                 var data = r.Data?.acquireLock; if (data?.ok != true || string.IsNullOrEmpty(data.lockId)) return false;
                 var info = new LockInfo { lockId = data.lockId!, owner = XqlAddIn.Cfg?.Nickname ?? Environment.UserName, resource = resKey, scope = scope, expiresAt = DateTime.UtcNow.AddSeconds(data.ttlSec) };
-                _locksById[info.lockId] = info; _locksByKey[resKey] = info; return true;
+                _locksById[info.lockId] = info; 
+                _locksByKey[resKey] = info; 
+                return true;
             }
             catch { return false; }
         }
@@ -117,3 +120,4 @@ namespace XQLite.AddIn
         }
     }
 }
+#endif
