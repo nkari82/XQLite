@@ -22,11 +22,8 @@ namespace XQLite.AddIn
         private readonly XqlMetaRegistry _meta;
         private readonly IXqlBackend _backend;
 
-        internal static XqlBackup? Instance = null;
-
         public XqlBackup(IXqlBackend backend, XqlMetaRegistry meta, string endpoint, string apiKey)
         {
-            Instance = this;
             _meta = meta ?? throw new ArgumentNullException(nameof(meta));
             _backend = backend;
         }
@@ -63,14 +60,22 @@ namespace XQLite.AddIn
                     {
                         var serverDir = Path.Combine(tmp, "server");
                         Directory.CreateDirectory(serverDir);
-                        var sMeta = await _backend.TryExportDatabase();
-                        
-                        //if (sMeta != null)
-                        //    File.WriteAllText(Path.Combine(serverDir, "meta.json"), sMeta.ToString(Formatting.Indented), new UTF8Encoding(false));
 
-                        var audit = await _backend.TryExportDatabase();
-                        //if (audit != null)
-                        //    File.WriteAllText(Path.Combine(serverDir, "audit_log.json"), audit.ToString(Formatting.Indented), new UTF8Encoding(false));
+                        // 1) 서버 메타
+                        var sMeta = await _backend.TryFetchServerMeta().ConfigureAwait(false);
+                        if (sMeta != null)
+                        {
+                            var metaText = sMeta.ToString(Formatting.Indented);
+                            File.WriteAllText(Path.Combine(serverDir, "meta.json"), metaText, new UTF8Encoding(false));
+                        }
+
+                        // 2) 감사 로그 (전체 스냅샷)
+                        var audit = await _backend.TryFetchAuditLog(null).ConfigureAwait(false);
+                        if (audit != null)
+                        {
+                            var auditText = audit.ToString(Formatting.Indented);
+                            File.WriteAllText(Path.Combine(serverDir, "audit_log.json"), auditText, new UTF8Encoding(false));
+                        }
                     }
                     catch { /* 서버가 미구현이어도 무시 */ }
 
@@ -171,7 +176,6 @@ namespace XQLite.AddIn
             }).ToList();
             await _backend.TryAddColumns(sm.TableName, defs);
         }
-
 
         private static List<Dictionary<string, object?>> ReadSheetRows(Excel.Application app, string sheetName, SheetMeta sm)
         {

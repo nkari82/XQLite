@@ -18,7 +18,7 @@ namespace XQLite.AddIn
         public XqlCollab(IXqlBackend backend, string nickname, int heartbeatSec = 3)
         {
             _backend = backend ?? throw new ArgumentNullException(nameof(backend));
-            _nickname = string.IsNullOrWhiteSpace(nickname) ? "anonymous" : XqlConfig.Nickname.Trim();
+            _nickname = string.IsNullOrWhiteSpace(nickname) ? "anonymous" : nickname.Trim();
             _heartbeat = new Timer(async _ => await SafeHeartbeat(), null, Timeout.Infinite, Timeout.Infinite);
             _ = SafeHeartbeat(); // 즉시 1회
             _heartbeat.Change(TimeSpan.FromSeconds(heartbeatSec), TimeSpan.FromSeconds(heartbeatSec));

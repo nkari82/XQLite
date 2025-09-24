@@ -87,7 +87,7 @@ namespace XQLite.AddIn
 
         public void OnExport(IRibbonControl _)
         {
-            if (XqlBackup.Instance == null)
+            if (XqlAddIn.Backup == null)
             {
                 MessageBox.Show("Backup 모듈이 초기화되지 않았습니다.", "XQLite");
                 return;
@@ -103,7 +103,7 @@ namespace XQLite.AddIn
             {
                 if (sfd.ShowDialog() == DialogResult.OK)
                 {
-                    XqlBackup.Instance?.ExportDb(sfd.FileName);
+                    XqlAddIn.Backup?.ExportDb(sfd.FileName);
                 }
             }
         }
@@ -136,7 +136,7 @@ namespace XQLite.AddIn
         {
             try
             {
-                XqlSchemaForm.ShowSingleton();
+                XqlLockForm.ShowSingleton();
             }
             catch (Exception ex)
             {
@@ -146,31 +146,29 @@ namespace XQLite.AddIn
 
         public void OnDiag(IRibbonControl _)
         {
-            if (XqlBackup.Instance == null)
+            if (XqlAddIn.Backup == null)
             {
                 MessageBox.Show("Backup 모듈이 초기화되지 않았습니다.", "XQLite");
                 return;
             }
 
-            using (var sfd = new SaveFileDialog
+            using var sfd = new SaveFileDialog
             {
                 Title = "Export Diagnostics (zip)",
                 Filter = "Zip (*.zip)|*.zip",
                 FileName = $"xql_diag_{DateTime.Now:yyyyMMdd_HHmm}.zip",
                 OverwritePrompt = true
-            })
-            {
-                if (sfd.ShowDialog() == DialogResult.OK)
-                    XqlBackup.Instance?.ExportDiagnostics(sfd.FileName);
-            }
+            };
+            if (sfd.ShowDialog() == DialogResult.OK)
+                XqlAddIn.Backup?.ExportDiagnostics(sfd.FileName);
         }
 
         // ===== Meta =====
 #if false
-        public void OnInsertMeta(IRibbonControl _) => XqlSheetUtil.InsertMetaHeaderFromSelection();
-        public void OnMetaInfo(IRibbonControl _) => XqlSheetUtil.ShowMetaHeaderInfo();
-        public void OnMetaRemove(IRibbonControl _) => XqlSheetUtil.RemoveMetaHeader();
-        public void OnRefreshMeta(IRibbonControl _) => XqlSheetUtil.RefreshMetaHeader();
+        public void OnInsertMeta(IRibbonControl _) => XqlSheet.InsertMetaHeaderFromSelection();
+        public void OnMetaInfo(IRibbonControl _) => XqlSheet.ShowMetaHeaderInfo();
+        public void OnMetaRemove(IRibbonControl _) => XqlSheet.RemoveMetaHeader();
+        public void OnRefreshMeta(IRibbonControl _) => XqlSheet.RefreshMetaHeader();
 #endif
         // 드롭다운 항목 공통 핸들러
         public void OnSetType(IRibbonControl c)

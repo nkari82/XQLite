@@ -8,12 +8,12 @@ namespace XQLite.AddIn
 {
     internal sealed class XqlAddIn : IExcelAddIn
     {
-        internal static IXqlBackend? Backend { get; }
-        internal static XqlMetaRegistry? MetaRegistry { get; }
-        internal static XqlSync? Sync { get; }
-        internal static XqlCollab? Collab { get; }
-        internal static XqlBackup? Backup { get; }
-        internal static XqlExcelInterop? ExcelInterop { get; }
+        internal static IXqlBackend? Backend => _backend;
+        internal static XqlMetaRegistry? MetaRegistry => _meta;
+        internal static XqlSync? Sync => _sync;
+        internal static XqlCollab? Collab => _collab;
+        internal static XqlBackup? Backup => _backup;
+        internal static XqlExcelInterop? ExcelInterop => _interop;
 
         private static readonly string AppDir =
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "XQLite");
