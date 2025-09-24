@@ -181,7 +181,7 @@ namespace XQLite.AddIn
                 if (rng == null) return null;
 
                 var ws = (Excel.Worksheet)rng.Worksheet;
-                var lo = rng.ListObject ?? XqlSheetUtil.FindListObjectContaining(ws, rng);
+                var lo = rng.ListObject ?? XqlSheet.FindListObjectContaining(ws, rng);
                 if (lo?.HeaderRowRange == null) return null;
 
                 var tableName = XqlTableNameMap.Map(lo.Name, ws.Name);
@@ -204,10 +204,10 @@ namespace XQLite.AddIn
                 if (rng == null) return null;
 
                 var ws = (Excel.Worksheet)rng.Worksheet;
-                var lo = rng.ListObject ?? XqlSheetUtil.FindListObjectContaining(ws, rng);
+                var lo = rng.ListObject ?? XqlSheet.FindListObjectContaining(ws, rng);
                 if (lo?.HeaderRowRange == null) return null;
 
-                var (header, headers) = XqlSheetUtil.GetHeaderAndNames(ws);
+                var (header, headers) = XqlSheet.GetHeaderAndNames(ws);
                 int colIndex = rng.Column - lo.HeaderRowRange.Column; // 0-base
                 if (colIndex < 0 || colIndex >= headers.Count) return null;
 

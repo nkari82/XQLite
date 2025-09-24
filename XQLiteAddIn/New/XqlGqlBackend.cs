@@ -1,31 +1,34 @@
-﻿// XqlGqlBackend.cs (async-first)
-using GraphQL;
-using GraphQL.Client.Http;
-using GraphQL.Client.Serializer.Newtonsoft;
-using Newtonsoft.Json.Linq;
+﻿// XqlGqlBackend.cs (async-first, 정리 버전)
+
 using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using GraphQL;
+using GraphQL.Client.Http;
+using GraphQL.Client.Serializer.Newtonsoft;
+using Newtonsoft.Json.Linq;
 
 namespace XQLite.AddIn
 {
-    // ==== Backend 인터페이스 (Async 전용) ====
+    // =======================================================================
+    // Backend 인터페이스 (Async 전용)
+    // =======================================================================
     internal interface IXqlBackend : IDisposable
     {
-        // sync
+        // Sync (데이터 동기화)
         Task<UpsertResult> UpsertCells(IReadOnlyList<EditCell> cells, CancellationToken ct = default);
         Task<PullResult> PullRows(long since, CancellationToken ct = default);
         void StartSubscription(Action<ServerEvent> onEvent, long since);
         void StopSubscription();
 
-        // collab
+        // Collab (Presence/Lock)
         Task PresenceHeartbeat(string nickname, string? cell, CancellationToken ct = default);
         Task AcquireLock(string cellOrResourceKey, string by, CancellationToken ct = default);
         Task ReleaseLocksBy(string by, CancellationToken ct = default);
 
-        // backup/schema
+        // Backup / Schema
         Task TryCreateTable(string table, string key, CancellationToken ct = default);
         Task TryAddColumns(string table, IEnumerable<ColumnDef> cols, CancellationToken ct = default);
         Task<JObject?> TryFetchServerMeta(CancellationToken ct = default);
@@ -39,50 +42,90 @@ namespace XQLite.AddIn
         Task<bool> UpsertRows(string table, List<Dictionary<string, object?>> rows, CancellationToken ct = default);
     }
 
+    // =======================================================================
+    // 실 구현: GraphQL Backend
+    // =======================================================================
     internal sealed class XqlGqlBackend : IXqlBackend
     {
-        // === GQL 문서(프로젝트 스키마 맞춰 사용) ===
-        const string MUT_UPSERT = @"mutation($cells:[CellEditInput!]!){
-          upsertCells(cells:$cells){ max_row_version errors conflicts { table row_key column message server_version local_version } }
+        // ── GraphQL 문서 (서버 스키마에 맞춰 사용) ───────────────────────────────
+        private const string MUT_UPSERT = @"mutation($cells:[CellEditInput!]!){
+          upsertCells(cells:$cells){
+            max_row_version
+            errors
+            conflicts { table row_key column message server_version local_version }
+          }
         }";
-        const string Q_PULL = @"query($since:Long!){
-          rows(since_version:$since){ max_row_version patches { table row_key row_version deleted cells } }
+
+        private const string Q_PULL = @"query($since:Long!){
+          rows(since_version:$since){
+            max_row_version
+            patches { table row_key row_version deleted cells }
+          }
         }";
-        const string SUB_ROWS = @"subscription($since:Long){
-          rowsChanged(since_version:$since){ max_row_version patches { table row_key row_version deleted cells } }
+
+        private const string SUB_ROWS = @"subscription($since:Long){
+          rowsChanged(since_version:$since){
+            max_row_version
+            patches { table row_key row_version deleted cells }
+          }
         }";
-        const string MUT_HEARTBEAT = @"mutation($nickname:String!, $cell:String){
-          presenceHeartbeat(nickname:$nickname, cell:$cell) { ok }
+
+        private const string MUT_HEARTBEAT = @"mutation($nickname:String!, $cell:String){
+          presenceHeartbeat(nickname:$nickname, cell:$cell){ ok }
         }";
-        const string MUT_ACQUIRE = @"mutation($cell:String!, $by:String!){
-          acquireLock(cell:$cell, by:$by) { ok }
-        }";
-        const string MUT_RELEASE_BY = @"mutation($by:String!){
-          releaseLocksBy(by:$by) { ok }
-        }";
-        const string MUT_CREATE_TABLE = @"mutation($table:String!, $key:String!){
+
+        private const string MUT_ACQUIRE = @"mutation($cell:String!, $by:String!){ acquireLock(cell:$cell, by:$by){ ok } }";
+        private const string MUT_RELEASE_BY = @"mutation($by:String!){ releaseLocksBy(by:$by){ ok } }";
+
+        private const string MUT_CREATE_TABLE = @"mutation($table:String!, $key:String!){
           createTable(table:$table, key:$key){ ok }
         }";
-        const string MUT_ADD_COLUMNS = @"mutation($table:String!, $columns:[ColumnDefInput!]!){
+
+        private const string MUT_ADD_COLUMNS = @"mutation($table:String!, $columns:[ColumnDefInput!]!){
           addColumns(table:$table, columns:$columns){ ok }
         }";
-        const string Q_META = @"query{ meta{ schema_hash max_row_version tables{ name cols{ name kind notnull } } } }";
-        const string Q_AUDIT = @"query($since:Long){
-          audit_log(since_version:$since){ ts user table row_key column old_value new_value row_version }
-        }";
-        const string Q_EXPORT_DB = @"query{ exportDatabase }";
 
+        private const string MUT_UPSERT_ROWS = @"mutation ($table:String!,$rows:[JSON!]!){
+              upsertRows(table:$table, rows:$rows){
+                affected
+                errors { code message }
+                max_row_version
+              }
+            }";
+
+        private const string Q_META = @"query{
+          meta{ schema_hash max_row_version tables{ name cols{ name kind notnull } } }
+        }";
+
+        private const string Q_AUDIT = @"query($since:Long){
+          audit_log(since_version:$since){
+            ts user table row_key column old_value new_value row_version
+          }
+        }";
+
+        private const string Q_EXPORT_DB = @"query{ exportDatabase }";
+
+        private const string Q_PRESENCE = @"query { presence { nickname sheet cell updated_at } }";
+
+        // ── 필드 ─────────────────────────────────────────────────────────────
         private readonly GraphQLHttpClient _http;
         private readonly GraphQLHttpClient _ws;
         private IDisposable? _subscription;
 
+        // ── 생성자 ───────────────────────────────────────────────────────────
         internal XqlGqlBackend(string httpEndpoint, string? apiKey)
         {
             var httpUri = new Uri(httpEndpoint);
             var wsUri = new UriBuilder(httpUri) { Scheme = httpUri.Scheme == "https" ? "wss" : "ws" }.Uri;
 
-            _http = new GraphQLHttpClient(new GraphQLHttpClientOptions { EndPoint = httpUri }, new NewtonsoftJsonSerializer());
-            _ws = new GraphQLHttpClient(new GraphQLHttpClientOptions { EndPoint = wsUri, UseWebSocketForQueriesAndMutations = false }, new NewtonsoftJsonSerializer());
+            _http = new GraphQLHttpClient(
+                new GraphQLHttpClientOptions { EndPoint = httpUri },
+                new NewtonsoftJsonSerializer());
+
+            _ws = new GraphQLHttpClient(
+                new GraphQLHttpClientOptions { EndPoint = wsUri, UseWebSocketForQueriesAndMutations = false },
+                new NewtonsoftJsonSerializer());
+
             if (!string.IsNullOrWhiteSpace(apiKey))
             {
                 _http.HttpClient.DefaultRequestHeaders.Add("x-api-key", apiKey);
@@ -97,7 +140,7 @@ namespace XQLite.AddIn
             try { _ws.Dispose(); } catch { }
         }
 
-        // --- Sync ---
+        // ── Sync ─────────────────────────────────────────────────────────────
         public async Task<UpsertResult> UpsertCells(IReadOnlyList<EditCell> cells, CancellationToken ct = default)
         {
             var req = new GraphQLRequest
@@ -105,7 +148,8 @@ namespace XQLite.AddIn
                 Query = MUT_UPSERT,
                 Variables = new
                 {
-                    cells = cells.Select(c => new {
+                    cells = cells.Select(c => new
+                    {
                         table = c.Table,
                         row_key = c.RowKey,
                         column = c.Column,
@@ -113,7 +157,8 @@ namespace XQLite.AddIn
                     }).ToArray()
                 }
             };
-            // ✅ 뮤테이션은 SendMutationAsync 사용
+
+            // 뮤테이션은 SendMutationAsync 사용
             var resp = await _http.SendMutationAsync<JObject>(req, ct).ConfigureAwait(false);
             return ParseUpsert(resp.Data);
         }
@@ -128,12 +173,14 @@ namespace XQLite.AddIn
         public void StartSubscription(Action<ServerEvent> onEvent, long since)
         {
             StopSubscription();
+
             var req = new GraphQLRequest { Query = SUB_ROWS, Variables = new { since } };
             var observable = _ws.CreateSubscriptionStream<JObject>(req);
+
             _subscription = observable.Subscribe(
-                p => { try { onEvent(ParseSub(p.Data)); } catch { } },
-                _ => { try { StopSubscription(); new Timer(_ => StartSubscription(onEvent, since), null, 2000, Timeout.Infinite); } catch { } },
-                () => { new Timer(_ => StartSubscription(onEvent, since), null, 2000, Timeout.Infinite); });
+                onNext: p => { try { onEvent(ParseSub(p.Data)); } catch { } },
+                onError: _ => { try { StopSubscription(); new Timer(_ => StartSubscription(onEvent, since), null, 2000, Timeout.Infinite); } catch { } },
+                onCompleted: () => { new Timer(_ => StartSubscription(onEvent, since), null, 2000, Timeout.Infinite); });
         }
 
         public void StopSubscription()
@@ -142,37 +189,36 @@ namespace XQLite.AddIn
             _subscription = null;
         }
 
-        // --- Collab ---
-        public async Task PresenceHeartbeat(string nickname, string? cell, CancellationToken ct = default)
-            => await _http.SendMutationAsync<JObject>(new GraphQLRequest { Query = MUT_HEARTBEAT, Variables = new { nickname, cell } }, ct).ConfigureAwait(false);
+        // ── Collab ───────────────────────────────────────────────────────────
+        public Task PresenceHeartbeat(string nickname, string? cell, CancellationToken ct = default) =>
+            _http.SendMutationAsync<JObject>(new GraphQLRequest { Query = MUT_HEARTBEAT, Variables = new { nickname, cell } }, ct);
 
-        public async Task AcquireLock(string cellOrResourceKey, string by, CancellationToken ct = default)
-            => await _http.SendMutationAsync<JObject>(new GraphQLRequest { Query = MUT_ACQUIRE, Variables = new { cell = cellOrResourceKey, by } }, ct).ConfigureAwait(false);
+        public Task AcquireLock(string cellOrResourceKey, string by, CancellationToken ct = default) =>
+            _http.SendMutationAsync<JObject>(new GraphQLRequest { Query = MUT_ACQUIRE, Variables = new { cell = cellOrResourceKey, by } }, ct);
 
-        public async Task ReleaseLocksBy(string by, CancellationToken ct = default)
-            => await _http.SendMutationAsync<JObject>(new GraphQLRequest { Query = MUT_RELEASE_BY, Variables = new { by } }, ct).ConfigureAwait(false);
+        public Task ReleaseLocksBy(string by, CancellationToken ct = default) =>
+            _http.SendMutationAsync<JObject>(new GraphQLRequest { Query = MUT_RELEASE_BY, Variables = new { by } }, ct);
 
-        // --- Backup/Schema ---
-        public async Task TryCreateTable(string table, string key, CancellationToken ct = default)
-            => await _http.SendMutationAsync<JObject>(new GraphQLRequest { Query = MUT_CREATE_TABLE, Variables = new { table, key } }, ct).ConfigureAwait(false);
+        // ── Backup / Schema ──────────────────────────────────────────────────
+        public Task TryCreateTable(string table, string key, CancellationToken ct = default) =>
+            _http.SendMutationAsync<JObject>(new GraphQLRequest { Query = MUT_CREATE_TABLE, Variables = new { table, key } }, ct);
 
-        public async Task TryAddColumns(string table, IEnumerable<ColumnDef> cols, CancellationToken ct = default)
-        {
-            await _http.SendMutationAsync<JObject>(new GraphQLRequest
+        public Task TryAddColumns(string table, IEnumerable<ColumnDef> cols, CancellationToken ct = default) =>
+            _http.SendMutationAsync<JObject>(new GraphQLRequest
             {
                 Query = MUT_ADD_COLUMNS,
                 Variables = new
                 {
                     table,
-                    columns = cols.Select(c => new {
+                    columns = cols.Select(c => new
+                    {
                         name = c.Name,
                         kind = c.Kind,
                         notnull = c.NotNull,
                         check = c.Check
                     }).ToArray()
                 }
-            }, ct).ConfigureAwait(false);
-        }
+            }, ct);
 
         public async Task<JObject?> TryFetchServerMeta(CancellationToken ct = default)
         {
@@ -189,25 +235,17 @@ namespace XQLite.AddIn
         public async Task<byte[]?> TryExportDatabase(CancellationToken ct = default)
         {
             var resp = await _http.SendQueryAsync<JObject>(new GraphQLRequest { Query = Q_EXPORT_DB }, ct).ConfigureAwait(false);
-            var d = resp.Data?["exportDatabase"]?.ToString();
-            if (string.IsNullOrWhiteSpace(d)) return null;
-            try { return Convert.FromBase64String(d); } catch { return null; }
+            var s = resp.Data?["exportDatabase"]?.ToString();
+            if (string.IsNullOrWhiteSpace(s)) return null;
+            try { return Convert.FromBase64String(s); } catch { return null; }
         }
 
-        // --- Parsers ---
-        private static UpsertResult ParseUpsert(JObject? data) => UpsertResult.From(data);
-        private static PullResult ParsePull(JObject? data) => PullResult.From(data);
-        private static ServerEvent ParseSub(JObject? data) => ServerEvent.From(data);
-
+        // ── Presence / Recover ───────────────────────────────────────────────
         public async Task<PresenceItem[]?> FetchPresence(CancellationToken ct = default)
         {
             try
             {
-                var req = new GraphQLRequest
-                {
-                    Query = @"query { presence { nickname sheet cell updated_at } }"
-                };
-
+                var req = new GraphQLRequest { Query = Q_PRESENCE };
                 var resp = await _http.SendQueryAsync<PresenceResp>(req, ct).ConfigureAwait(false);
                 return resp?.Data?.presence;
             }
@@ -216,38 +254,16 @@ namespace XQLite.AddIn
 
         public async Task<bool> UpsertRows(string table, List<Dictionary<string, object?>> rows, CancellationToken ct = default)
         {
-            // 서버 스키마에 맞게 upsertRows를 호출
-            const string MUT = @"mutation ($table:String!,$rows:[JSON!]!){
-              upsertRows(table:$table, rows:$rows){
-                affected
-                errors { code message }
-                max_row_version
-              }
-            }";
-
-            var req = new GraphQLRequest
-            {
-                Query = MUT,
-                Variables = new { table, rows }
-            };
-
+            var req = new GraphQLRequest { Query = MUT_UPSERT_ROWS, Variables = new { table, rows } };
             var resp = await _http.SendMutationAsync<UpsertResp>(req, ct).ConfigureAwait(false);
             var data = resp?.Data?.upsertRows;
-            // 에러가 있으면 실패로 간주
             return data != null && (data.errors == null || data.errors.Length == 0);
         }
-    }
 
-    // ==== Parser DTO ====
-    internal sealed class UpsertResult
-    {
-        public long MaxRowVersion;
-        public List<string>? Errors;
-        public List<Conflict>? Conflicts;
-
-        public static UpsertResult From(JObject? data)
+        // ── Parser bridge ────────────────────────────────────────────────────
+        private static UpsertResult ParseUpsert(JObject? data)
         {
-            var res = new UpsertResult { MaxRowVersion = 0, Errors = [], Conflicts = new List<Conflict>() };
+            var res = new UpsertResult { MaxRowVersion = 0, Errors = [], Conflicts = [] };
             if (data == null) return res;
 
             var root = data["upsertCells"] ?? data["upsertRows"];
@@ -276,14 +292,8 @@ namespace XQLite.AddIn
             }
             return res;
         }
-    }
 
-    internal sealed class PullResult
-    {
-        public long MaxRowVersion;
-        public List<RowPatch>? Patches;
-
-        public static PullResult From(JObject? data)
+        private static PullResult ParsePull(JObject? data)
         {
             var res = new PullResult { MaxRowVersion = 0, Patches = new List<RowPatch>() };
             if (data == null) return res;
@@ -316,14 +326,8 @@ namespace XQLite.AddIn
             }
             return res;
         }
-    }
 
-    internal sealed class ServerEvent
-    {
-        public long MaxRowVersion;
-        public List<RowPatch>? Patches;
-
-        public static ServerEvent From(JObject? data)
+        private static ServerEvent ParseSub(JObject? data)
         {
             var ev = new ServerEvent { MaxRowVersion = 0, Patches = new List<RowPatch>() };
             if (data == null) return ev;
@@ -360,7 +364,11 @@ namespace XQLite.AddIn
         }
     }
 
-    // ==== 공용 DTO ====
+    // =======================================================================
+    // DTOs
+    // =======================================================================
+
+    // 공용 DTO
     internal readonly record struct EditCell(string Table, object RowKey, string Column, object? Value);
 
     internal sealed class RowPatch
@@ -383,17 +391,8 @@ namespace XQLite.AddIn
         public long? LocalVersion { get; set; }
 
         public static Conflict System(string where, string msg) =>
-            new Conflict { Kind = "system", Message = $"[{where}] {msg}" };
-    }
-
-
-    internal sealed class PresenceResp { public PresenceItem[]? presence { get; set; } }
-    internal sealed class PresenceItem
-    {
-        public string? nickname { get; set; }
-        public string? sheet { get; set; }
-        public string? cell { get; set; }
-        public string? updated_at { get; set; }
+            new()
+            { Kind = "system", Message = $"[{where}] {msg}" };
     }
 
     internal sealed class ColumnDef
@@ -404,22 +403,30 @@ namespace XQLite.AddIn
         public string? Check;
     }
 
-    internal sealed class UpsertResp
+    // GraphQL 응답 DTO
+    internal sealed class PresenceResp { public PresenceItem[]? presence { get; set; } }
+    internal sealed class PresenceItem { public string? nickname { get; set; } public string? sheet { get; set; } public string? cell { get; set; } public string? updated_at { get; set; } }
+    internal sealed class UpsertResp { public UpsertRowsPayload? upsertRows { get; set; } }
+    internal sealed class UpsertRowsPayload { public int affected { get; set; } public GqlErr[]? errors { get; set; } public long max_row_version { get; set; } }
+    internal sealed class GqlErr { public string? code { get; set; } public string? message { get; set; } }
+
+    // Parser 결과 DTO
+    internal sealed class UpsertResult
     {
-        public UpsertRowsPayload? upsertRows { get; set; }
+        public long MaxRowVersion;
+        public List<string>? Errors;
+        public List<Conflict>? Conflicts;
     }
 
-    internal sealed class UpsertRowsPayload
+    internal sealed class PullResult
     {
-        public int affected { get; set; }
-        public GqlErr[]? errors { get; set; }
-        public long max_row_version { get; set; }
+        public long MaxRowVersion;
+        public List<RowPatch>? Patches;
     }
 
-    internal sealed class GqlErr
+    internal sealed class ServerEvent
     {
-        public string? code { get; set; }
-        public string? message { get; set; }
+        public long MaxRowVersion;
+        public List<RowPatch>? Patches;
     }
-
 }

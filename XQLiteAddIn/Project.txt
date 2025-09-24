@@ -1,25 +1,24 @@
 c# 엑셀 애드인
 
 XqlAddIn.cs
-XqlCommands.cs
 XqlConfig.cs
 XqlDiagExport.cs
 XqlJson.cs
 XqlTableNameMap.cs
 
-Events/XqlSheetEvent.cs 핵심요소
+New/XqlBackup.cs
+New/XqlCollab.cs
+New/XqlCommon.cs
+New/XqlExcelInterop.cs
+New/XqlGqlBackend.cs
+New/XqlSheet.cs
+New/XqlSync.cs
 
-Services/XqlLockService.cs 핵심요소
-Services/XqlPresenceService.cs 핵심요소
-Services/XqlSubscriptionService.cs 핵심요소
-Services/XqlRowSyncServices.cs 핵심요소
-Services/XqlDiagExportService.cs
-Services/XqlExportService.cs
-
-Core/XqlGraphQLClient.cs 핵심요소
-Core/XqlColumnTypeRegistry.cs 핵심요소
-Core/XqlSheetMetaRegistry.cs 핵심요소
-Core/XqlUpsert.cs 핵심요소
+UI/XqlConfigForm.cs
+UI/XqlInspectorForm.cs
+UI/XqlPresenceHudForm.cs
+UI/XqlRecoverForm.cs
+UI/XqlSchemaForm.cs
 
 Ribbon/XqlRibbon.cs
 

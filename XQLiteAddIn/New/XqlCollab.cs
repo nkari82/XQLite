@@ -80,11 +80,11 @@ namespace XQLite.AddIn
                 if (rng == null) return false;
 
                 var ws = (Excel.Worksheet)rng.Worksheet;
-                var lo = rng.ListObject ?? XqlSheetUtil.FindListObjectContaining(ws, rng);
+                var lo = rng.ListObject ?? XqlSheet.FindListObjectContaining(ws, rng);
                 if (lo?.HeaderRowRange == null) return false;
 
                 var tableName = XqlTableNameMap.Map(lo.Name, ws.Name);
-                var (header, headers) = XqlSheetUtil.GetHeaderAndNames(ws);
+                var (header, headers) = XqlSheet.GetHeaderAndNames(ws);
                 // 선택한 셀의 헤더 인덱스 계산
                 int colIndex = rng.Column - lo.HeaderRowRange.Column; // 0-base
                 if (colIndex < 0 || colIndex >= headers.Count) return false;
@@ -94,7 +94,7 @@ namespace XQLite.AddIn
                 int hCol = lo.HeaderRowRange.Column;
                 int colOffset = colIndex; // 헤더 좌상단 기준 상대 offset(0-base)
 
-                var key = XqlSheetUtil.ColumnKey(ws.Name, tableName, hRow, hCol, colOffset, headerName);
+                var key = XqlSheet.ColumnKey(ws.Name, tableName, hRow, hCol, colOffset, headerName);
                 await _backend.AcquireLock(key, _nickname).ConfigureAwait(false);
                 return true;
             }
@@ -111,7 +111,7 @@ namespace XQLite.AddIn
                 if (rng == null) return false;
 
                 var ws = (Excel.Worksheet)rng.Worksheet;
-                var lo = rng.ListObject ?? XqlSheetUtil.FindListObjectContaining(ws, rng);
+                var lo = rng.ListObject ?? XqlSheet.FindListObjectContaining(ws, rng);
                 if (lo?.HeaderRowRange == null) return false;
 
                 var tableName = XqlTableNameMap.Map(lo.Name, ws.Name);
@@ -121,7 +121,7 @@ namespace XQLite.AddIn
                 int rowOffset = rng.Row - (hRow + 1); // 데이터 첫행 = header+1
                 int colOffset = rng.Column - hCol;
 
-                var key = XqlSheetUtil.CellKey(ws.Name, tableName, hRow, hCol, rowOffset, colOffset);
+                var key = XqlSheet.CellKey(ws.Name, tableName, hRow, hCol, rowOffset, colOffset);
                 await _backend.AcquireLock(key, _nickname).ConfigureAwait(false);
                 return true;
             }
@@ -154,7 +154,7 @@ namespace XQLite.AddIn
                 if (rng == null) return null;
 
                 var ws = (Excel.Worksheet)rng.Worksheet;
-                var lo = rng.ListObject ?? XqlSheetUtil.FindListObjectContaining(ws, rng);
+                var lo = rng.ListObject ?? XqlSheet.FindListObjectContaining(ws, rng);
                 if (lo?.HeaderRowRange == null) return null;
 
                 var tableName = XqlTableNameMap.Map(lo.Name, ws.Name);
@@ -164,7 +164,7 @@ namespace XQLite.AddIn
                 int rowOffset = rng.Row - (hRow + 1);
                 int colOffset = rng.Column - hCol;
 
-                return XqlSheetUtil.CellKey(ws.Name, tableName, hRow, hCol, rowOffset, colOffset);
+                return XqlSheet.CellKey(ws.Name, tableName, hRow, hCol, rowOffset, colOffset);
             }
             catch { return null; }
         }
@@ -195,14 +195,14 @@ namespace XQLite.AddIn
                     var sheet = mCell.Groups["sheet"].Value;
                     var addr = mCell.Groups["addr"].Value;
 
-                    var ws = XqlSheetUtil.FindWorksheet(app, sheet);
+                    var ws = XqlSheet.FindWorksheet(app, sheet);
                     if (ws == null) return oldKey;
 
                     Excel.Range? rng = null; Excel.ListObject? lo = null;
                     try
                     {
                         rng = ws.Range[addr];
-                        lo = rng?.ListObject ?? XqlSheetUtil.FindListObjectContaining(ws, rng!);
+                        lo = rng?.ListObject ?? XqlSheet.FindListObjectContaining(ws, rng!);
                         if (lo?.HeaderRowRange == null) return oldKey;
 
                         int hRow = lo.HeaderRowRange.Row;
@@ -212,7 +212,7 @@ namespace XQLite.AddIn
                         int colOffset = rng!.Column - hCol;
 
                         var tableName = XqlTableNameMap.Map(lo.Name, ws.Name);
-                        return XqlSheetUtil.CellKey(ws.Name, tableName, hRow, hCol, rowOffset, colOffset);
+                        return XqlSheet.CellKey(ws.Name, tableName, hRow, hCol, rowOffset, colOffset);
                     }
                     catch { return oldKey; }
                     finally { XqlCommon.ReleaseCom(lo); XqlCommon.ReleaseCom(rng); }
@@ -231,10 +231,10 @@ namespace XQLite.AddIn
                         var ws = (Excel.Worksheet)app2.ActiveSheet;
                         if (ws == null) return oldKey;
 
-                        var lo = XqlSheetUtil.FindListObjectByTable(ws, table);
+                        var lo = XqlSheet.FindListObjectByTable(ws, table);
                         if (lo?.HeaderRowRange == null) return oldKey;
 
-                        var (header, headers) = XqlSheetUtil.GetHeaderAndNames(ws);
+                        var (header, headers) = XqlSheet.GetHeaderAndNames(ws);
                         int colIndex = headers.FindIndex(h => string.Equals(h, col, StringComparison.Ordinal));
                         if (colIndex < 0) return oldKey;
 
@@ -243,7 +243,7 @@ namespace XQLite.AddIn
                         int headerCol = lo.HeaderRowRange.Column + colIndex;
                         int colOffset = headerCol - hCol;
 
-                        return XqlSheetUtil.ColumnKey(ws.Name, table, hRow, hCol, colOffset, col);
+                        return XqlSheet.ColumnKey(ws.Name, table, hRow, hCol, colOffset, col);
                     }
                     catch { return oldKey; }
                 }
@@ -259,8 +259,8 @@ namespace XQLite.AddIn
             try
             {
                 var app = (Excel.Application)ExcelDnaUtil.Application;
-                if (XqlSheetUtil.TryParse(key, out var desc) &&
-                    XqlSheetUtil.TryResolve(app, desc, out var range, out _, out _))
+                if (XqlSheet.TryParse(key, out var desc) &&
+                    XqlSheet.TryResolve(app, desc, out var range, out _, out _))
                 {
                     range?.Select();
                     return true;

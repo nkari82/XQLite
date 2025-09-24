@@ -6,7 +6,7 @@ using Excel = Microsoft.Office.Interop.Excel;
 
 namespace XQLite.AddIn
 {
-    internal static class XqlSheetUtil
+    internal static class XqlSheet
     {
         public static Excel.Range GetHeaderRange(Excel.Worksheet sh)
         {

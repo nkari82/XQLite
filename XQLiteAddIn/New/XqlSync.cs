@@ -240,18 +240,18 @@ namespace XQLite.AddIn
                         if (ws == null || smeta == null) continue;
 
                         // 헤더/컬럼 맵
-                        var (header, headers) = XqlSheetUtil.GetHeaderAndNames(ws);
+                        var (header, headers) = XqlSheet.GetHeaderAndNames(ws);
                         if (headers.Count == 0) continue;
 
                         // 키 컬럼 인덱스 결정 (메타 우선)
-                        int keyCol = XqlSheetUtil.FindKeyColumnIndex(headers, smeta.KeyColumn);
+                        int keyCol = XqlSheet.FindKeyColumnIndex(headers, smeta.KeyColumn);
                         int firstDataRow = header.Row + 1;
 
                         foreach (var patch in grp)
                         {
                             try
                             {
-                                int? row = XqlSheetUtil.FindRowByKey(ws, firstDataRow, keyCol, patch.RowKey);
+                                int? row = XqlSheet.FindRowByKey(ws, firstDataRow, keyCol, patch.RowKey);
                                 if (patch.Deleted)
                                 {
                                     if (row.HasValue) SafeDeleteRow(ws, row.Value);

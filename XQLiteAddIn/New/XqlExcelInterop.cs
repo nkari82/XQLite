@@ -108,7 +108,7 @@ namespace XQLite.AddIn
                         kv => kv.Value.ToTooltip(),
                         StringComparer.Ordinal)
                     : new Dictionary<string, string>(StringComparer.Ordinal);
-                XqlSheetUtil.SetHeaderTooltips(sh, dict);
+                XqlSheet.SetHeaderTooltips(sh, dict);
                 XqlCommon.ReleaseCom(sh);
             });
         }
