@@ -8,8 +8,6 @@ namespace XQLite.AddIn
 {
     internal sealed class XqlAddIn : IExcelAddIn
     {
-        // ====== Config ======
-        internal static XqlConfig? Cfg { get; set; }
         internal static IXqlBackend? Backend { get; }
         internal static XqlMetaRegistry? MetaRegistry { get; }
         internal static XqlSync? Sync { get; }
@@ -34,8 +32,8 @@ namespace XQLite.AddIn
             try
             {
                 Directory.CreateDirectory(AppDir);
-                Cfg = LoadConfigWithOverrides();
-                StartRuntime(Cfg!);
+                LoadConfigWithOverrides();
+                StartRuntime();
             }
             catch (Exception ex)
             {
@@ -50,34 +48,32 @@ namespace XQLite.AddIn
         }
 
         // ====== Runtime lifecycle ======
-        internal static void RestartRuntime(XqlConfig cfg)
+        internal static void RestartRuntime()
         {
             StopRuntime();
-            StartRuntime(cfg);
+            StartRuntime();
         }
 
-        internal static void StartRuntime(XqlConfig cfg)
+        internal static void StartRuntime()
         {
             try
             {
                 // 1) 백엔드 & 메타
-                _backend = new XqlGqlBackend(cfg.Endpoint, cfg.ApiKey); // GraphQL 클라이언트(HTTP/WS) 공용 인스턴스
+                _backend = new XqlGqlBackend(XqlConfig.Endpoint, XqlConfig.ApiKey); // GraphQL 클라이언트(HTTP/WS) 공용 인스턴스
                 _meta = new XqlMetaRegistry();
 
                 // 2) 동기화/협업/백업
                 //    - XqlSync: push(업서트) ms, pull(증분) ms
                 _sync = new XqlSync(_backend, _meta,
-                    pushIntervalMs: Math.Max(250, cfg.DebounceMs),
-                    pullIntervalMs: Math.Max(1000, cfg.PullSec * 1000)); // Start/Stop 지원
+                    pushIntervalMs: Math.Max(250, XqlConfig.DebounceMs),
+                    pullIntervalMs: Math.Max(1000, XqlConfig.PullSec * 1000)); // Start/Stop 지원
                 _sync.Start(); // 구독 시작 포함 :contentReference[oaicite:5]{index=5}
 
                 //    - XqlCollab: TTL/Heartbeat 간격 (초→ms)
-                _collab = new XqlCollab(_backend,
-                    ttlSeconds: Math.Max(5, cfg.LockTtlSec),
-                    heartbeatMs: Math.Max(1000, cfg.HeartbeatSec * 1000)); // 내부 타이머 운용 :contentReference[oaicite:6]{index=6}
+                _collab = new XqlCollab(_backend, XqlConfig.Nickname, heartbeatSec: XqlConfig.HeartbeatSec); // 내부 타이머 운용 :contentReference[oaicite:6]{index=6}
 
                 //    - XqlBackup: 진단/복구/풀덤프
-                _backup = new XqlBackup(_backend, _meta, cfg.Endpoint, cfg.ApiKey); // 현재 시그니처 기준 :contentReference[oaicite:7]{index=7}
+                _backup = new XqlBackup(_backend, _meta, XqlConfig.Endpoint, XqlConfig.ApiKey); // 현재 시그니처 기준 :contentReference[oaicite:7]{index=7}
 
                 // 3) Excel 이벤트 훅
                 var app = (Excel.Application)ExcelDnaUtil.Application;
@@ -125,50 +121,47 @@ namespace XQLite.AddIn
         }
 
         // ====== Config load/save (Env → File → Defaults) ======
-        private static XqlConfig LoadConfigWithOverrides()
+        private static void LoadConfigWithOverrides()
         {
-            var cfg = LoadConfigFromFile() ?? new XqlConfig();
+            LoadConfigFromFile();
 
             // 1) 환경변수 우선 적용
             string? ep = Environment.GetEnvironmentVariable("XQLITE_ENDPOINT");
-            if (!string.IsNullOrWhiteSpace(ep)) cfg.Endpoint = ep.Trim();
+            if (!string.IsNullOrWhiteSpace(ep)) XqlConfig.Endpoint = ep.Trim();
 
             string? k = Environment.GetEnvironmentVariable("XQLITE_APIKEY");
-            if (!string.IsNullOrWhiteSpace(k)) cfg.ApiKey = k.Trim();
+            if (!string.IsNullOrWhiteSpace(k)) XqlConfig.ApiKey = k.Trim();
 
             string? nick = Environment.GetEnvironmentVariable("XQLITE_NICKNAME");
-            if (!string.IsNullOrWhiteSpace(nick)) cfg.Nickname = nick.Trim();
+            if (!string.IsNullOrWhiteSpace(nick)) XqlConfig.Nickname = nick.Trim();
 
             string? proj = Environment.GetEnvironmentVariable("XQLITE_PROJECT");
-            if (!string.IsNullOrWhiteSpace(proj)) cfg.Project = proj.Trim();
+            if (!string.IsNullOrWhiteSpace(proj)) XqlConfig.Project = proj.Trim();
 
             // 2) 기본값 보정
-            cfg.PullSec = cfg.PullSec <= 0 ? 10 : cfg.PullSec;
-            cfg.DebounceMs = cfg.DebounceMs <= 0 ? 2000 : cfg.DebounceMs;
-            cfg.HeartbeatSec = cfg.HeartbeatSec <= 0 ? 3 : cfg.HeartbeatSec;
-            cfg.LockTtlSec = cfg.LockTtlSec <= 0 ? 10 : cfg.LockTtlSec;
-
-            return cfg;
+            XqlConfig.PullSec = XqlConfig.PullSec <= 0 ? 10 : XqlConfig.PullSec;
+            XqlConfig.DebounceMs = XqlConfig.DebounceMs <= 0 ? 2000 : XqlConfig.DebounceMs;
+            XqlConfig.HeartbeatSec = XqlConfig.HeartbeatSec <= 0 ? 3 : XqlConfig.HeartbeatSec;
+            XqlConfig.LockTtlSec = XqlConfig.LockTtlSec <= 0 ? 10 : XqlConfig.LockTtlSec;
         }
 
-        private static XqlConfig? LoadConfigFromFile()
+        private static void LoadConfigFromFile()
         {
             try
             {
-                if (!File.Exists(CfgPath)) return null;
+                if (!File.Exists(CfgPath)) return;
                 var json = File.ReadAllText(CfgPath);
-                return XqlJson.Deserialize<XqlConfig>(json);
+                XqlConfig.TryJson(json);
             }
-            catch { return null; }
+            catch { }
         }
 
-        internal static void SaveConfigToFile(XqlConfig cfg)
+        internal static void SaveConfigToFile()
         {
             try
             {
                 Directory.CreateDirectory(AppDir);
-                var json = XqlJson.Serialize(cfg, true);
-                File.WriteAllText(CfgPath, json);
+                XqlConfig.Save(CfgPath);
             }
             catch (Exception ex)
             {

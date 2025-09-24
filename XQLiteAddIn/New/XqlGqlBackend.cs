@@ -11,40 +11,6 @@ using System.Threading.Tasks;
 
 namespace XQLite.AddIn
 {
-    // ==== 공용 DTO ====
-    internal readonly record struct EditCell(string Table, object RowKey, string Column, object? Value);
-
-    internal sealed class RowPatch
-    {
-        public string Table { get; set; } = "";
-        public object RowKey { get; set; } = default!;
-        public Dictionary<string, object?> Cells { get; set; } = new(StringComparer.Ordinal);
-        public long RowVersion { get; set; }
-        public bool Deleted { get; set; }
-    }
-
-    internal sealed class Conflict
-    {
-        public string Kind { get; set; } = "conflict";
-        public string Table { get; set; } = "";
-        public object? RowKey { get; set; }
-        public string? Column { get; set; }
-        public string Message { get; set; } = "";
-        public long? ServerVersion { get; set; }
-        public long? LocalVersion { get; set; }
-
-        public static Conflict System(string where, string msg) =>
-            new Conflict { Kind = "system", Message = $"[{where}] {msg}" };
-    }
-
-    internal sealed class ColumnDef
-    {
-        public string Name = "";
-        public string Kind = "text";   // int/real/text/bool/json/date
-        public bool NotNull = false;
-        public string? Check;
-    }
-
     // ==== Backend 인터페이스 (Async 전용) ====
     internal interface IXqlBackend : IDisposable
     {
@@ -65,6 +31,12 @@ namespace XQLite.AddIn
         Task<JObject?> TryFetchServerMeta(CancellationToken ct = default);
         Task<JArray?> TryFetchAuditLog(long? since = null, CancellationToken ct = default);
         Task<byte[]?> TryExportDatabase(CancellationToken ct = default);
+
+        // Presence
+        Task<PresenceItem[]?> FetchPresence(CancellationToken ct = default);
+
+        // Recover
+        Task<bool> UpsertRows(string table, List<Dictionary<string, object?>> rows, CancellationToken ct = default);
     }
 
     internal sealed class XqlGqlBackend : IXqlBackend
@@ -226,6 +198,44 @@ namespace XQLite.AddIn
         private static UpsertResult ParseUpsert(JObject? data) => UpsertResult.From(data);
         private static PullResult ParsePull(JObject? data) => PullResult.From(data);
         private static ServerEvent ParseSub(JObject? data) => ServerEvent.From(data);
+
+        public async Task<PresenceItem[]?> FetchPresence(CancellationToken ct = default)
+        {
+            try
+            {
+                var req = new GraphQLRequest
+                {
+                    Query = @"query { presence { nickname sheet cell updated_at } }"
+                };
+
+                var resp = await _http.SendQueryAsync<PresenceResp>(req, ct).ConfigureAwait(false);
+                return resp?.Data?.presence;
+            }
+            catch { return null; }
+        }
+
+        public async Task<bool> UpsertRows(string table, List<Dictionary<string, object?>> rows, CancellationToken ct = default)
+        {
+            // 서버 스키마에 맞게 upsertRows를 호출
+            const string MUT = @"mutation ($table:String!,$rows:[JSON!]!){
+              upsertRows(table:$table, rows:$rows){
+                affected
+                errors { code message }
+                max_row_version
+              }
+            }";
+
+            var req = new GraphQLRequest
+            {
+                Query = MUT,
+                Variables = new { table, rows }
+            };
+
+            var resp = await _http.SendMutationAsync<UpsertResp>(req, ct).ConfigureAwait(false);
+            var data = resp?.Data?.upsertRows;
+            // 에러가 있으면 실패로 간주
+            return data != null && (data.errors == null || data.errors.Length == 0);
+        }
     }
 
     // ==== Parser DTO ====
@@ -349,4 +359,67 @@ namespace XQLite.AddIn
             return ev;
         }
     }
+
+    // ==== 공용 DTO ====
+    internal readonly record struct EditCell(string Table, object RowKey, string Column, object? Value);
+
+    internal sealed class RowPatch
+    {
+        public string Table { get; set; } = "";
+        public object RowKey { get; set; } = default!;
+        public Dictionary<string, object?> Cells { get; set; } = new(StringComparer.Ordinal);
+        public long RowVersion { get; set; }
+        public bool Deleted { get; set; }
+    }
+
+    internal sealed class Conflict
+    {
+        public string Kind { get; set; } = "conflict";
+        public string Table { get; set; } = "";
+        public object? RowKey { get; set; }
+        public string? Column { get; set; }
+        public string Message { get; set; } = "";
+        public long? ServerVersion { get; set; }
+        public long? LocalVersion { get; set; }
+
+        public static Conflict System(string where, string msg) =>
+            new Conflict { Kind = "system", Message = $"[{where}] {msg}" };
+    }
+
+
+    internal sealed class PresenceResp { public PresenceItem[]? presence { get; set; } }
+    internal sealed class PresenceItem
+    {
+        public string? nickname { get; set; }
+        public string? sheet { get; set; }
+        public string? cell { get; set; }
+        public string? updated_at { get; set; }
+    }
+
+    internal sealed class ColumnDef
+    {
+        public string Name = "";
+        public string Kind = "text";   // int/real/text/bool/json/date
+        public bool NotNull = false;
+        public string? Check;
+    }
+
+    internal sealed class UpsertResp
+    {
+        public UpsertRowsPayload? upsertRows { get; set; }
+    }
+
+    internal sealed class UpsertRowsPayload
+    {
+        public int affected { get; set; }
+        public GqlErr[]? errors { get; set; }
+        public long max_row_version { get; set; }
+    }
+
+    internal sealed class GqlErr
+    {
+        public string? code { get; set; }
+        public string? message { get; set; }
+    }
+
 }

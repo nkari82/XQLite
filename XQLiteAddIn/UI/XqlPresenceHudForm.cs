@@ -1,51 +1,85 @@
-﻿using System;
+﻿// XqlPresenceHudForm.cs
+using System;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using Timer = System.Windows.Forms.Timer;
 
 namespace XQLite.AddIn
 {
     public sealed class XqlPresenceHudForm : Form
     {
-        private static XqlPresenceHudForm? _inst; 
-        
-        internal static void ShowSingleton() 
-        { 
-            if (_inst == null || _inst.IsDisposed) 
-                _inst = new XqlPresenceHudForm(); 
-            _inst.Show(); 
-            _inst.BringToFront(); 
+        private static XqlPresenceHudForm? _inst;
+        internal static void ShowSingleton()
+        {
+            if (_inst == null || _inst.IsDisposed) _inst = new XqlPresenceHudForm();
+            _inst.Show();
+            _inst.BringToFront();
         }
 
-        private ListView lv = new(); private Timer auto = new() { Interval = 2000 };
+        private readonly ListView _lv = new() { View = View.Details, Dock = DockStyle.Fill, FullRowSelect = true };
+        private readonly Timer _auto = new() { Interval = 3000 }; // 3s 주기
+        private volatile int _refreshing; // 0:idle, 1:busy
+        private CancellationTokenSource? _cts; // 폼 종료 시 취소용
 
         public XqlPresenceHudForm()
         {
-            Text = "XQLite Presence"; StartPosition = FormStartPosition.Manual; Left = 20; Top = 20; Width = 520; Height = 320;
-            lv.View = View.Details; lv.FullRowSelect = true; lv.Dock = DockStyle.Fill;
-            lv.Columns.AddRange(new[] { new ColumnHeader { Text = "Nickname", Width = 140 }, new ColumnHeader { Text = "Sheet/Cell", Width = 200 }, new ColumnHeader { Text = "When", Width = 140 } });
-            Controls.Add(lv); auto.Tick += async (_, __) => await RefreshAsync(); auto.Start(); Load += async (_, __) => await RefreshAsync();
+            Text = "XQLite Presence";
+            StartPosition = FormStartPosition.Manual;
+            Left = 20; Top = 20; Width = 560; Height = 360;
+
+            _lv.Columns.AddRange(
+            [
+                new ColumnHeader { Text = "Nickname", Width = 140 },
+                new ColumnHeader { Text = "Sheet/Cell", Width = 220 },
+                new ColumnHeader { Text = "When (UTC)", Width = 160 }
+            ]);
+
+            Controls.Add(_lv);
+
+            Load += async (_, __) => await RefreshList().ConfigureAwait(false);
+            FormClosed += (_, __) => { try { _cts?.Cancel(); } catch { } };
+            _auto.Tick += async (_, __) => await RefreshList().ConfigureAwait(false);
+            _auto.Start();
         }
 
-        private async Task RefreshAsync()
+        private async Task RefreshList()
         {
-            // #FIXME
-#if false
-            try
+            // Backend null 가드
+            if (XqlAddIn.Backend is not IXqlBackend be)
+                return;
+
+            if (Interlocked.Exchange(ref _refreshing, 1) == 1) return;
+
+            _cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+
+            var list = await be.FetchPresence(_cts.Token).ConfigureAwait(false);
+            if (list == null) return;
+
+            // UI 갱신
+            if (IsHandleCreated)
             {
-                const string q = "query{ presence{ nickname sheet cell updated_at } }";
-                var resp = await XqlGraphQLClient.QueryAsync<PresenceResp>(q, null);
-                var list = resp.Data?.presence ?? Array.Empty<PresenceItem>();
-                lv.BeginUpdate(); lv.Items.Clear();
-                foreach (var p in list)
-                    lv.Items.Add(new ListViewItem(new[] { p.nickname ?? "", string.Format("{0}/{1}", p.sheet, p.cell), p.updated_at ?? "" }));
-                lv.EndUpdate();
+                BeginInvoke(new Action(() =>
+                {
+                    _lv.BeginUpdate();
+                    try
+                    {
+                        _lv.Items.Clear();
+                        foreach (var p in list)
+                        {
+                            var when = p.updated_at ?? "";
+                            var where = string.IsNullOrWhiteSpace(p.sheet) && string.IsNullOrWhiteSpace(p.cell)
+                                        ? ""
+                                        : $"{p.sheet}/{p.cell}";
+                            _lv.Items.Add(new ListViewItem(new[] { p.nickname ?? "", where, when }));
+                        }
+                    }
+                    finally { _lv.EndUpdate(); }
+                }));
             }
-            catch { /* 서버가 지원 안하면 조용히 */ }
-#endif
-            
+
+            Interlocked.Exchange(ref _refreshing, 0);
         }
 
-        private sealed class PresenceResp { public PresenceItem[]? presence { get; set; } }
-        private sealed class PresenceItem { public string? nickname { get; set; } public string? sheet { get; set; } public string? cell { get; set; } public string? updated_at { get; set; } }
     }
 }

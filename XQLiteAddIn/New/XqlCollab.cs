@@ -1,180 +1,273 @@
-﻿// XqlCollab.cs
+﻿// XqlCollab.cs (Migration + RelativeKey 내장 통합판)
 using System;
-using System.Collections.Concurrent;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
-using GraphQL;
-using GraphQL.Client.Http;
-using GraphQL.Client.Serializer.Newtonsoft;
-using Newtonsoft.Json.Linq;
+using ExcelDna.Integration;
+using Excel = Microsoft.Office.Interop.Excel;
 
 namespace XQLite.AddIn
 {
-    /// <summary>
-    /// 실시간 협업(프레즌스 + 시트/셀/컬럼 락)
-    /// - Heartbeat: 2.5초 주기(기본), TTL: 10초(기본)
-    /// - 로컬 캐시에 즉시 반영 + 서버와 동기화
-    /// - 락 키 규격:
-    ///   * 셀   : "cell:{sheet}!{address}"
-    ///   * 컬럼 : "column:{table}.{column}"
-    /// </summary>
     internal sealed class XqlCollab : IDisposable
     {
-        private readonly ConcurrentDictionary<string, DateTime> _presence = new(StringComparer.Ordinal);
-        private readonly ConcurrentDictionary<string, string> _locks = new(StringComparer.Ordinal); // key -> nickname
+        private readonly IXqlBackend _backend;
+        private readonly string _nickname;
+        private readonly Timer _heartbeat;
+        private volatile bool _started;
 
-        private readonly Timer _ttlSweep;
-        private readonly Timer _hbTimer;
-
-        private readonly IXqlBackend? _backend; // 서버 연동(선택)
-
-        private readonly int _ttlSec;
-        private readonly int _hbMs;
-
-        private volatile string _lastCellRef = ""; // "Sheet!A1"
-
-        internal static XqlCollab? Instance = null;
-
-        public XqlCollab(IXqlBackend backend, int ttlSeconds = 10, int heartbeatMs = 2500)
+        public XqlCollab(IXqlBackend backend, string nickname, int heartbeatSec = 3)
         {
-            Instance = null;
-
             _backend = backend ?? throw new ArgumentNullException(nameof(backend));
-            _ttlSec = Math.Max(5, ttlSeconds);
-            _hbMs = Math.Max(1000, heartbeatMs);
-
-            _ttlSweep = new Timer(_ => Sweep(), null, 5000, 2000);
-            _hbTimer = new Timer(_ => SendPeriodicHeartbeat(), null, Timeout.Infinite, Timeout.Infinite);
+            _nickname = string.IsNullOrWhiteSpace(nickname) ? "anonymous" : XqlConfig.Nickname.Trim();
+            _heartbeat = new Timer(async _ => await SafeHeartbeat(), null, Timeout.Infinite, Timeout.Infinite);
+            _ = SafeHeartbeat(); // 즉시 1회
+            _heartbeat.Change(TimeSpan.FromSeconds(heartbeatSec), TimeSpan.FromSeconds(heartbeatSec));
+            _started = true;
         }
 
         public void Dispose()
         {
-            try { _ttlSweep.Dispose(); } catch { }
-            try { _hbTimer.Dispose(); } catch { }
-            try { _backend?.Dispose(); } catch { }
+            _started = false;
+            try 
+            { 
+                _heartbeat.Change(Timeout.Infinite, Timeout.Infinite); 
+                _heartbeat.Dispose(); 
+            } catch { }
         }
 
-        // ===== Presence =====
-
-        /// <summary>선택 변경 시 호출: 현재 선택 셀을 알려주면 디바운스된 하트비트로 반영됩니다.</summary>
-        public void NotifySelection(string nickname, string sheetExAddr)
+        // ─────────────────────────────────────────────────────────────────────
+        // Presence
+        // ─────────────────────────────────────────────────────────────────────
+        private async Task SafeHeartbeat()
         {
-            _lastCellRef = sheetExAddr ?? "";
-            _hbTimer.Change(_hbMs, Timeout.Infinite);
+            if (!_started) return;
+            try
+            {
+                var cell = TryGetCurrentRelativeCellKeyOrNull();
+                await _backend.PresenceHeartbeat(_nickname, cell).ConfigureAwait(false);
+            }
+            catch { /* 네트워크 일시 오류는 무시 */ }
         }
 
-        /// <summary>즉시 하트비트(버튼/메뉴에서 수동 호출 가능)</summary>
-        public void Heartbeat(string nickname, string? cellRef = null)
+        // ─────────────────────────────────────────────────────────────────────
+        // Lock APIs (항상 상대 키로 정규화하여 서버 호출)
+        // ─────────────────────────────────────────────────────────────────────
+        public async Task<bool> Acquire(string resourceKey)
         {
             try
             {
-                nickname = string.IsNullOrWhiteSpace(nickname) ? "anonymous" : nickname;
-                var cref = cellRef ?? _lastCellRef;
-
-                _presence[nickname] = DateTime.UtcNow;
-                if (!string.IsNullOrEmpty(cref))
-                {
-                    var key = BuildCellKeyFromDisplayRef(cref); // "cell:Sheet!A1"
-                    _locks.TryAdd(key, nickname);
-                }
-
-                _backend?.PresenceHeartbeat(nickname, cref);
-            }
-            catch { }
-        }
-
-        private void SendPeriodicHeartbeat()
-        {
-            var nickname = XqlAddIn.Cfg?.Nickname ?? "anonymous";
-            try { Heartbeat(nickname, _lastCellRef); }
-            catch { }
-        }
-
-        /// <summary>TTL 만료 사용자/락 청소</summary>
-        private void Sweep()
-        {
-            var now = DateTime.UtcNow;
-            foreach (var kv in _presence)
-            {
-                if ((now - kv.Value).TotalSeconds > _ttlSec)
-                {
-                    _presence.TryRemove(kv.Key, out _);
-                    ReleaseLocksBy(kv.Key);
-                }
-            }
-        }
-
-        // ===== Locks: 공통 유틸 =====
-
-        private static string BuildCellKey(string sheet, string address) => $"cell:{sheet}!{address}";
-        private static string BuildCellKeyFromDisplayRef(string sheetExAddr) => $"cell:{sheetExAddr}";
-        private static string BuildColumnKey(string table, string column) => $"column:{table}.{column}";
-
-        /// <summary>소유자 닉네임 기준으로 모든 락 해제</summary>
-        public void ReleaseLocksBy(string nickname)
-        {
-            try
-            {
-                foreach (var kv in _locks)
-                    if (kv.Value == nickname) _locks.TryRemove(kv.Key, out _);
-
-                _backend?.ReleaseLocksBy(nickname);
-            }
-            catch { }
-        }
-
-        public bool IsLockedCell(string sheet, string address, out string by)
-        {
-            var key = BuildCellKey(sheet, address);
-            if (_locks.TryGetValue(key, out by!)) return true;
-            by = ""; return false;
-        }
-
-        public bool IsLockedColumn(string table, string column, out string by)
-        {
-            var key = BuildColumnKey(table, column);
-            if (_locks.TryGetValue(key, out by!)) return true;
-            by = ""; return false;
-        }
-
-        /// <summary>셀 락 시도(동기). 성공 시 로컬/서버에 반영.</summary>
-        public async Task<bool> TryAcquireCellLock(string sheet, string address, string byNickname)
-        {
-            if (_backend == null)
-                return false;
-
-            try
-            {
-                var key = BuildCellKey(sheet, address);
-                if (_locks.TryAdd(key, byNickname))
-                {
-                    // 서버에는 통합 acquireLock(key, by)로 전달
-                    await _backend.AcquireLock(key, byNickname);
-                    return true;
-                }
-                return false;
+                var app = (Excel.Application)ExcelDnaUtil.Application;
+                var key = LockKeyMigration.MigrateIfNeeded(app, resourceKey);
+                await _backend.AcquireLock(key, _nickname).ConfigureAwait(false);
+                return true;
             }
             catch { return false; }
         }
 
-        /// <summary>컬럼 락 시도(동기). 성공 시 로컬/서버에 반영.</summary>
-        public async Task<bool> TryAcquireColumnLock(string table, string column, string byNickname)
+        public async Task<bool> ReleaseByMe()
         {
-            if (_backend == null)
-                return false;
+            try { await _backend.ReleaseLocksBy(_nickname).ConfigureAwait(false); return true; }
+            catch { return false; }
+        }
 
+        /// <summary>현재 선택의 컬럼을 상대키로 계산해 획득</summary>
+        public async Task<bool> AcquireCurrentColumn()
+        {
             try
             {
-                var key = BuildColumnKey(table, column);
-                if (_locks.TryAdd(key, byNickname))
-                {
-                    // 서버에는 통합 acquireLock(key, by)로 전달
-                    await _backend.AcquireLock(key, byNickname);
-                    return true;
-                }
-                return false;
+                var app = (Excel.Application)ExcelDnaUtil.Application;
+                var rng = (Excel.Range)app.Selection;
+                if (rng == null) return false;
+
+                var ws = (Excel.Worksheet)rng.Worksheet;
+                var lo = rng.ListObject ?? XqlSheetUtil.FindListObjectContaining(ws, rng);
+                if (lo?.HeaderRowRange == null) return false;
+
+                var tableName = XqlTableNameMap.Map(lo.Name, ws.Name);
+                var (header, headers) = XqlSheetUtil.GetHeaderAndNames(ws);
+                // 선택한 셀의 헤더 인덱스 계산
+                int colIndex = rng.Column - lo.HeaderRowRange.Column; // 0-base
+                if (colIndex < 0 || colIndex >= headers.Count) return false;
+
+                string headerName = headers[colIndex];
+                int hRow = lo.HeaderRowRange.Row;
+                int hCol = lo.HeaderRowRange.Column;
+                int colOffset = colIndex; // 헤더 좌상단 기준 상대 offset(0-base)
+
+                var key = XqlSheetUtil.ColumnKey(ws.Name, tableName, hRow, hCol, colOffset, headerName);
+                await _backend.AcquireLock(key, _nickname).ConfigureAwait(false);
+                return true;
             }
             catch { return false; }
+        }
+
+        /// <summary>현재 선택한 셀을 상대키로 계산해 획득</summary>
+        public async Task<bool> AcquireCurrentCell()
+        {
+            try
+            {
+                var app = (Excel.Application)ExcelDnaUtil.Application;
+                var rng = (Excel.Range)app.Selection;
+                if (rng == null) return false;
+
+                var ws = (Excel.Worksheet)rng.Worksheet;
+                var lo = rng.ListObject ?? XqlSheetUtil.FindListObjectContaining(ws, rng);
+                if (lo?.HeaderRowRange == null) return false;
+
+                var tableName = XqlTableNameMap.Map(lo.Name, ws.Name);
+                int hRow = lo.HeaderRowRange.Row;
+                int hCol = lo.HeaderRowRange.Column;
+
+                int rowOffset = rng.Row - (hRow + 1); // 데이터 첫행 = header+1
+                int colOffset = rng.Column - hCol;
+
+                var key = XqlSheetUtil.CellKey(ws.Name, tableName, hRow, hCol, rowOffset, colOffset);
+                await _backend.AcquireLock(key, _nickname).ConfigureAwait(false);
+                return true;
+            }
+            catch { return false; }
+        }
+
+        // (선택) 특정 구키를 새키로 서버에서 교체 시도: 새키 획득 후 내 락 해제
+        public async Task<bool> MigrateOnServer(string oldKey)
+        {
+            try
+            {
+                var app = (Excel.Application)ExcelDnaUtil.Application;
+                var newKey = LockKeyMigration.MigrateIfNeeded(app, oldKey);
+                if (newKey == oldKey) return true; // 이미 신포맷
+
+                await _backend.AcquireLock(newKey, _nickname).ConfigureAwait(false);
+                await _backend.ReleaseLocksBy(_nickname).ConfigureAwait(false);
+                return true;
+            }
+            catch { return false; }
+        }
+
+        // UI가 현재 커서를 Presence에 태그하고 싶을 때 사용
+        private static string? TryGetCurrentRelativeCellKeyOrNull()
+        {
+            try
+            {
+                var app = (Excel.Application)ExcelDnaUtil.Application;
+                var rng = (Excel.Range)app.Selection;
+                if (rng == null) return null;
+
+                var ws = (Excel.Worksheet)rng.Worksheet;
+                var lo = rng.ListObject ?? XqlSheetUtil.FindListObjectContaining(ws, rng);
+                if (lo?.HeaderRowRange == null) return null;
+
+                var tableName = XqlTableNameMap.Map(lo.Name, ws.Name);
+                int hRow = lo.HeaderRowRange.Row;
+                int hCol = lo.HeaderRowRange.Column;
+
+                int rowOffset = rng.Row - (hRow + 1);
+                int colOffset = rng.Column - hCol;
+
+                return XqlSheetUtil.CellKey(ws.Name, tableName, hRow, hCol, rowOffset, colOffset);
+            }
+            catch { return null; }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        // 마이그레이션(구 포맷 → 상대키)  ─ 내부 클래스로 내장
+        // ─────────────────────────────────────────────────────────────────────
+        private static class LockKeyMigration
+        {
+            // 예: cell:Sheet!B5  | cell:Sheet!$C$10
+            private static readonly Regex RxOldCell =
+                new(@"^cell:(?<sheet>[^!]+)!(?<addr>\$?[A-Z]+\$?\d+)$",
+                    RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
+
+            // 예: column:Table.Column  | col:Table.Column
+            private static readonly Regex RxOldColumn =
+                new(@"^(?:column|col):(?<table>[^\.]+)\.(?<column>.+)$",
+                    RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
+
+            public static string MigrateIfNeeded(Excel.Application app, string oldKey)
+            {
+                if (string.IsNullOrWhiteSpace(oldKey)) return oldKey;
+
+                // 1) cell:Sheet!A1
+                var mCell = RxOldCell.Match(oldKey);
+                if (mCell.Success)
+                {
+                    var sheet = mCell.Groups["sheet"].Value;
+                    var addr = mCell.Groups["addr"].Value;
+
+                    var ws = XqlSheetUtil.FindWorksheet(app, sheet);
+                    if (ws == null) return oldKey;
+
+                    Excel.Range? rng = null; Excel.ListObject? lo = null;
+                    try
+                    {
+                        rng = ws.Range[addr];
+                        lo = rng?.ListObject ?? XqlSheetUtil.FindListObjectContaining(ws, rng!);
+                        if (lo?.HeaderRowRange == null) return oldKey;
+
+                        int hRow = lo.HeaderRowRange.Row;
+                        int hCol = lo.HeaderRowRange.Column;
+
+                        int rowOffset = rng!.Row - (hRow + 1);
+                        int colOffset = rng!.Column - hCol;
+
+                        var tableName = XqlTableNameMap.Map(lo.Name, ws.Name);
+                        return XqlSheetUtil.CellKey(ws.Name, tableName, hRow, hCol, rowOffset, colOffset);
+                    }
+                    catch { return oldKey; }
+                    finally { XqlCommon.ReleaseCom(lo); XqlCommon.ReleaseCom(rng); }
+                }
+
+                // 2) column:Table.Column
+                var mCol = RxOldColumn.Match(oldKey);
+                if (mCol.Success)
+                {
+                    var table = mCol.Groups["table"].Value;
+                    var col = mCol.Groups["column"].Value;
+
+                    try
+                    {
+                        var app2 = (Excel.Application)ExcelDnaUtil.Application;
+                        var ws = (Excel.Worksheet)app2.ActiveSheet;
+                        if (ws == null) return oldKey;
+
+                        var lo = XqlSheetUtil.FindListObjectByTable(ws, table);
+                        if (lo?.HeaderRowRange == null) return oldKey;
+
+                        var (header, headers) = XqlSheetUtil.GetHeaderAndNames(ws);
+                        int colIndex = headers.FindIndex(h => string.Equals(h, col, StringComparison.Ordinal));
+                        if (colIndex < 0) return oldKey;
+
+                        int hRow = lo.HeaderRowRange.Row;
+                        int hCol = lo.HeaderRowRange.Column;
+                        int headerCol = lo.HeaderRowRange.Column + colIndex;
+                        int colOffset = headerCol - hCol;
+
+                        return XqlSheetUtil.ColumnKey(ws.Name, table, hRow, hCol, colOffset, col);
+                    }
+                    catch { return oldKey; }
+                }
+
+                // 3) 이미 신 포맷/미인식 포맷
+                return oldKey;
+            }
+        }
+
+        // (선택) 키를 더블클릭으로 점프할 때 사용: 상대키 → 현재 Range 복원
+        public static bool TryJumpTo(string key)
+        {
+            try
+            {
+                var app = (Excel.Application)ExcelDnaUtil.Application;
+                if (XqlSheetUtil.TryParse(key, out var desc) &&
+                    XqlSheetUtil.TryResolve(app, desc, out var range, out _, out _))
+                {
+                    range?.Select();
+                    return true;
+                }
+            }
+            catch { }
+            return false;
         }
     }
 }

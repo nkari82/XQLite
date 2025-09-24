@@ -189,7 +189,7 @@ namespace XQLite.AddIn
                     _applier.ApplyOnUiThread(ev.Patches);
 
                 // 안전성 위해 한 번 더 Pull (fire-and-forget)
-                SafePull();
+                var _ = SafePull();
             }
             catch (Exception ex)
             {

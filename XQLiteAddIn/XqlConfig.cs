@@ -1,86 +1,128 @@
 ﻿using ExcelDna.Integration;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using System;
 using System.IO;
+using System.Net;
 using Excel = Microsoft.Office.Interop.Excel;
 
 
 namespace XQLite.AddIn
 {
-    internal sealed class XqlConfig
+    internal static class XqlConfig
     {
-        public string Endpoint { get; set; } = "http://localhost:4000/graphql";
-        public string ApiKey { get; set; } = "";
-        public string Nickname { get; set; } = Environment.UserName;
-        public string Project { get; set; } = "";
+        [JsonProperty]
+        public static string Endpoint { get; set; } = "http://localhost:4000/graphql";
+        [JsonProperty]
+        public static string ApiKey { get; set; } = "";
+        [JsonProperty]
+        public static string Nickname { get; set; } = Environment.UserName ?? "anonymous";
+        [JsonProperty]
+        public static string Project { get; set; } = "";
 
 
-        public int PullSec { get; set; } = 10;
-        public int DebounceMs { get; set; } = 2000;
-        public int HeartbeatSec { get; set; } = 3;
-        public int LockTtlSec { get; set; } = 10;
+        [JsonProperty]
+        public static int PullSec { get; set; } = 10;
+        [JsonProperty]
+        public static int DebounceMs { get; set; } = 2000;
+        [JsonProperty]
+        public static int HeartbeatSec { get; set; } = 3;
+        [JsonProperty]
+        public static int LockTtlSec { get; set; } = 10;
 
 
-        private string? _resolvedPath;
+        private static string? _resolvedPath;
 
 
-        public static XqlConfig Load()
+        public static void Load()
         {
-            var cfg = new XqlConfig();
-            if (TryEnv("XQL_CONFIG", ref cfg)) return cfg;
-
+            if (TryEnv("XQL_CONFIG")) 
+                return;
 
             var sidecar = TryWorkbookSidecar();
-            if (sidecar is not null && TryFile(sidecar, ref cfg)) return cfg;
-
+            if (sidecar is not null && TryFile(sidecar)) 
+                return;
 
             var roaming = RoamingPath();
-            if (TryFile(roaming, ref cfg)) return cfg;
+            if (TryFile(roaming)) 
+                return;
 
-            cfg._resolvedPath = sidecar ?? roaming;
-            return cfg;
+            _resolvedPath = sidecar ?? roaming;
         }
 
 
-        public void Save(bool preferSidecar = true)
+        internal static void Save(bool preferSidecar = true)
         {
             var sidecar = TryWorkbookSidecar();
             var path = preferSidecar && sidecar is not null ? sidecar : RoamingPath();
-            var json = XqlJson.Serialize(this, true);
+            Save(path);
+        }
+
+        internal static void Save(string path)
+        {
+            var data = new
+            {
+                Endpoint,
+                ApiKey,
+                Nickname,
+                Project,
+                PullSec,
+                DebounceMs,
+                HeartbeatSec,
+                LockTtlSec
+            };
+
+            var json = JsonConvert.SerializeObject(data, Formatting.Indented);
             var dir = Path.GetDirectoryName(path);
-            if(!string.IsNullOrEmpty(dir))
+            if (!string.IsNullOrEmpty(dir))
                 Directory.CreateDirectory(dir!);
             File.WriteAllText(path, json);
             _resolvedPath = path;
         }
 
-
-        private static bool TryEnv(string name, ref XqlConfig cfg)
+        private static bool TryEnv(string name)
         {
             var v = Environment.GetEnvironmentVariable(name);
             if (string.IsNullOrWhiteSpace(v)) return false;
             if (v.TrimStart().StartsWith("{"))
-                return TryJson(v, ref cfg);
+                return TryJson(v);
             if (File.Exists(v))
-                return TryFile(v, ref cfg);
+                return TryFile(v);
             return false;
         }
 
-        private static bool TryFile(string path, ref XqlConfig cfg)
+        internal static bool TryFile(string path)
         {
-            try { return TryJson(File.ReadAllText(path), ref cfg) && (cfg._resolvedPath = path) == path; }
+            try 
+            { 
+                return TryJson(File.ReadAllText(path)) && (_resolvedPath = path) == path; 
+            }
             catch { return false; }
         }
 
-        private static bool TryJson(string json, ref XqlConfig cfg)
+        internal static bool TryJson(string json)
         {
-            try { var x = XqlJson.Deserialize<XqlConfig>(json); if (x is null) return false; Copy(x, cfg); return true; }
-            catch { return false; }
-        }
+            try
+            {
+                var x = JObject.Parse(json);
+                if (x == null)
+                    return false;
 
-        private static void Copy(XqlConfig s, XqlConfig d)
-        {
-            d.Endpoint = s.Endpoint; d.ApiKey = s.ApiKey; d.Nickname = s.Nickname; d.Project = s.Project;
-            d.PullSec = s.PullSec; d.DebounceMs = s.DebounceMs; d.HeartbeatSec = s.HeartbeatSec; d.LockTtlSec = s.LockTtlSec;
+                Endpoint = (string?)x["Endpoint"] ?? Endpoint;
+                ApiKey = (string?)x["ApiKey"] ?? ApiKey;
+                Nickname = (string?)x["Nickname"] ?? Nickname;
+                Project = (string?)x["Project"] ?? Project;
+                PullSec = (int?)x["PullSec"] ?? PullSec;
+                DebounceMs = (int?)x["DebounceMs"] ?? DebounceMs;
+                HeartbeatSec = (int?)x["HeartbeatSec"] ?? HeartbeatSec;
+                LockTtlSec = (int?)x["LockTtlSec"] ?? LockTtlSec;
+
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         private static string RoamingPath()

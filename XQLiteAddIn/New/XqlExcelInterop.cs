@@ -2,9 +2,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Runtime.InteropServices;
 using System.Threading;
-using System.Windows.Forms;
 using ExcelDna.Integration;
 using Excel = Microsoft.Office.Interop.Excel;
 
@@ -26,20 +24,16 @@ namespace XQLite.AddIn
         private readonly XqlCollab _collab;
         private readonly XqlMetaRegistry _meta;
         private readonly XqlBackup _backup;
-        internal static XqlExcelInterop? Instance = null;
 
         private bool _started;
         private readonly object _uiGate = new();
 
         // 선택 변경 스팸 억제를 위한 디바운서
         private readonly System.Threading.Timer _heartbeatDebounce;
-        private volatile string _lastNickname = string.Empty;
         private volatile string _lastCellRef = string.Empty;
 
         public XqlExcelInterop(Excel.Application app, XqlSync sync, XqlCollab collab, XqlMetaRegistry meta, XqlBackup backup)
         {
-            Instance = this;
-
             _app = app ?? throw new ArgumentNullException(nameof(app));
             _sync = sync ?? throw new ArgumentNullException(nameof(sync));
             _collab = collab ?? throw new ArgumentNullException(nameof(collab));
@@ -130,7 +124,7 @@ namespace XQLite.AddIn
         private void App_WorkbookBeforeClose(Excel.Workbook wb, ref bool Cancel)
         {
             // 락 해제, 프레즌스 정리 등
-            _collab.ReleaseLocksBy(_lastNickname);
+            var _ = _collab.ReleaseByMe();
             XqlCommon.ReleaseCom(wb);
         }
 
@@ -197,9 +191,9 @@ namespace XQLite.AddIn
         {
             try
             {
-                var nickname = _lastNickname;
+                
                 var cellRef = _lastCellRef;
-                _collab.Heartbeat(nickname, cellRef);
+                // _collab.Heartbeat(nickname, cellRef);
 
                 // 선택 셀에 대한 락(낙관적으로 시도)
                 //if (!string.IsNullOrEmpty(cellRef))

@@ -1,11 +1,9 @@
-﻿using ExcelDna.Integration;
-using System;
-using System.Collections.Concurrent;
+﻿using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Reflection;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using ExcelDna.Integration;
 using Excel = Microsoft.Office.Interop.Excel;
 
 namespace XQLite.AddIn
@@ -20,189 +18,161 @@ namespace XQLite.AddIn
             _inst.BringToFront();
         }
 
+        // 단일 Collab 인스턴스(프로젝트 전역에서 사용 중인 것)
+        private XqlCollab Collab => XqlAddIn.Collab!; // 필요 시 참조 수정
+
         private readonly Button btnLockCol = new() { Text = "Lock Column", Width = 120, Dock = DockStyle.Left };
         private readonly Button btnLockCell = new() { Text = "Lock Cell", Width = 100, Dock = DockStyle.Left };
-        private readonly Button btnUnlock = new() { Text = "Unlock (Mine)", Width = 140, Dock = DockStyle.Left };
+        private readonly Button btnUnlockAll = new() { Text = "Unlock (Mine)", Width = 120, Dock = DockStyle.Left };
+        private readonly Button btnJump = new() { Text = "Jump to Selected", Width = 140, Dock = DockStyle.Left };
+
         private readonly ListView lv = new() { View = View.Details, Dock = DockStyle.Fill, FullRowSelect = true };
-        private readonly Timer auto = new() { Interval = 2000 };
+        private readonly StatusStrip status = new();
+        private readonly ToolStripStatusLabel lbl = new() { Text = "Ready" };
+
+        // 서버 목록 API가 없으므로 로컬 히스토리로 최근 락을 보관
+        private readonly LinkedList<string> _recentKeys = new();
+        private const int MaxRecent = 200;
 
         public XqlLockForm()
         {
             Text = "XQLite Locks";
             StartPosition = FormStartPosition.Manual;
-            Left = 60; Top = 60; Width = 720; Height = 360;
+            Left = 80; Top = 80; Width = 760; Height = 420;
 
-            var top = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 36 };
-            top.Controls.AddRange(new Control[] { btnLockCol, btnLockCell, btnUnlock });
+            var top = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 40, Padding = new Padding(8), AutoSize = false };
+            top.Controls.AddRange(new Control[] { btnLockCol, btnLockCell, btnUnlockAll, btnJump });
 
             lv.Columns.AddRange(new[]
             {
-                new ColumnHeader { Text = "LockId",   Width = 220 }, // 리소스 키
-                new ColumnHeader { Text = "Owner",    Width = 120 },
-                new ColumnHeader { Text = "Resource", Width = 220 },
-                new ColumnHeader { Text = "Expires",  Width = 120 }
+                new ColumnHeader { Text = "Key (relative)", Width = 440 },
+                new ColumnHeader { Text = "When",           Width = 180 },
+                new ColumnHeader { Text = "Note",           Width = 100 },
             });
+
+            status.Items.Add(lbl);
 
             Controls.Add(lv);
             Controls.Add(top);
+            Controls.Add(status);
 
-            btnLockCol.Click += async (_, __) => await LockCurrentColumnAsync();
-            btnLockCell.Click += async (_, __) => await LockCurrentCellAsync();
-            btnUnlock.Click += async (_, __) => await UnlockMineAsync();
+            // 핸들러
+            btnLockCol.Click += async (_, __) => await LockCurrentColumn();
+            btnLockCell.Click += async (_, __) => await LockCurrentCell();
+            btnUnlockAll.Click += async (_, __) => await UnlockMine();
+            btnJump.Click += (_, __) => JumpToSelected();
 
-            auto.Tick += (_, __) => RefreshList();
-            auto.Start();
+            lv.ItemActivate += (_, __) => JumpToSelected();
+
             Load += (_, __) => RefreshList();
         }
 
-        // ===== Actions =====
+        // ─────────────────────────────────────────────────────────────────────
+        // Actions
+        // ─────────────────────────────────────────────────────────────────────
 
-        private async Task LockCurrentColumnAsync()
-        {
-            var sel = GetSelection();
-            if (sel == null || string.IsNullOrEmpty(sel.Table) || string.IsNullOrEmpty(sel.ColumnName))
-            {
-                MessageBox.Show("선택 영역이 테이블 컬럼이 아닙니다.");
-                return;
-            }
-            if (XqlCollab.Instance == null)
-            {
-                MessageBox.Show("Collab 모듈이 초기화되지 않았습니다.");
-                return;
-            }
-
-            var nickname = XqlAddIn.Cfg?.Nickname ?? "anonymous";
-#pragma warning disable CS8602 // null 가능 참조에 대한 역참조입니다.
-            var ok = await XqlAddIn.Collab.TryAcquireColumnLock(sel.Table!, sel.ColumnName!, nickname);
-#pragma warning restore CS8602 // null 가능 참조에 대한 역참조입니다.
-            MessageBox.Show(ok ? "Locked" : "Lock failed");
-            RefreshList();
-        }
-
-        private async Task LockCurrentCellAsync()
-        {
-            var sel = GetSelection();
-            if (sel == null)
-                return;
-            if (XqlCollab.Instance == null)
-            {
-                MessageBox.Show("Collab 모듈이 초기화되지 않았습니다.");
-                return;
-            }
-
-            var nickname = XqlAddIn.Cfg?.Nickname ?? "anonymous";
-            var ok = await XqlCollab.Instance.TryAcquireCellLock(sel.Sheet, sel.Address, nickname);
-            MessageBox.Show(ok ? "Locked" : "Lock failed");
-            RefreshList();
-        }
-
-        private async Task UnlockMineAsync()
-        {
-            if (XqlCollab.Instance == null)
-            {
-                MessageBox.Show("Collab 모듈이 초기화되지 않았습니다.");
-                return;
-            }
-            var nick = XqlAddIn.Cfg?.Nickname ?? "anonymous";
-            XqlCollab.Instance.ReleaseLocksBy(nick); // 서버/로컬 모두 해제
-            await Task.Delay(50);
-            RefreshList();
-        }
-
-        // ===== List Rendering =====
-
-        private void RefreshList()
+        private async Task LockCurrentColumn()
         {
             try
             {
-                lv.BeginUpdate();
-                lv.Items.Clear();
+                if (Collab == null) { Warn("Collab not ready."); return; }
 
-                foreach (var it in SnapshotLocks())
+                // 선택된 컬럼으로 상대키 생성 → Acquire (Collab 내부에서 마이그레이션 처리)
+                if (await Collab.AcquireCurrentColumn().ConfigureAwait(false))
                 {
-                    var li = new ListViewItem(new[]
-                    {
-                        it.LockId,
-                        it.Owner,
-                        it.Resource,
-                        it.ExpiresAtLocal
-                    })
-                    {
-                        Tag = it.LockId
-                    };
-                    lv.Items.Add(li);
+                    var key = TryCurrentColumnKeyOrNull();
+                    if (!string.IsNullOrWhiteSpace(key)) PushRecent(key!, "locked");
+                    Info("Column locked.");
                 }
+                else Warn("Lock failed.");
             }
-            finally
+            catch (Exception ex) { Warn("Lock error: " + ex.Message); }
+            RefreshList();
+        }
+
+        private async Task LockCurrentCell()
+        {
+            try
             {
-                lv.EndUpdate();
+                if (Collab == null) { Warn("Collab not ready."); return; }
+
+                if (await Collab.AcquireCurrentCell().ConfigureAwait(false))
+                {
+                    var key = TryCurrentCellKeyOrNull();
+                    if (!string.IsNullOrWhiteSpace(key)) PushRecent(key!, "locked");
+                    Info("Cell locked.");
+                }
+                else Warn("Lock failed.");
             }
+            catch (Exception ex) { Warn("Lock error: " + ex.Message); }
+            RefreshList();
         }
 
-        // 우선 Collab에 공개 API가 있다면 사용, 없으면 reflection fallback
-        private IEnumerable<LockView> SnapshotLocks()
+        private async Task UnlockMine()
         {
-            var list = new List<LockView>();
-
-            if (XqlCollab.Instance != null)
+            try
             {
-                // 1) 공개 API가 있다면 사용
-                var pub = XqlCollab.Instance.GetType().GetMethod("GetCurrentLocks", BindingFlags.Instance | BindingFlags.Public);
-                if (pub != null)
+                if (Collab == null) { Warn("Collab not ready."); return; }
+                if (await Collab.ReleaseByMe().ConfigureAwait(false))
                 {
-                    var result = pub.Invoke(XqlCollab.Instance, null) as IEnumerable<object>;
-                    if (result != null)
-                    {
-                        foreach (var o in result)
-                        {
-                            // 익명/튜플 등에 대응
-                            var t = o.GetType();
-                            string key = TryProp<string>(t, o, "Key") ?? TryProp<string>(t, o, "Resource") ?? "";
-                            string owner = TryProp<string>(t, o, "Owner") ?? TryProp<string>(t, o, "By") ?? "";
-                            DateTime? exp = TryProp<DateTime?>(t, o, "ExpiresAt");
-                            list.Add(new LockView(key, owner, key, ToLocalString(exp)));
-                        }
-                        return list;
-                    }
+                    Info("Released my locks.");
                 }
-
-                // 2) 내부 딕셔너리(_locks: ConcurrentDictionary<string,string>)에 대한 reflection
-                var fld = XqlCollab.Instance?.GetType().GetField("_locks", BindingFlags.NonPublic | BindingFlags.Instance);
-                if (fld?.GetValue(XqlCollab.Instance) is ConcurrentDictionary<string, string> dict)
-                {
-                    foreach (var kv in dict)
-                        list.Add(new LockView(kv.Key, kv.Value, kv.Key, "")); // TTL은 서버 기준이라 미표시
-                }
+                else Warn("Release failed.");
             }
-
-            return list;
+            catch (Exception ex) { Warn("Release error: " + ex.Message); }
         }
 
-        private static T? TryProp<T>(Type t, object o, string name)
+        private void JumpToSelected()
         {
-            var p = t.GetProperty(name, BindingFlags.Public | BindingFlags.Instance);
-            if (p == null) return default;
-            try { return (T?)p.GetValue(o); } catch { return default; }
+            try
+            {
+                if (lv.SelectedItems.Count == 0) return;
+                var key = lv.SelectedItems[0].SubItems[0].Text;
+                if (string.IsNullOrWhiteSpace(key)) return;
+
+                if (XqlCollab.TryJumpTo(key))
+                {
+                    Info("Jumped.");
+                }
+                else Warn("Cannot resolve key.");
+            }
+            catch (Exception ex) { Warn("Jump error: " + ex.Message); }
         }
 
-        private static string ToLocalString(DateTime? dt)
+        // ─────────────────────────────────────────────────────────────────────
+        // Helpers
+        // ─────────────────────────────────────────────────────────────────────
+
+        private void PushRecent(string key, string note)
         {
-            if (!dt.HasValue) return "";
-            try { return dt.Value.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss"); }
-            catch { return ""; }
+            // 중복은 맨 앞으로 당김
+            var node = _recentKeys.FirstOrDefault(k => string.Equals(k, key, StringComparison.Ordinal));
+            if (node != null)
+            {
+                _recentKeys.Remove(key);
+            }
+            _recentKeys.AddFirst(key);
+            while (_recentKeys.Count > MaxRecent) _recentKeys.RemoveLast();
+
+            // UI 반영
+            var li = new ListViewItem(new[] { key, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"), note });
+            lv.Items.Insert(0, li);
+            // 리스트가 너무 커졌으면 정리
+            while (lv.Items.Count > MaxRecent) lv.Items.RemoveAt(lv.Items.Count - 1);
         }
 
-        // ===== Selection Helper =====
-
-        private sealed class SelInfo
+        private void RefreshList()
         {
-            public string Sheet = "";
-            public string Address = "";
-            public string? Table;
-            public string? ColumnName;
+            // 첫 로드 시 아무 것도 없으면 현재 선택으로 힌트 제공
+            if (lv.Items.Count == 0)
+            {
+                var hint = TryCurrentCellKeyOrNull() ?? TryCurrentColumnKeyOrNull();
+                if (!string.IsNullOrWhiteSpace(hint))
+                    PushRecent(hint!, "hint");
+            }
         }
 
-        private SelInfo? GetSelection()
+        private static string? TryCurrentCellKeyOrNull()
         {
             try
             {
@@ -211,38 +181,50 @@ namespace XQLite.AddIn
                 if (rng == null) return null;
 
                 var ws = (Excel.Worksheet)rng.Worksheet;
-                string sheet = ws.Name;
-                string addr = rng.Address[false, false];
+                var lo = rng.ListObject ?? XqlSheetUtil.FindListObjectContaining(ws, rng);
+                if (lo?.HeaderRowRange == null) return null;
 
-                string? tableName = null;
-                string? colName = null;
+                var tableName = XqlTableNameMap.Map(lo.Name, ws.Name);
+                int hRow = lo.HeaderRowRange.Row;
+                int hCol = lo.HeaderRowRange.Column;
+                int rowOffset = rng.Row - (hRow + 1);
+                int colOffset = rng.Column - hCol;
 
-                if (rng.ListObject is Excel.ListObject lo)
-                {
-                    tableName = XqlTableNameMap.Map(lo.Name, ws.Name);
-                    int colIndex = rng.Column - lo.HeaderRowRange.Column + 1;
-                    if (colIndex >= 1 && colIndex <= lo.HeaderRowRange.Columns.Count)
-                    {
-                        var headerArr = (object[,])lo.HeaderRowRange.Value2;
-                        colName = Convert.ToString(headerArr[1, colIndex]) ?? "";
-                    }
-                }
-
-                return new SelInfo
-                {
-                    Sheet = sheet,
-                    Address = addr,
-                    Table = tableName,
-                    ColumnName = colName
-                };
+                return $"cell:{ws.Name}:{tableName}:H{hRow}C{hCol}:dr={rowOffset}:dc={colOffset}";
             }
-            catch
-            {
-                return null;
-            }
+            catch { return null; }
         }
 
-        // 목록 표시용 뷰모델
-        private readonly record struct LockView(string LockId, string Owner, string Resource, string ExpiresAtLocal);
+        private static string? TryCurrentColumnKeyOrNull()
+        {
+            try
+            {
+                var app = (Excel.Application)ExcelDnaUtil.Application;
+                var rng = (Excel.Range)app.Selection;
+                if (rng == null) return null;
+
+                var ws = (Excel.Worksheet)rng.Worksheet;
+                var lo = rng.ListObject ?? XqlSheetUtil.FindListObjectContaining(ws, rng);
+                if (lo?.HeaderRowRange == null) return null;
+
+                var (header, headers) = XqlSheetUtil.GetHeaderAndNames(ws);
+                int colIndex = rng.Column - lo.HeaderRowRange.Column; // 0-base
+                if (colIndex < 0 || colIndex >= headers.Count) return null;
+
+                string headerName = headers[colIndex];
+                var tableName = XqlTableNameMap.Map(lo.Name, ws.Name);
+                int hRow = lo.HeaderRowRange.Row;
+                int hCol = lo.HeaderRowRange.Column;
+                int colOffset = colIndex;
+
+                return $"col:{ws.Name}:{tableName}:H{hRow}C{hCol}:dx={colOffset}:hdr={Escape(headerName)}";
+            }
+            catch { return null; }
+        }
+
+        private static string Escape(string s) => s.Replace("\\", "\\\\").Replace(":", "\\:");
+
+        private void Info(string msg) { lbl.Text = msg; }
+        private void Warn(string msg) { lbl.Text = "⚠ " + msg; }
     }
 }

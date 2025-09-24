@@ -316,19 +316,19 @@ namespace XQLite.AddIn
         // ─────────────────────────────────────────────────────────────
         private void LoadConfigToUi()
         {
-            var cfg = XqlAddIn.Cfg ?? XqlConfig.Load();
+            XqlConfig.Load();
 
-            txtEndpoint.Text = cfg.Endpoint;
-            txtApiKey.Text = cfg.ApiKey;
-            txtNickname.Text = cfg.Nickname;
-            txtProject.Text = cfg.Project;
+            txtEndpoint.Text = XqlConfig.Endpoint;
+            txtApiKey.Text = XqlConfig.ApiKey;
+            txtNickname.Text = XqlConfig.Nickname;
+            txtProject.Text = XqlConfig.Project;
 
-            numPull.Value = Clamp(cfg.PullSec, (int)numPull.Minimum, (int)numPull.Maximum);
-            numDebounce.Value = Clamp(cfg.DebounceMs, (int)numDebounce.Minimum, (int)numDebounce.Maximum);
-            numHeartbeat.Value = Clamp(cfg.HeartbeatSec, (int)numHeartbeat.Minimum, (int)numHeartbeat.Maximum);
-            numLockTtl.Value = Clamp(cfg.LockTtlSec, (int)numLockTtl.Minimum, (int)numLockTtl.Maximum);
+            numPull.Value = Clamp(XqlConfig.PullSec, (int)numPull.Minimum, (int)numPull.Maximum);
+            numDebounce.Value = Clamp(XqlConfig.DebounceMs, (int)numDebounce.Minimum, (int)numDebounce.Maximum);
+            numHeartbeat.Value = Clamp(XqlConfig.HeartbeatSec, (int)numHeartbeat.Minimum, (int)numHeartbeat.Maximum);
+            numLockTtl.Value = Clamp(XqlConfig.LockTtlSec, (int)numLockTtl.Minimum, (int)numLockTtl.Maximum);
 
-            if (string.Equals(cfg.ApiKey, "__DPAPI__", StringComparison.Ordinal))
+            if (string.Equals(XqlConfig.ApiKey, "__DPAPI__", StringComparison.Ordinal))
             {
                 chkSecure.Checked = true;
                 txtApiKey.PlaceholderTextSafe("Stored securely (DPAPI)");
@@ -338,35 +338,32 @@ namespace XQLite.AddIn
 
         private void SaveConfig(bool apply)
         {
-            var cfg = XqlAddIn.Cfg ?? new XqlConfig();
-            cfg.Endpoint = txtEndpoint.Text.Trim();
-            cfg.ApiKey = chkSecure.Checked ? "__DPAPI__" : txtApiKey.Text;
-            cfg.Nickname = txtNickname.Text.Trim();
-            cfg.Project = txtProject.Text.Trim();
-            cfg.PullSec = (int)numPull.Value;
-            cfg.DebounceMs = (int)numDebounce.Value;
-            cfg.HeartbeatSec = (int)numHeartbeat.Value;
-            cfg.LockTtlSec = (int)numLockTtl.Value;
+            XqlConfig.Endpoint = txtEndpoint.Text.Trim();
+            XqlConfig.ApiKey = chkSecure.Checked ? "__DPAPI__" : txtApiKey.Text;
+            XqlConfig.Nickname = txtNickname.Text.Trim();
+            XqlConfig.Project = txtProject.Text.Trim();
+            XqlConfig.PullSec = (int)numPull.Value;
+            XqlConfig.DebounceMs = (int)numDebounce.Value;
+            XqlConfig.HeartbeatSec = (int)numHeartbeat.Value;
+            XqlConfig.LockTtlSec = (int)numLockTtl.Value;
 
-            cfg.Save(preferSidecar: true);
+            XqlConfig.Save(preferSidecar: true);
 #if false
             if (chkSecure.Checked) 
                 XqlGraphQLClient.Secrets.SaveApiKey(txtApiKey.Text); 
             else 
                 XqlGraphQLClient.Secrets.Clear();
 #endif
-            XqlAddIn.Cfg = cfg;
-
             if (apply)
             {
                 btnSaveApply.Enabled = btnSave.Enabled = false;
                 UseWaitCursor = true;
-                var cfgCopy = cfg;
+                
                 BeginInvoke(() =>
                 {
                     try
                     {
-                        XqlAddIn.RestartRuntime(cfgCopy);
+                        XqlAddIn.RestartRuntime();
                         MessageBox.Show(this, "Saved & Applied.", "XQLite", MessageBoxButtons.OK, MessageBoxIcon.Information);
                     }
                     catch (Exception ex)

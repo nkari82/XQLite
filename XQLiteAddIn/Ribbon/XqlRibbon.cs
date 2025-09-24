@@ -1,9 +1,6 @@
-﻿using ExcelDna.Integration;
-using ExcelDna.Integration.CustomUI;
+﻿using ExcelDna.Integration.CustomUI;
 using System;
-using System.IO;
 using System.Windows.Forms;
-using Excel = Microsoft.Office.Interop.Excel;
 
 namespace XQLite.AddIn
 {
@@ -62,7 +59,7 @@ namespace XQLite.AddIn
         }
 
         public void OnCommit(IRibbonControl _)
-            => XqlExcelInterop.Instance?.Cmd_CommitSync();
+            => XqlAddIn.ExcelInterop?.Cmd_CommitSync();
 
         public void OnRecover(IRibbonControl _)
         {
