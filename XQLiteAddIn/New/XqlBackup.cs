@@ -19,12 +19,12 @@ namespace XQLite.AddIn
     /// </summary>
     internal sealed class XqlBackup : IDisposable
     {
-        private readonly XqlMetaRegistry _meta;
+        private readonly XqlSheet _sheet;
         private readonly IXqlBackend _backend;
 
-        public XqlBackup(IXqlBackend backend, XqlMetaRegistry meta, string endpoint, string apiKey)
+        public XqlBackup(IXqlBackend backend, XqlSheet sheet, string endpoint, string apiKey)
         {
-            _meta = meta ?? throw new ArgumentNullException(nameof(meta));
+            _sheet = sheet ?? throw new ArgumentNullException(nameof(sheet));
             _backend = backend;
         }
 
@@ -107,7 +107,7 @@ namespace XQLite.AddIn
 
                 foreach (var sheetName in GetWorkbookSheets(app))
                 {
-                    if (!_meta.TryGetSheet(sheetName, out var sm)) continue;
+                    if (!_sheet.TryGetSheet(sheetName, out var sm)) continue;
 
                     await EnsureTableSchema(sm);
 
@@ -258,7 +258,7 @@ namespace XQLite.AddIn
             var sheets = new List<object>();
             foreach (var name in GetAllRegisteredSheets())
             {
-                if (!_meta.TryGetSheet(name, out var sm)) continue;
+                if (!_sheet.TryGetSheet(name, out var sm)) continue;
                 var cols = sm.Columns.Select(kv => new
                 {
                     name = kv.Key,
@@ -287,7 +287,7 @@ namespace XQLite.AddIn
             var app = (Excel.Application)ExcelDnaUtil.Application;
             foreach (var sheetName in GetWorkbookSheets(app))
             {
-                if (!_meta.TryGetSheet(sheetName, out var sm)) continue;
+                if (!_sheet.TryGetSheet(sheetName, out var sm)) continue;
                 var rows = ReadSheetRows(app, sheetName, sm);
                 var outPath = Path.Combine(outDir, $"{SafeFileName(sheetName)}.csv");
                 WriteCsv(outPath, rows);
@@ -316,7 +316,7 @@ namespace XQLite.AddIn
             // 여기서는 워크북 시트명과 메타 매칭을 시도.
             var app = (Excel.Application)ExcelDnaUtil.Application;
             foreach (var name in GetWorkbookSheets(app))
-                if (_meta.TryGetSheet(name, out _)) yield return name;
+                if (_sheet.TryGetSheet(name, out _)) yield return name;
         }
 
         private static void WriteCsv(string path, List<Dictionary<string, object?>> rows)

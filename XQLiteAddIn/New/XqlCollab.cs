@@ -1,4 +1,4 @@
-﻿// XqlCollab.cs (Migration + RelativeKey 내장 통합판)
+﻿// XqlCollab.cs (Migration + RelativeKey 내장 통합판, refactored)
 using System;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -28,11 +28,12 @@ namespace XQLite.AddIn
         public void Dispose()
         {
             _started = false;
-            try 
-            { 
-                _heartbeat.Change(Timeout.Infinite, Timeout.Infinite); 
-                _heartbeat.Dispose(); 
-            } catch { }
+            try
+            {
+                _heartbeat.Change(Timeout.Infinite, Timeout.Infinite);
+                _heartbeat.Dispose();
+            }
+            catch { }
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -57,7 +58,7 @@ namespace XQLite.AddIn
             try
             {
                 var app = (Excel.Application)ExcelDnaUtil.Application;
-                var key = LockKeyMigration.MigrateIfNeeded(app, resourceKey);
+                var key = XqlSheet.MigrateLockKeyIfNeeded(app, resourceKey);
                 await _backend.AcquireLock(key, _nickname).ConfigureAwait(false);
                 return true;
             }
@@ -73,59 +74,85 @@ namespace XQLite.AddIn
         /// <summary>현재 선택의 컬럼을 상대키로 계산해 획득</summary>
         public async Task<bool> AcquireCurrentColumn()
         {
+            Excel.Range? rng = null; Excel.Worksheet? ws = null; Excel.ListObject? lo = null; Excel.Range? headerCell = null;
             try
             {
                 var app = (Excel.Application)ExcelDnaUtil.Application;
-                var rng = (Excel.Range)app.Selection;
+                rng = app.Selection as Excel.Range;
                 if (rng == null) return false;
 
-                var ws = (Excel.Worksheet)rng.Worksheet;
-                var lo = rng.ListObject ?? XqlSheet.FindListObjectContaining(ws, rng);
+                
+                var sheet = XqlAddIn.Sheet;
+                if (sheet == null) return false;
+
+                lo = rng.ListObject ?? XqlSheet.FindListObjectContaining(ws, rng);
                 if (lo?.HeaderRowRange == null) return false;
 
-                var tableName = XqlTableNameMap.Map(lo.Name, ws.Name);
-                var (header, headers) = XqlSheet.GetHeaderAndNames(ws);
-                // 선택한 셀의 헤더 인덱스 계산
-                int colIndex = rng.Column - lo.HeaderRowRange.Column; // 0-base
-                if (colIndex < 0 || colIndex >= headers.Count) return false;
+                // 선택 좌상단 컬럼 → 표 헤더 기준 0-base index
+                int colIndex = rng.Column - lo.HeaderRowRange.Column;
+                if (colIndex < 0) colIndex = 0;
+                if (lo.ListColumns != null && colIndex >= lo.ListColumns.Count)
+                    colIndex = lo.ListColumns.Count - 1;
+                if (colIndex < 0) return false;
 
-                string headerName = headers[colIndex];
+                // 헤더 명은 반드시 표 헤더에서 읽는다(UsedRange 1행 X)
+                headerCell = (Excel.Range)lo.HeaderRowRange.Cells[1, colIndex + 1];
+                string headerName = (headerCell.Value2 as string)?.Trim();
+                if (string.IsNullOrEmpty(headerName))
+                    headerName = XqlCommon.ColumnIndexToLetter(headerCell.Column);
+
+                string tableName = XqlTableNameMap.Map(lo.Name, ws.Name);
                 int hRow = lo.HeaderRowRange.Row;
                 int hCol = lo.HeaderRowRange.Column;
-                int colOffset = colIndex; // 헤더 좌상단 기준 상대 offset(0-base)
+                int colOffset = colIndex; // 헤더 좌상단 기준 0-base
 
                 var key = XqlSheet.ColumnKey(ws.Name, tableName, hRow, hCol, colOffset, headerName);
                 await _backend.AcquireLock(key, _nickname).ConfigureAwait(false);
                 return true;
             }
             catch { return false; }
+            finally
+            {
+                XqlCommon.ReleaseCom(headerCell);
+                XqlCommon.ReleaseCom(lo);
+                XqlCommon.ReleaseCom(ws);
+                XqlCommon.ReleaseCom(rng);
+            }
         }
 
         /// <summary>현재 선택한 셀을 상대키로 계산해 획득</summary>
         public async Task<bool> AcquireCurrentCell()
         {
+            Excel.Range? rng = null; Excel.Worksheet? ws = null; Excel.ListObject? lo = null;
             try
             {
                 var app = (Excel.Application)ExcelDnaUtil.Application;
-                var rng = (Excel.Range)app.Selection;
+                rng = app.Selection as Excel.Range;
                 if (rng == null) return false;
 
-                var ws = (Excel.Worksheet)rng.Worksheet;
-                var lo = rng.ListObject ?? XqlSheet.FindListObjectContaining(ws, rng);
+                ws = (Excel.Worksheet)rng.Worksheet;
+                lo = rng.ListObject ?? XqlSheet.FindListObjectContaining(ws, rng);
                 if (lo?.HeaderRowRange == null) return false;
 
-                var tableName = XqlTableNameMap.Map(lo.Name, ws.Name);
                 int hRow = lo.HeaderRowRange.Row;
                 int hCol = lo.HeaderRowRange.Column;
 
+                // 선택 범위가 넓어도 좌상단 셀 기준
                 int rowOffset = rng.Row - (hRow + 1); // 데이터 첫행 = header+1
                 int colOffset = rng.Column - hCol;
 
+                string tableName = XqlTableNameMap.Map(lo.Name, ws.Name);
                 var key = XqlSheet.CellKey(ws.Name, tableName, hRow, hCol, rowOffset, colOffset);
                 await _backend.AcquireLock(key, _nickname).ConfigureAwait(false);
                 return true;
             }
             catch { return false; }
+            finally
+            {
+                XqlCommon.ReleaseCom(lo);
+                XqlCommon.ReleaseCom(ws);
+                XqlCommon.ReleaseCom(rng);
+            }
         }
 
         // (선택) 특정 구키를 새키로 서버에서 교체 시도: 새키 획득 후 내 락 해제
@@ -134,7 +161,7 @@ namespace XQLite.AddIn
             try
             {
                 var app = (Excel.Application)ExcelDnaUtil.Application;
-                var newKey = LockKeyMigration.MigrateIfNeeded(app, oldKey);
+                var newKey = XqlSheet.MigrateLockKeyIfNeeded(app, oldKey);
                 if (newKey == oldKey) return true; // 이미 신포맷
 
                 await _backend.AcquireLock(newKey, _nickname).ConfigureAwait(false);
@@ -147,17 +174,18 @@ namespace XQLite.AddIn
         // UI가 현재 커서를 Presence에 태그하고 싶을 때 사용
         private static string? TryGetCurrentRelativeCellKeyOrNull()
         {
+            Excel.Range? rng = null; Excel.Worksheet? ws = null; Excel.ListObject? lo = null;
             try
             {
                 var app = (Excel.Application)ExcelDnaUtil.Application;
-                var rng = (Excel.Range)app.Selection;
+                rng = app.Selection as Excel.Range;
                 if (rng == null) return null;
 
-                var ws = (Excel.Worksheet)rng.Worksheet;
-                var lo = rng.ListObject ?? XqlSheet.FindListObjectContaining(ws, rng);
+                ws = (Excel.Worksheet)rng.Worksheet;
+                lo = rng.ListObject ?? XqlSheet.FindListObjectContaining(ws, rng);
                 if (lo?.HeaderRowRange == null) return null;
 
-                var tableName = XqlTableNameMap.Map(lo.Name, ws.Name);
+                string tableName = XqlTableNameMap.Map(lo.Name, ws.Name);
                 int hRow = lo.HeaderRowRange.Row;
                 int hCol = lo.HeaderRowRange.Column;
 
@@ -167,89 +195,11 @@ namespace XQLite.AddIn
                 return XqlSheet.CellKey(ws.Name, tableName, hRow, hCol, rowOffset, colOffset);
             }
             catch { return null; }
-        }
-
-        // ─────────────────────────────────────────────────────────────────────
-        // 마이그레이션(구 포맷 → 상대키)  ─ 내부 클래스로 내장
-        // ─────────────────────────────────────────────────────────────────────
-        private static class LockKeyMigration
-        {
-            // 예: cell:Sheet!B5  | cell:Sheet!$C$10
-            private static readonly Regex RxOldCell =
-                new(@"^cell:(?<sheet>[^!]+)!(?<addr>\$?[A-Z]+\$?\d+)$",
-                    RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
-
-            // 예: column:Table.Column  | col:Table.Column
-            private static readonly Regex RxOldColumn =
-                new(@"^(?:column|col):(?<table>[^\.]+)\.(?<column>.+)$",
-                    RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
-
-            public static string MigrateIfNeeded(Excel.Application app, string oldKey)
+            finally
             {
-                if (string.IsNullOrWhiteSpace(oldKey)) return oldKey;
-
-                // 1) cell:Sheet!A1
-                var mCell = RxOldCell.Match(oldKey);
-                if (mCell.Success)
-                {
-                    var sheet = mCell.Groups["sheet"].Value;
-                    var addr = mCell.Groups["addr"].Value;
-
-                    var ws = XqlSheet.FindWorksheet(app, sheet);
-                    if (ws == null) return oldKey;
-
-                    Excel.Range? rng = null; Excel.ListObject? lo = null;
-                    try
-                    {
-                        rng = ws.Range[addr];
-                        lo = rng?.ListObject ?? XqlSheet.FindListObjectContaining(ws, rng!);
-                        if (lo?.HeaderRowRange == null) return oldKey;
-
-                        int hRow = lo.HeaderRowRange.Row;
-                        int hCol = lo.HeaderRowRange.Column;
-
-                        int rowOffset = rng!.Row - (hRow + 1);
-                        int colOffset = rng!.Column - hCol;
-
-                        var tableName = XqlTableNameMap.Map(lo.Name, ws.Name);
-                        return XqlSheet.CellKey(ws.Name, tableName, hRow, hCol, rowOffset, colOffset);
-                    }
-                    catch { return oldKey; }
-                    finally { XqlCommon.ReleaseCom(lo); XqlCommon.ReleaseCom(rng); }
-                }
-
-                // 2) column:Table.Column
-                var mCol = RxOldColumn.Match(oldKey);
-                if (mCol.Success)
-                {
-                    var table = mCol.Groups["table"].Value;
-                    var col = mCol.Groups["column"].Value;
-
-                    try
-                    {
-                        var app2 = (Excel.Application)ExcelDnaUtil.Application;
-                        var ws = (Excel.Worksheet)app2.ActiveSheet;
-                        if (ws == null) return oldKey;
-
-                        var lo = XqlSheet.FindListObjectByTable(ws, table);
-                        if (lo?.HeaderRowRange == null) return oldKey;
-
-                        var (header, headers) = XqlSheet.GetHeaderAndNames(ws);
-                        int colIndex = headers.FindIndex(h => string.Equals(h, col, StringComparison.Ordinal));
-                        if (colIndex < 0) return oldKey;
-
-                        int hRow = lo.HeaderRowRange.Row;
-                        int hCol = lo.HeaderRowRange.Column;
-                        int headerCol = lo.HeaderRowRange.Column + colIndex;
-                        int colOffset = headerCol - hCol;
-
-                        return XqlSheet.ColumnKey(ws.Name, table, hRow, hCol, colOffset, col);
-                    }
-                    catch { return oldKey; }
-                }
-
-                // 3) 이미 신 포맷/미인식 포맷
-                return oldKey;
+                XqlCommon.ReleaseCom(lo);
+                XqlCommon.ReleaseCom(ws);
+                XqlCommon.ReleaseCom(rng);
             }
         }
 

@@ -22,25 +22,21 @@ namespace XQLite.AddIn
         private readonly Excel.Application _app;
         private readonly XqlSync _sync;
         private readonly XqlCollab _collab;
-        private readonly XqlMetaRegistry _meta;
+        private readonly XqlSheet _sheet;
         private readonly XqlBackup _backup;
 
         private bool _started;
         private readonly object _uiGate = new();
 
-        // 선택 변경 스팸 억제를 위한 디바운서
-        private readonly System.Threading.Timer _heartbeatDebounce;
         private volatile string _lastCellRef = string.Empty;
 
-        public XqlExcelInterop(Excel.Application app, XqlSync sync, XqlCollab collab, XqlMetaRegistry meta, XqlBackup backup)
+        public XqlExcelInterop(Excel.Application app, XqlSync sync, XqlCollab collab, XqlSheet sheet, XqlBackup backup)
         {
             _app = app ?? throw new ArgumentNullException(nameof(app));
             _sync = sync ?? throw new ArgumentNullException(nameof(sync));
             _collab = collab ?? throw new ArgumentNullException(nameof(collab));
-            _meta = meta ?? throw new ArgumentNullException(nameof(meta));
+            _sheet = sheet ?? throw new ArgumentNullException(nameof(sheet));
             _backup = backup ?? throw new ArgumentNullException(nameof(backup));
-
-            _heartbeatDebounce = new System.Threading.Timer(_ => SendHeartbeat(), null, Timeout.Infinite, Timeout.Infinite);
         }
 
         // ========= 수명 주기 =========
@@ -54,9 +50,6 @@ namespace XQLite.AddIn
             _app.SheetSelectionChange += App_SheetSelectionChange;
             _app.WorkbookOpen += App_WorkbookOpen;
             _app.WorkbookBeforeClose += App_WorkbookBeforeClose;
-
-            // 최초 하트비트 타이머 기동(사용자 선택이 들어오면 BYHOUR=2초 디바운스)
-            _heartbeatDebounce.Change(Timeout.Infinite, Timeout.Infinite);
         }
 
         public void Stop()
@@ -68,14 +61,11 @@ namespace XQLite.AddIn
             _app.SheetSelectionChange -= App_SheetSelectionChange;
             _app.WorkbookOpen -= App_WorkbookOpen;
             _app.WorkbookBeforeClose -= App_WorkbookBeforeClose;
-
-            _heartbeatDebounce.Change(Timeout.Infinite, Timeout.Infinite);
         }
 
         public void Dispose()
         {
             Stop();
-            _heartbeatDebounce.Dispose();
         }
 
         // ========= 명령(리본/메뉴) =========
@@ -83,7 +73,7 @@ namespace XQLite.AddIn
         public void Cmd_CommitSync()
         {
             // 서버에서 증분 Pull → Excel 반영은 XqlSync가 수행 (머지/충돌 로직 포함)
-            _sync.PullSince(_sync.MaxRowVersion);
+            _sync.PullSince();
         }
 
         public void Cmd_RecoverFromExcel()
@@ -92,6 +82,7 @@ namespace XQLite.AddIn
             _backup.RecoverFromExcel();
         }
 
+#if false
         public void Cmd_SetHeaderTooltipsForActiveSheet()
         {
             RunOnUiThread(() =>
@@ -99,19 +90,20 @@ namespace XQLite.AddIn
                 var sh = (Excel.Worksheet)_app.ActiveSheet;
                 if (sh == null) return;
 
-                if (!_meta.TryGetSheet(sh.Name, out var sheetMeta))
+                if (!_sheet.TryGetSheet(sh.Name, out var sheetMeta))
                     return;
 
-                var dict = _meta.TryGetSheet(sh.Name, out var sm)
+                var dict = _sheet.TryGetSheet(sh.Name, out var sm)
                     ? sm.Columns.ToDictionary(
                         kv => kv.Key,
                         kv => kv.Value.ToTooltip(),
                         StringComparer.Ordinal)
                     : new Dictionary<string, string>(StringComparer.Ordinal);
-                XqlSheet.SetHeaderTooltips(sh, dict);
+                XqlSheetView.SetHeaderTooltips(sh, dict);
                 XqlCommon.ReleaseCom(sh);
             });
         }
+#endif
 
         // ========= Excel 이벤트 =========
 
@@ -138,8 +130,6 @@ namespace XQLite.AddIn
                 var cellRef = $"{sh.Name}!{Target.Address[false, false]}";
                 _lastCellRef = cellRef;
 
-                // 2초 디바운스 하트비트
-                _heartbeatDebounce.Change(2000, Timeout.Infinite);
 
                 XqlCommon.ReleaseCom(Target);
                 XqlCommon.ReleaseCom(sh);
@@ -160,7 +150,7 @@ namespace XQLite.AddIn
                     try
                     {
                         var ctx = ReadCellContext(sh, cell); // table,rowKey,colName,value
-                        var vr = _meta.ValidateCell(sh.Name, ctx.colName, ctx.value);
+                        var vr = _sheet.ValidateCell(sh.Name, ctx.colName, ctx.value);
                         ApplyValidationVisual(cell, vr);
 
                         if (vr.IsOk)
@@ -184,24 +174,6 @@ namespace XQLite.AddIn
             }
             catch { /* swallow */ }
         }
-
-        // ========= 하트비트 & 락 =========
-
-        private void SendHeartbeat()
-        {
-            try
-            {
-                
-                var cellRef = _lastCellRef;
-                // _collab.Heartbeat(nickname, cellRef);
-
-                // 선택 셀에 대한 락(낙관적으로 시도)
-                //if (!string.IsNullOrEmpty(cellRef))
-                //    _collab.TryAcquireCellLock(cellRef, nickname);
-            }
-            catch { /* swallow */ }
-        }
-
 
         private static void ApplyValidationVisual(Excel.Range cell, ValidationResult vr)
         {

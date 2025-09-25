@@ -17,7 +17,7 @@ namespace XQLite.AddIn
         private readonly int _pullIntervalMs;
 
         private readonly IXqlBackend _backend;
-        private readonly XqlMetaRegistry _meta;
+        private readonly XqlSheet _sheet;
         private readonly ConcurrentQueue<EditCell> _outbox = new();
         private readonly object _flushGate = new();
         private readonly object _pullGate = new();
@@ -37,14 +37,14 @@ namespace XQLite.AddIn
         // ⬇️ 엑셀 반영기
         private readonly ExcelPatchApplier _applier;
 
-        public XqlSync(IXqlBackend backend, XqlMetaRegistry meta, int pushIntervalMs = 2000, int pullIntervalMs = 10000)
+        public XqlSync(IXqlBackend backend, XqlSheet sheet, int pushIntervalMs = 2000, int pullIntervalMs = 10000)
         {
-            _meta = meta ?? throw new ArgumentNullException(nameof(meta));
+            _sheet = sheet ?? throw new ArgumentNullException(nameof(sheet));
             _pushIntervalMs = Math.Max(250, pushIntervalMs);
             _pullIntervalMs = Math.Max(1000, pullIntervalMs);
 
             _backend = backend ?? throw new ArgumentNullException(nameof(backend));
-            _applier = new ExcelPatchApplier(_meta);
+            _applier = new ExcelPatchApplier(_sheet);
 
             _pushTimer = new Timer(_ => SafeFlushUpserts(), null, Timeout.Infinite, Timeout.Infinite);
             _pullTimer = new Timer(_ => _ = SafePull(), null, Timeout.Infinite, Timeout.Infinite);
@@ -92,7 +92,7 @@ namespace XQLite.AddIn
 
         public void FlushUpsertsNow() => SafeFlushUpserts();
 
-        public Task<PullResult?> PullSince(long sinceVersion) => SafePull(sinceVersion);
+        public Task<PullResult?> PullSince() => SafePull(MaxRowVersion);
 
         private void SafeFlushUpserts()
         {
@@ -214,8 +214,8 @@ namespace XQLite.AddIn
 
         private sealed class ExcelPatchApplier
         {
-            private readonly XqlMetaRegistry _meta;
-            public ExcelPatchApplier(XqlMetaRegistry meta) => _meta = meta;
+            private readonly XqlSheet _sheet;
+            public ExcelPatchApplier(XqlSheet sheet) => _sheet = sheet;
 
             public void ApplyOnUiThread(List<RowPatch> patches)
             {
@@ -282,7 +282,7 @@ namespace XQLite.AddIn
                         {
                             string name = w.Name;
                             // 메타가 등록된 시트만 대상
-                            if (_meta.TryGetSheet(name, out var m))
+                            if (_sheet.TryGetSheet(name, out var m))
                             {
                                 if (string.Equals(m.TableName ?? name, table, StringComparison.Ordinal))
                                 {
