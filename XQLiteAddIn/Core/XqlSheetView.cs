@@ -32,7 +32,7 @@ namespace XQLite.AddIn
                 if (sheet == null) { MessageBox.Show("Sheet service not ready.", Caption); return; }
 
                 var oldHeader = TryGetMarkerRange(ws);
-                var newHeader = ResolveHeader(ws, sel, sheet) ?? sheet.GetHeaderRange(ws);
+                var newHeader = ResolveHeader(ws, sel, sheet) ?? XqlSheet.GetHeaderRange(ws);
 
                 if (!SameAddress(oldHeader, newHeader))
                     ClearHeaderUi(ws, oldHeader); // 이전 UI 정리
@@ -73,7 +73,7 @@ namespace XQLite.AddIn
                     return;
                 }
 
-                var header = TryGetMarkerRange(ws) ?? ResolveHeader(ws, GetSelection(ws), sheet) ?? sheet.GetHeaderRange(ws);
+                var header = TryGetMarkerRange(ws) ?? ResolveHeader(ws, GetSelection(ws), sheet) ?? XqlSheet.GetHeaderRange(ws);
                 var dict = sheet.BuildTooltipsForSheet(ws.Name);
 
                 SetHeaderTooltips(header, dict);
@@ -124,7 +124,7 @@ namespace XQLite.AddIn
                     return;
                 }
 
-                var header = TryGetMarkerRange(ws) ?? ResolveHeader(ws, sel, sheet) ?? sheet.GetHeaderRange(ws);
+                var header = TryGetMarkerRange(ws) ?? ResolveHeader(ws, sel, sheet) ?? XqlSheet.GetHeaderRange(ws);
                 Excel.Range? hit = null, cell = null;
                 try
                 {
@@ -135,7 +135,7 @@ namespace XQLite.AddIn
                     if (string.IsNullOrEmpty(colName))
                         colName = XqlCommon.ColumnIndexToLetter(cell.Column);
 
-                    if (!string.IsNullOrEmpty(colName) && sm.Columns.TryGetValue(colName, out var ct))
+                    if (!string.IsNullOrEmpty(colName) && sm.Columns.TryGetValue(colName!, out var ct))
                     {
                         MessageBox.Show($"{ws.Name}.{colName}\r\n{ct.ToTooltip()}", Caption);
                         return;
@@ -261,7 +261,7 @@ namespace XQLite.AddIn
                     if (string.IsNullOrEmpty(key))
                         key = XqlCommon.ColumnIndexToLetter(cell.Column);
 
-                    if (!colToTip.TryGetValue(key, out var tip)) continue;
+                    if (!colToTip.TryGetValue(key!, out var tip)) continue;
 
                     var c = cell.Comment;
                     try { c?.Delete(); }
@@ -352,9 +352,11 @@ namespace XQLite.AddIn
                     try
                     {
                         h = (Excel.Range)header.Cells[1, i];
-                        string name = (h.Value2 as string)?.Trim();
-                        if (string.IsNullOrEmpty(name)) name = XqlCommon.ColumnIndexToLetter(h.Column);
-                        if (!sm.Columns.TryGetValue(name, out var ct)) continue;
+                        string? name = (h.Value2 as string)?.Trim();
+                        if (string.IsNullOrEmpty(name)) 
+                            name = XqlCommon.ColumnIndexToLetter(h.Column);
+
+                        if (!sm.Columns.TryGetValue(name!, out var ct)) continue;
 
                         var lcol = lo.ListColumns[i];
                         body = lcol?.DataBodyRange;
@@ -382,9 +384,12 @@ namespace XQLite.AddIn
                     try
                     {
                         h = (Excel.Range)header.Cells[1, i];
-                        string name = (h.Value2 as string)?.Trim();
-                        if (string.IsNullOrEmpty(name)) name = XqlCommon.ColumnIndexToLetter(h.Column);
-                        if (!sm.Columns.TryGetValue(name, out var ct)) continue;
+                        string? name = (h.Value2 as string)?.Trim();
+                        if (string.IsNullOrEmpty(name)) 
+                            name = XqlCommon.ColumnIndexToLetter(h.Column);
+
+                        if (!sm.Columns.TryGetValue(name!, out var ct)) 
+                            continue;
 
                         int col = h.Column;
                         colRange = ws.Range[ws.Cells[startRow, col], ws.Cells[lastRow, col]];
@@ -407,7 +412,7 @@ namespace XQLite.AddIn
                 switch (kind)
                 {
                     case ColumnKind.Int:
-                        rng.Validation.Add(
+                        rng.Validation!.Add(
                             Excel.XlDVType.xlValidateWholeNumber,
                             Excel.XlDVAlertStyle.xlValidAlertStop,
                             Excel.XlFormatConditionOperator.xlBetween,
@@ -418,7 +423,7 @@ namespace XQLite.AddIn
                         break;
 
                     case ColumnKind.Real:
-                        rng.Validation.Add(
+                        rng.Validation!.Add(
                             Excel.XlDVType.xlValidateDecimal,
                             Excel.XlDVAlertStyle.xlValidAlertStop,
                             Excel.XlFormatConditionOperator.xlBetween,
@@ -429,7 +434,7 @@ namespace XQLite.AddIn
                         break;
 
                     case ColumnKind.Date:
-                        rng.Validation.Add(
+                        rng.Validation!.Add(
                             Excel.XlDVType.xlValidateDate,
                             Excel.XlDVAlertStyle.xlValidAlertStop,
                             Excel.XlFormatConditionOperator.xlBetween,
@@ -440,7 +445,7 @@ namespace XQLite.AddIn
                         break;
 
                     case ColumnKind.Bool:
-                        rng.Validation.Add(
+                        rng.Validation!.Add(
                             Excel.XlDVType.xlValidateList,
                             Excel.XlDVAlertStyle.xlValidAlertStop,
                             Excel.XlFormatConditionOperator.xlBetween,

@@ -1,6 +1,9 @@
 ﻿using ExcelDna.Integration.CustomUI;
 using System;
 using System.Windows.Forms;
+using Excel = Microsoft.Office.Interop.Excel;
+using ExcelDna.Integration; // ExcelDnaUtil.Application 사용
+
 
 namespace XQLite.AddIn
 {
@@ -164,35 +167,76 @@ namespace XQLite.AddIn
         }
 
         // ===== Meta =====
-#if false
-        public void OnInsertMeta(IRibbonControl _) => XqlSheet.InsertMetaHeaderFromSelection();
-        public void OnMetaInfo(IRibbonControl _) => XqlSheet.ShowMetaHeaderInfo();
-        public void OnMetaRemove(IRibbonControl _) => XqlSheet.RemoveMetaHeader();
-        public void OnRefreshMeta(IRibbonControl _) => XqlSheet.RefreshMetaHeader();
-#endif
+
+        public void OnInsertMeta(IRibbonControl _) => XqlSheetView.InsertMetaHeaderFromSelection();
+        public void OnMetaInfo(IRibbonControl _) => XqlSheetView.ShowMetaHeaderInfo();
+        public void OnMetaRemove(IRibbonControl _) => XqlSheetView.RemoveMetaHeader();
+        public void OnRefreshMeta(IRibbonControl _) => XqlSheetView.RefreshMetaHeader();
+
         // 드롭다운 항목 공통 핸들러
         public void OnSetType(IRibbonControl c)
         {
-#if false
-            var type = (c.Tag ?? "").Trim().ToUpperInvariant();
-
-            var app = (Excel.Application)ExcelDnaUtil.Application;
-            if (app.ActiveSheet is not Excel.Worksheet ws || app.Selection is not Excel.Range sel) return;
-
-            // 헤더 한 칸만 기준: 사용자가 범위 선택해도 첫 셀만 취급
-            var cell = (Excel.Range)sel.Cells[1, 1];
-
-            // 현재 셀이 메타헤더 “행”에 있는지 간단 검증(선택 사항: 스킵 가능)
-            var meta = XqlSheetMetaRegistry.Get(ws);
-            if (meta == null || cell.Row != meta.TopRow)
+            try
             {
-                MessageBox.Show("메타 헤더의 셀을 선택한 후 타입을 지정하세요.");
-                return;
-            }
+                var tag = (c?.Tag as string ?? "").Trim().ToUpperInvariant();
+                if (string.IsNullOrEmpty(tag)) return;
 
-            XqlColumnTypeRegistry.SetColumnType(ws, cell, type);
-            XqlSheetMetaRegistry.RefreshHeaderBorders(ws);
-#endif
+                ColumnKind kind = tag switch
+                {
+                    "INT" or "INTEGER" => ColumnKind.Int,
+                    "REAL" => ColumnKind.Real,
+                    "TEXT" => ColumnKind.Text,
+                    "BOOL" or "BOOLEAN" => ColumnKind.Bool,
+                    "DATE" => ColumnKind.Date,
+                    _ => ColumnKind.Text,
+                };
+
+                var app = (Excel.Application)ExcelDnaUtil.Application;
+                if (app.ActiveSheet is not Excel.Worksheet ws) return;
+                var sheet = XqlAddIn.Sheet;
+                if (sheet == null) { MessageBox.Show("MetaRegistry not ready.", "XQLite"); return; }
+
+                Excel.Range? sel = app.Selection as Excel.Range;
+                var header = XqlSheetView.ResolveHeader(ws, sel, sheet);
+                if (header == null) { MessageBox.Show("헤더를 선택하거나 표 헤더에서 실행하세요.", "XQLite"); return; }
+
+                var hit = sel != null ? ws.Application.Intersect(header, sel) : null;
+                Excel.Range? cell = (Excel.Range)((hit != null && hit.Cells.Count >= 1) ? hit.Cells[1, 1] : header.Cells[1, 1]);
+
+                try
+                {
+                    var colName = (cell.Value2 as string)?.Trim();
+                    if (string.IsNullOrEmpty(colName))
+                        colName = XqlCommon.ColumnIndexToLetter(cell.Column); // 폴백
+
+                    if (string.IsNullOrEmpty(colName))
+                    {
+                        MessageBox.Show("컬럼명을 찾을 수 없습니다.", "XQLite");
+                        return;
+                    }
+
+                    var sm = sheet.GetOrCreateSheet(ws.Name);
+#pragma warning disable CS8604 // 가능한 null 참조 인수입니다.
+                    var ct = sm.Columns.TryGetValue(colName, out var cur) ? cur : new ColumnType();
+#pragma warning restore CS8604 // 가능한 null 참조 인수입니다.
+                    ct.Kind = kind;
+                    sm.SetColumn(colName, ct);
+
+                    // 주석/툴팁 갱신
+                    var dict = sheet.BuildTooltipsForSheet(ws.Name);
+                    XqlSheetView.SetHeaderTooltips(header, dict);
+                }
+                finally
+                {
+                    XqlCommon.ReleaseCom(cell);
+                    XqlCommon.ReleaseCom(hit);
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Set Type failed: " + ex.Message, "XQLite");
+            }
         }
+
     }
 }

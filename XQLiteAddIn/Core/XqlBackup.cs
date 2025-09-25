@@ -264,10 +264,6 @@ namespace XQLite.AddIn
                     name = kv.Key,
                     kind = kv.Value.Kind.ToString(),
                     nullable = kv.Value.Nullable,
-                    min = kv.Value.Min,
-                    max = kv.Value.Max,
-                    regex = kv.Value.Regex?.ToString(),
-                    check = kv.Value.CustomCheckDescription
                 }).ToList();
 
                 sheets.Add(new

@@ -1,6 +1,5 @@
 ﻿// XqlCollab.cs (Migration + RelativeKey 내장 통합판, refactored)
 using System;
-using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using ExcelDna.Integration;
@@ -81,10 +80,7 @@ namespace XQLite.AddIn
                 rng = app.Selection as Excel.Range;
                 if (rng == null) return false;
 
-                
-                var sheet = XqlAddIn.Sheet;
-                if (sheet == null) return false;
-
+                ws = (Excel.Worksheet)rng.Worksheet;
                 lo = rng.ListObject ?? XqlSheet.FindListObjectContaining(ws, rng);
                 if (lo?.HeaderRowRange == null) return false;
 
@@ -97,7 +93,7 @@ namespace XQLite.AddIn
 
                 // 헤더 명은 반드시 표 헤더에서 읽는다(UsedRange 1행 X)
                 headerCell = (Excel.Range)lo.HeaderRowRange.Cells[1, colIndex + 1];
-                string headerName = (headerCell.Value2 as string)?.Trim();
+                string? headerName = (headerCell.Value2 as string)?.Trim();
                 if (string.IsNullOrEmpty(headerName))
                     headerName = XqlCommon.ColumnIndexToLetter(headerCell.Column);
 

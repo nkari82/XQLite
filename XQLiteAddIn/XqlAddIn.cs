@@ -9,7 +9,7 @@ namespace XQLite.AddIn
     internal sealed class XqlAddIn : IExcelAddIn
     {
         internal static IXqlBackend? Backend => _backend;
-        internal static XqlMetaRegistry? MetaRegistry => _meta;
+        internal static XqlSheet? Sheet => _sheet;
         internal static XqlSync? Sync => _sync;
         internal static XqlCollab? Collab => _collab;
         internal static XqlBackup? Backup => _backup;
@@ -21,7 +21,7 @@ namespace XQLite.AddIn
 
         // ====== Singletons (런타임 구성요소) ======
         private static IXqlBackend? _backend;
-        private static XqlMetaRegistry? _meta;
+        private static XqlSheet? _sheet;
         private static XqlSync? _sync;
         private static XqlCollab? _collab;
         private static XqlBackup? _backup;
@@ -60,11 +60,11 @@ namespace XQLite.AddIn
             {
                 // 1) 백엔드 & 메타
                 _backend = new XqlGqlBackend(XqlConfig.Endpoint, XqlConfig.ApiKey); // GraphQL 클라이언트(HTTP/WS) 공용 인스턴스
-                _meta = new XqlMetaRegistry();
+                _sheet = new XqlSheet();
 
                 // 2) 동기화/협업/백업
                 //    - XqlSync: push(업서트) ms, pull(증분) ms
-                _sync = new XqlSync(_backend, _meta,
+                _sync = new XqlSync(_backend, _sheet,
                     pushIntervalMs: Math.Max(250, XqlConfig.DebounceMs),
                     pullIntervalMs: Math.Max(1000, XqlConfig.PullSec * 1000)); // Start/Stop 지원
                 _sync.Start(); // 구독 시작 포함 :contentReference[oaicite:5]{index=5}
@@ -73,11 +73,11 @@ namespace XQLite.AddIn
                 _collab = new XqlCollab(_backend, XqlConfig.Nickname, heartbeatSec: XqlConfig.HeartbeatSec); // 내부 타이머 운용 :contentReference[oaicite:6]{index=6}
 
                 //    - XqlBackup: 진단/복구/풀덤프
-                _backup = new XqlBackup(_backend, _meta, XqlConfig.Endpoint, XqlConfig.ApiKey); // 현재 시그니처 기준 :contentReference[oaicite:7]{index=7}
+                _backup = new XqlBackup(_backend, _sheet, XqlConfig.Endpoint, XqlConfig.ApiKey); // 현재 시그니처 기준 :contentReference[oaicite:7]{index=7}
 
                 // 3) Excel 이벤트 훅
                 var app = (Excel.Application)ExcelDnaUtil.Application;
-                _interop = new XqlExcelInterop(app, _sync, _collab, _meta, _backup);
+                _interop = new XqlExcelInterop(app, _sync, _collab, _sheet, _backup);
                 _interop.Start(); // Excel SheetChange/SelectionChange/Workbook 이벤트 연결 :contentReference[oaicite:8]{index=8}
             }
             catch (Exception ex)
@@ -112,7 +112,7 @@ namespace XQLite.AddIn
                 _backend = null;
 
                 // 메타는 관리 객체이므로 GC에 맡김
-                _meta = null;
+                _sheet = null;
             }
             catch (Exception ex)
             {

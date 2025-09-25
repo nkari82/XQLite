@@ -66,10 +66,12 @@ namespace XQLite.AddIn
         /// </summary>
         internal static (Excel.Range header, List<string> names) GetHeaderAndNames(Excel.Worksheet ws)
         {
-            Excel.Range header = ws.Range[ws.Cells[1, 1], ws.Cells[1, ws.UsedRange.Columns.Count]];
-            var names = new List<string>();
-            int cols = header.Columns.Count;
-            for (int c = 1; c <= cols; c++)
+            int usedCols = 1;
+            try { usedCols = Math.Max(1, ws.UsedRange?.Columns?.Count ?? 1); } catch { usedCols = 1; }
+
+            Excel.Range header = ws.Range[ws.Cells[1, 1], ws.Cells[1, usedCols]];
+            var names = new List<string>(capacity: usedCols);
+            for (int c = 1; c <= usedCols; c++)
             {
                 var cell = (Excel.Range)header.Cells[1, c];
                 names.Add(Convert.ToString(cell.Value2) ?? string.Empty);
@@ -79,7 +81,7 @@ namespace XQLite.AddIn
         }
 
         // ───────────────────────── Header (fallback to UsedRange row1)
-        public Excel.Range GetHeaderRange(Excel.Worksheet sh)
+        internal static Excel.Range GetHeaderRange(Excel.Worksheet sh)
         {
             Excel.Range? lastCell = null;
             try
@@ -108,68 +110,75 @@ namespace XQLite.AddIn
         internal static Excel.Worksheet? FindWorksheet(Excel.Application app, string sheetName)
         {
             if (app is null || string.IsNullOrWhiteSpace(sheetName)) return null;
+
+            Excel.Worksheet? match = null;
             foreach (Excel.Worksheet? ws in app.Worksheets)
             {
-                try
+                if (ws is null) continue;
+                if (string.Equals(ws.Name, sheetName, StringComparison.Ordinal))
                 {
-                    if (ws is null) continue;
-                    if (string.Equals(ws.Name, sheetName, StringComparison.Ordinal))
-                        return ws;
+                    match = ws;       // ★ 선택한 객체는 해제하지 않음 (호출자가 책임)
+                    break;
                 }
-                finally { XqlCommon.ReleaseCom(ws); }
+                XqlCommon.ReleaseCom(ws); // 매칭 실패한 것만 해제
             }
-            return null;
+            return match;
         }
 
         internal static Excel.ListObject? FindListObject(Excel.Worksheet ws, string listObjectName)
         {
             if (ws is null || string.IsNullOrWhiteSpace(listObjectName)) return null;
+
+            Excel.ListObject? match = null;
             foreach (Excel.ListObject? lo in ws.ListObjects)
             {
-                try
+                if (lo is null) continue;
+                if (string.Equals(lo.Name, listObjectName, StringComparison.Ordinal))
                 {
-                    if (lo is null) continue;
-                    if (string.Equals(lo.Name, listObjectName, StringComparison.Ordinal))
-                        return lo;
+                    match = lo;       // ★ 선택한 객체는 해제하지 않음
+                    break;
                 }
-                finally { XqlCommon.ReleaseCom(lo); }
+                XqlCommon.ReleaseCom(lo);
             }
-            return null;
+            return match;
         }
 
         internal static Excel.ListObject? FindListObjectContaining(Excel.Worksheet ws, Excel.Range rng)
         {
             if (ws is null || rng is null) return null;
+
+            Excel.ListObject? match = null;
             foreach (Excel.ListObject? lo in ws.ListObjects)
             {
+                if (lo is null) continue;
                 Excel.Range? header = null;
                 Excel.Range? body = null;
                 try
                 {
-                    if (lo is null) continue;
                     header = lo.HeaderRowRange;
                     body = lo.DataBodyRange;
-
                     if ((header != null && XqlCommon.IntersectSafe(ws, rng, header) != null) ||
                         (body != null && XqlCommon.IntersectSafe(ws, rng, body) != null))
-                        return lo;
+                    {
+                        match = lo;   // ★ 선택한 객체는 해제하지 않음
+                        break;
+                    }
                 }
-                catch { /* ignore */ }
                 finally
                 {
                     XqlCommon.ReleaseCom(header);
                     XqlCommon.ReleaseCom(body);
-                    XqlCommon.ReleaseCom(lo);
+                    if (!object.ReferenceEquals(match, lo)) // 선택되지 않은 경우만 해제
+                        XqlCommon.ReleaseCom(lo);
                 }
             }
-            return null;
+            return match;
         }
 
         internal static Excel.ListObject? FindListObjectByTable(Excel.Worksheet ws, string tableNameOrQualified)
         {
             if (ws is null || string.IsNullOrWhiteSpace(tableNameOrQualified)) return null;
 
-            // "Sheet.Table" 지원
             string? sheetHint = null;
             string loName = tableNameOrQualified;
             var dot = tableNameOrQualified.IndexOf('.');
@@ -179,22 +188,15 @@ namespace XQLite.AddIn
                 loName = tableNameOrQualified.Substring(dot + 1);
             }
 
-            // 1) 현재 시트 이름
-            var found = FindListObject(ws, loName);
+            var found = FindListObject(ws, loName) ?? FindListObjectByHeaderCaption(ws, loName);
             if (found != null) return found;
 
-            // 2) 헤더 캡션 추정
-            found = FindListObjectByHeaderCaption(ws, loName);
-            if (found != null) return found;
-
-            // 3) sheetHint로 넘어가서 재시도
-            if (!string.IsNullOrEmpty(sheetHint))
+            if (!string.IsNullOrEmpty(sheetHint) && ws.Application is Excel.Application app)
             {
                 Excel.Worksheet? ws2 = null;
                 try
                 {
-                    var app = ws.Application as Excel.Application;
-                    ws2 = FindWorksheet(app!, sheetHint);
+                    ws2 = FindWorksheet(app, sheetHint!);
                     if (ws2 != null)
                     {
                         var f2 = FindListObject(ws2, loName) ?? FindListObjectByHeaderCaption(ws2, loName);
@@ -204,17 +206,20 @@ namespace XQLite.AddIn
                 finally { XqlCommon.ReleaseCom(ws2); }
             }
 
-            // 4) 정규화 "Sheet.Table" 최종 시도
             foreach (Excel.ListObject? lo in ws.ListObjects)
             {
+                if (lo is null) continue;
                 try
                 {
-                    if (lo is null) continue;
                     var qualified = $"{ws.Name}.{lo.Name}";
                     if (string.Equals(qualified, tableNameOrQualified, StringComparison.Ordinal))
-                        return lo;
+                        return lo; // ★ 선택된 객체 해제 금지(호출자 책임)
                 }
-                finally { XqlCommon.ReleaseCom(lo); }
+                finally
+                {
+                    // 매치됐으면 반환되므로 여기 오지 않음. 매치 실패건만 해제.
+                    XqlCommon.ReleaseCom(lo);
+                }
             }
 
             return null;
@@ -222,12 +227,14 @@ namespace XQLite.AddIn
 
         private static Excel.ListObject? FindListObjectByHeaderCaption(Excel.Worksheet ws, string caption)
         {
+            Excel.ListObject? match = null;
+
             foreach (Excel.ListObject? lo in ws.ListObjects)
             {
+                if (lo is null) continue;
                 Excel.Range? header = null;
                 try
                 {
-                    if (lo is null) continue;
                     header = lo.HeaderRowRange;
                     if (header == null) continue;
 
@@ -236,21 +243,30 @@ namespace XQLite.AddIn
 
                     string first = Convert.ToString(v[1, 1]) ?? string.Empty;
                     if (string.Equals(first, caption, StringComparison.Ordinal))
-                        return lo;
+                    {
+                        match = lo;                 // ★ 선택된 객체는 해제 금지
+                        break;
+                    }
 
                     int cols = header.Columns.Count;
                     var joined = string.Empty;
                     for (int i = 1; i <= cols; i++)
                         joined += (i == 1 ? "" : "|") + (Convert.ToString(v[1, i]) ?? string.Empty);
                     if (string.Equals(joined, caption, StringComparison.Ordinal))
-                        return lo;
+                    {
+                        match = lo;
+                        break;
+                    }
                 }
-                catch { /* ignore */ }
-                finally { XqlCommon.ReleaseCom(header); XqlCommon.ReleaseCom(lo); }
+                finally
+                {
+                    XqlCommon.ReleaseCom(header);
+                    if (!object.ReferenceEquals(match, lo))
+                        XqlCommon.ReleaseCom(lo);
+                }
             }
-            return null;
+            return match;
         }
-
 
         internal static int FindKeyColumnIndex(List<string> headers, string keyName) { if (!string.IsNullOrWhiteSpace(keyName)) { var idx = headers.FindIndex(h => string.Equals(h, keyName, StringComparison.Ordinal)); if (idx >= 0) return idx + 1; } var id = headers.FindIndex(h => string.Equals(h, "id", StringComparison.OrdinalIgnoreCase)); if (id >= 0) return id + 1; var key = headers.FindIndex(h => string.Equals(h, "key", StringComparison.OrdinalIgnoreCase)); if (key >= 0) return key + 1; return 1; }
 
@@ -484,8 +500,11 @@ namespace XQLite.AddIn
         /// </summary>
         internal ValidationResult ValidateCell(string sheet, string col, object? value)
         {
-            if (!_sheets.TryGetValue(sheet, out var sm)) return ValidationResult.Ok();
-            if (!sm.Columns.TryGetValue(col, out var ct)) return ValidationResult.Ok();
+            if (!_sheets.TryGetValue(sheet, out var sm)) 
+                return ValidationResult.Ok();
+
+            if (!sm.Columns.TryGetValue(col, out var ct)) 
+                return ValidationResult.Ok();
 
             // NotNull
             if (!ct.Nullable && XqlCommon.IsNullish(value))
@@ -496,45 +515,36 @@ namespace XQLite.AddIn
             {
                 case ColumnKind.Int:
                     {
-                        if (XqlCommon.IsNullish(value)) return ValidationResult.Ok();
-                        if (!XqlCommon.TryToInt64(value, out var iv))
+                        if (XqlCommon.IsNullish(value)) 
+                            return ValidationResult.Ok();
+                        if (!XqlCommon.TryToInt64(value!, out var iv))
                             return ValidationResult.Fail(ErrCode.E_TYPE_MISMATCH, "Expect INT.");
-                        if (ct.Min.HasValue && iv < (long)ct.Min.Value)
-                            return ValidationResult.Fail(ErrCode.E_RANGE, $"INT < Min({ct.Min})");
-                        if (ct.Max.HasValue && iv > (long)ct.Max.Value)
-                            return ValidationResult.Fail(ErrCode.E_RANGE, $"INT > Max({ct.Max})");
                         break;
                     }
                 case ColumnKind.Real:
                     {
                         if (XqlCommon.IsNullish(value)) return ValidationResult.Ok();
-                        if (!XqlCommon.TryToDouble(value, out var dv))
+                        if (!XqlCommon.TryToDouble(value!, out var dv))
                             return ValidationResult.Fail(ErrCode.E_TYPE_MISMATCH, "Expect REAL.");
-                        if (ct.Min.HasValue && dv < ct.Min.Value)
-                            return ValidationResult.Fail(ErrCode.E_RANGE, $"REAL < Min({ct.Min})");
-                        if (ct.Max.HasValue && dv > ct.Max.Value)
-                            return ValidationResult.Fail(ErrCode.E_RANGE, $"REAL > Max({ct.Max})");
                         break;
                     }
                 case ColumnKind.Bool:
                     {
                         if (XqlCommon.IsNullish(value)) return ValidationResult.Ok();
-                        if (!XqlCommon.TryToBool(value, out _))
+                        if (!XqlCommon.TryToBool(value!, out _))
                             return ValidationResult.Fail(ErrCode.E_TYPE_MISMATCH, "Expect BOOL.");
                         break;
                     }
                 case ColumnKind.Text:
                     {
-                        if (XqlCommon.IsNullish(value)) return ValidationResult.Ok();
-                        var s = XqlCommon.NormalizeToString(value);
-                        if (ct.Regex != null && !ct.Regex.IsMatch(s))
-                            return ValidationResult.Fail(ErrCode.E_CHECK_FAIL, "TEXT regex mismatch.");
+                        if (XqlCommon.IsNullish(value)) 
+                            return ValidationResult.Ok();
                         break;
                     }
                 case ColumnKind.Json:
                     {
                         if (XqlCommon.IsNullish(value)) return ValidationResult.Ok();
-                        var s = XqlCommon.NormalizeToString(value);
+                        var s = XqlCommon.NormalizeToString(value!);
                         try { _ = JToken.Parse(s); }
                         catch (Exception ex)
                         {
@@ -545,26 +555,12 @@ namespace XQLite.AddIn
                 case ColumnKind.Date:
                     {
                         if (XqlCommon.IsNullish(value)) return ValidationResult.Ok();
-                        if (!XqlCommon.TryToDate(value, out _))
+                        if (!XqlCommon.TryToDate(value!, out _))
                             return ValidationResult.Fail(ErrCode.E_TYPE_MISMATCH, "Expect DATE.");
                         break;
                     }
                 default:
                     return ValidationResult.Fail(ErrCode.E_UNSUPPORTED, $"Unsupported type: {ct.Kind}");
-            }
-
-            // 사용자 정의 체크
-            if (ct.CustomCheck != null)
-            {
-                try
-                {
-                    if (!ct.CustomCheck(value))
-                        return ValidationResult.Fail(ErrCode.E_CHECK_FAIL, ct.CustomCheckDescription ?? "Custom check failed.");
-                }
-                catch (Exception ex)
-                {
-                    return ValidationResult.Fail(ErrCode.E_CHECK_FAIL, $"Custom check error: {ex.Message}");
-                }
             }
 
             return ValidationResult.Ok();
@@ -597,17 +593,6 @@ namespace XQLite.AddIn
     {
         public ColumnKind Kind { get; set; } = ColumnKind.Text;
         public bool Nullable { get; set; } = true;
-
-        /// <summary>수치형에만 사용(Int=long, Real=double)</summary>
-        public double? Min;
-        public double? Max;
-
-        /// <summary>Text 전용</summary>
-        public Regex? Regex;
-
-        /// <summary>사용자 정의 체크(선택)</summary>
-        public Func<object?, bool>? CustomCheck = null;
-        public string? CustomCheckDescription = null;
 
         public string ToTooltip()
         {
