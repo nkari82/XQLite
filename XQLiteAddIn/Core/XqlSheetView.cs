@@ -258,19 +258,11 @@ namespace XQLite.AddIn
                 try
                 {
                     var key = (cell.Value2 as string)?.Trim();
-                    if (string.IsNullOrEmpty(key))
-                        key = XqlCommon.ColumnIndexToLetter(cell.Column);
+                    if (string.IsNullOrEmpty(key)) key = XqlCommon.ColumnIndexToLetter(cell.Column);
+                    if (!colToTip.TryGetValue(key, out var tip)) continue;
 
-                    if (!colToTip.TryGetValue(key!, out var tip)) continue;
-
-                    var c = cell.Comment;
-                    try { c?.Delete(); }
-                    catch { }
-                    finally { XqlCommon.ReleaseCom(c); }
-
-                    try { c = cell.AddComment(tip); }
-                    catch { }
-                    finally { XqlCommon.ReleaseCom(c); }
+                    try { cell.Comment?.Delete(); } catch { }
+                    try { cell.AddComment(tip); cell.Comment?.Visible = false; } catch { }
                 }
                 finally { XqlCommon.ReleaseCom(cell); }
             }

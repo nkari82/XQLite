@@ -123,32 +123,19 @@ namespace XQLite.AddIn
             try
             {
                 var app = (Excel.Application)ExcelDnaUtil.Application;
-                rng = app.Selection as Excel.Range;
-                if (rng == null) return false;
-
+                rng = app.Selection as Excel.Range; if (rng == null) return false;
                 ws = (Excel.Worksheet)rng.Worksheet;
                 lo = rng.ListObject ?? XqlSheet.FindListObjectContaining(ws, rng);
                 if (lo?.HeaderRowRange == null) return false;
 
-                int hRow = lo.HeaderRowRange.Row;
-                int hCol = lo.HeaderRowRange.Column;
-
-                // 선택 범위가 넓어도 좌상단 셀 기준
-                int rowOffset = rng.Row - (hRow + 1); // 데이터 첫행 = header+1
-                int colOffset = rng.Column - hCol;
-
-                string tableName = XqlTableNameMap.Map(lo.Name, ws.Name);
-                var key = XqlSheet.CellKey(ws.Name, tableName, hRow, hCol, rowOffset, colOffset);
+                int hRow = lo.HeaderRowRange.Row, hCol = lo.HeaderRowRange.Column;
+                int dr = rng.Row - (hRow + 1), dc = rng.Column - hCol;
+                var key = XqlSheet.CellKey(ws.Name, XqlTableNameMap.Map(lo.Name, ws.Name), hRow, hCol, dr, dc);
                 await _backend.AcquireLock(key, _nickname).ConfigureAwait(false);
                 return true;
             }
             catch { return false; }
-            finally
-            {
-                XqlCommon.ReleaseCom(lo);
-                XqlCommon.ReleaseCom(ws);
-                XqlCommon.ReleaseCom(rng);
-            }
+            finally { XqlCommon.ReleaseCom(lo); XqlCommon.ReleaseCom(ws); XqlCommon.ReleaseCom(rng); }
         }
 
         // (선택) 특정 구키를 새키로 서버에서 교체 시도: 새키 획득 후 내 락 해제

@@ -6,13 +6,14 @@ XqlDiagExport.cs
 XqlJson.cs
 XqlTableNameMap.cs
 
-New/XqlBackup.cs
-New/XqlCollab.cs
-New/XqlCommon.cs
-New/XqlExcelInterop.cs
-New/XqlGqlBackend.cs
-New/XqlSheet.cs
-New/XqlSync.cs
+Core/XqlBackup.cs
+Core/XqlCollab.cs
+Core/XqlCommon.cs
+Core/XqlExcelInterop.cs
+Core/XqlGqlBackend.cs
+Core/XqlSheet.cs
+Core/XqlSheetView.cs
+Core/XqlSync.cs
 
 UI/XqlConfigForm.cs
 UI/XqlInspectorForm.cs

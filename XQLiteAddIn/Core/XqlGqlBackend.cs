@@ -111,6 +111,7 @@ namespace XQLite.AddIn
         private readonly GraphQLHttpClient _http;
         private readonly GraphQLHttpClient _ws;
         private IDisposable? _subscription;
+        private int _subRetry = 0;
 
         // ── 생성자 ───────────────────────────────────────────────────────────
         internal XqlGqlBackend(string httpEndpoint, string? apiKey)
@@ -173,14 +174,21 @@ namespace XQLite.AddIn
         public void StartSubscription(Action<ServerEvent> onEvent, long since)
         {
             StopSubscription();
-
             var req = new GraphQLRequest { Query = SUB_ROWS, Variables = new { since } };
-            var observable = _ws.CreateSubscriptionStream<JObject>(req);
+            var stream = _ws.CreateSubscriptionStream<JObject>(req);
 
-            _subscription = observable.Subscribe(
-                onNext: p => { try { onEvent(ParseSub(p.Data)); } catch { } },
-                onError: _ => { try { StopSubscription(); new Timer(_ => StartSubscription(onEvent, since), null, 2000, Timeout.Infinite); } catch { } },
-                onCompleted: () => { new Timer(_ => StartSubscription(onEvent, since), null, 2000, Timeout.Infinite); });
+            _subscription = stream.Subscribe(
+                p => { _subRetry = 0; try { onEvent(ParseSub(p.Data)); } catch { } },
+                _ => Resubscribe(onEvent, since),
+                () => Resubscribe(onEvent, since)
+            );
+        }
+
+        private void Resubscribe(Action<ServerEvent> onEvent, long since)
+        {
+            StopSubscription();
+            var delay = TimeSpan.FromMilliseconds(Math.Min(30_000, 500 * Math.Pow(2, _subRetry++)));
+            new Timer(_ => StartSubscription(onEvent, since), null, delay, Timeout.InfiniteTimeSpan);
         }
 
         public void StopSubscription()

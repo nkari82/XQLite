@@ -177,14 +177,16 @@ namespace XQLite.AddIn
 
         private static void ApplyValidationVisual(Excel.Range cell, ValidationResult vr)
         {
-            if (vr.IsOk)
+            try { cell.Comment?.Delete(); } catch { }
+            if (!vr.IsOk)
             {
-                SafeClearComment(cell);
-                return;
+                try
+                {
+                    var msg = vr.Message.Length <= 512 ? vr.Message : (vr.Message.Substring(0, 509) + "...");
+                    cell.AddComment(msg); cell.Comment?.Visible = false;
+                }
+                catch { }
             }
-
-            SafeClearComment(cell);
-            SafeSetComment(cell, TruncateForComment(vr.Message));
         }
 
         private static string TruncateForComment(string s)

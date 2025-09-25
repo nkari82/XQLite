@@ -104,22 +104,19 @@ namespace XQLite.AddIn
             try
             {
                 var app = (Excel.Application)ExcelDnaUtil.Application;
-
                 foreach (var sheetName in GetWorkbookSheets(app))
                 {
                     if (!_sheet.TryGetSheet(sheetName, out var sm)) continue;
-
-                    await EnsureTableSchema(sm);
+                    await EnsureTableSchema(sm).ConfigureAwait(false);
 
                     var rows = ReadSheetRows(app, sheetName, sm);
                     if (rows.Count == 0) continue;
 
-                    var cells = RowsToCellEdits(sm.TableName ?? sheetName, rows);
-                    foreach (var chunk in XqlCommon.Chunk(cells, batchSize))
-                        await _backend.UpsertCells(chunk);
+                    foreach (var chunk in XqlCommon.Chunk(RowsToCellEdits(sm.TableName ?? sheetName, rows), batchSize))
+                        await _backend.UpsertCells(chunk).ConfigureAwait(false);
                 }
             }
-            catch { }
+            catch { /* 무음 실패 (UI는 Inspector/Diag로 확인) */ }
         }
 
         // ============================================================

@@ -97,42 +97,28 @@ namespace XQLite.AddIn
         private void SafeFlushUpserts()
         {
             if (!_started || _disposed) return;
-
             lock (_flushGate)
             {
-                try
-                {
-                    // 비동기 코어 실행 (락 밖에서 await되도록 async void 유지)
-                    FlushUpsertsCore();
-                }
-                catch (Exception ex)
-                {
-                    _conflicts.Enqueue(Conflict.System("flush", ex.Message));
-                }
+                // 콜백 재진입 방지: 큐가 비면 즉시 종료
+                if (_outbox.IsEmpty) return;
+                _ = Task.Run(FlushUpsertsCore)  // async void 제거
+                     .ContinueWith(t => {
+                         if (t.Exception != null)
+                             _conflicts.Enqueue(Conflict.System("upsert.core", t.Exception.InnerException?.Message ?? "unknown"));
+                     }, TaskScheduler.Default);
             }
         }
 
         private async Task<PullResult?> SafePull(long? sinceOverride = null)
         {
-            if (!_started || _disposed)
-                return null;
-
-            Task<PullResult>? result;
-
+            if (!_started || _disposed) return null;
+            Task<PullResult>? job;
             lock (_pullGate)
             {
-                try
-                {
-                    result = PullCore(sinceOverride ?? MaxRowVersion);
-                }
-                catch (Exception ex)
-                {
-                    _conflicts.Enqueue(Conflict.System("pull", ex.Message));
-                    return null;
-                }
+                job = PullCore(sinceOverride ?? MaxRowVersion); // 락 안에서 Task만 획득
             }
-
-            return await result.ConfigureAwait(false);
+            try { return await job.ConfigureAwait(false); }
+            catch (Exception ex) { _conflicts.Enqueue(Conflict.System("pull", ex.Message)); return null; }
         }
 
         private async void FlushUpsertsCore()
