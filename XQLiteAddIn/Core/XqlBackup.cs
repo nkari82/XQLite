@@ -28,10 +28,7 @@ namespace XQLite.AddIn
             _backend = backend;
         }
 
-        public void Dispose()
-        {
-            try { _backend.Dispose(); } catch { }
-        }
+        public void Dispose() { /* backend is owned by AddIn */ }
 
         // ============================================================
         // 1) Diagnostics Export
@@ -99,7 +96,7 @@ namespace XQLite.AddIn
         //   - 원칙: Excel 파일 = 동기화된 DB 원본
         //   - 절차: 스키마 생성/보강 → 배치 업서트 → 무결성 검사(서버 쪽) → 완료
         // ============================================================
-        public async void RecoverFromExcel(int batchSize = 500)
+        public async Task RecoverFromExcel(int batchSize = 500)
         {
             try
             {

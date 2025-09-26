@@ -67,18 +67,18 @@ namespace XQLite.AddIn
                 _sync = new XqlSync(_backend, _sheet,
                     pushIntervalMs: Math.Max(250, XqlConfig.DebounceMs),
                     pullIntervalMs: Math.Max(1000, XqlConfig.PullSec * 1000)); // Start/Stop 지원
-                _sync.Start(); // 구독 시작 포함 :contentReference[oaicite:5]{index=5}
+                _sync.Start(); // 구독 시작 포함
 
                 //    - XqlCollab: TTL/Heartbeat 간격 (초→ms)
-                _collab = new XqlCollab(_backend, XqlConfig.Nickname, heartbeatSec: XqlConfig.HeartbeatSec); // 내부 타이머 운용 :contentReference[oaicite:6]{index=6}
+                _collab = new XqlCollab(_backend, XqlConfig.Nickname, heartbeatSec: XqlConfig.HeartbeatSec); // 내부 타이머 운용
 
                 //    - XqlBackup: 진단/복구/풀덤프
-                _backup = new XqlBackup(_backend, _sheet, XqlConfig.Endpoint, XqlConfig.ApiKey); // 현재 시그니처 기준 :contentReference[oaicite:7]{index=7}
+                _backup = new XqlBackup(_backend, _sheet, XqlConfig.Endpoint, XqlConfig.ApiKey); // 현재 시그니처 기준
 
                 // 3) Excel 이벤트 훅
                 var app = (Excel.Application)ExcelDnaUtil.Application;
                 _interop = new XqlExcelInterop(app, _sync, _collab, _sheet, _backup);
-                _interop.Start(); // Excel SheetChange/SelectionChange/Workbook 이벤트 연결 :contentReference[oaicite:8]{index=8}
+                _interop.Start(); // Excel SheetChange/SelectionChange/Workbook 이벤트 연결
             }
             catch (Exception ex)
             {

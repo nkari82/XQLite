@@ -1,9 +1,13 @@
 ﻿// XqlSheet.cs
+using Microsoft.Office.Interop.Excel;
 using Newtonsoft.Json.Linq;
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
+using XQLite.AddIn;
+using static System.Net.Mime.MediaTypeNames;
 using Excel = Microsoft.Office.Interop.Excel;
 
 namespace XQLite.AddIn
@@ -50,16 +54,6 @@ namespace XQLite.AddIn
             return added;
         }
 
-        /// <summary>툴팁 딕셔너리 생성.</summary>
-        public Dictionary<string, string> BuildTooltipsForSheet(string sheetName)
-        {
-            if (!_sheets.TryGetValue(sheetName, out var sm)) return new();
-            var dict = new Dictionary<string, string>(StringComparer.Ordinal);
-            foreach (var kv in sm.Columns)
-                dict[kv.Key] = kv.Value.ToTooltip();
-            return dict;
-        }
-
         /// <summary>
         /// 1행 헤더 Range와 트림된 헤더 텍스트 리스트를 반환.
         /// 반환된 header는 호출자가 ReleaseCom 해야 함(여기서 해제 금지).
@@ -81,29 +75,34 @@ namespace XQLite.AddIn
         }
 
         // ───────────────────────── Header (fallback to UsedRange row1)
+        // XqlSheetView.cs에서만 사용하므로 옮길수 도 있다.
         internal static Excel.Range GetHeaderRange(Excel.Worksheet sh)
         {
-            Excel.Range? lastCell = null;
+            Excel.Range? used = null;
             try
             {
-                int col = 1;
-                for (; col <= sh.UsedRange.Columns.Count; col++)
+                used = sh.UsedRange;
+                int lastCol = Math.Max(1, used.Columns.Count);
+                int hr = 1; // 헤더는 1행 기준 (마커/ResolveHeader가 우선이며, 이는 Fallback)
+                int last = 1;
+                for (int c = lastCol; c >= 1; --c)
                 {
-                    var cell = (Excel.Range)sh.Cells[1, col];
-                    var txt = (cell?.Value2 as string)?.Trim();
-                    if (string.IsNullOrEmpty(txt)) { XqlCommon.ReleaseCom(cell); break; }
-                    XqlCommon.ReleaseCom(lastCell); lastCell = cell;
+                    Excel.Range? cell = null;
+                    try
+                    {
+                        cell = (Excel.Range)sh.Cells[hr, c];
+                        var txt = (cell.Value2 as string)?.Trim();
+                        if (!string.IsNullOrEmpty(txt)) { last = c; break; }
+                    }
+                    finally { XqlCommon.ReleaseCom(cell); }
                 }
-                var lastCol = Math.Max(1, (lastCell?.Column as int?) ?? 1);
-                var rg = sh.Range[sh.Cells[1, 1], sh.Cells[1, lastCol]];
-                XqlCommon.ReleaseCom(lastCell);
-                return rg;
+                return sh.Range[sh.Cells[hr, 1], sh.Cells[hr, last]];
             }
             catch
             {
-                XqlCommon.ReleaseCom(lastCell);
                 return (Excel.Range)sh.Cells[1, 1];
             }
+            finally { XqlCommon.ReleaseCom(used); }
         }
 
         // ───────────────────────── Finders (인스턴스)
@@ -323,7 +322,7 @@ namespace XQLite.AddIn
                 var ws = FindWorksheet(app, d.Sheet);
                 if (ws == null) return false;
 
-                lo = FindListObject(ws, d.Table);
+                lo = FindListObject(ws, d.Table) ?? FindListObjectByTable(ws, d.Table);
                 if (lo == null || lo.HeaderRowRange == null) return false;
 
                 var hdr = lo.HeaderRowRange;
@@ -500,10 +499,10 @@ namespace XQLite.AddIn
         /// </summary>
         internal ValidationResult ValidateCell(string sheet, string col, object? value)
         {
-            if (!_sheets.TryGetValue(sheet, out var sm)) 
+            if (!_sheets.TryGetValue(sheet, out var sm))
                 return ValidationResult.Ok();
 
-            if (!sm.Columns.TryGetValue(col, out var ct)) 
+            if (!sm.Columns.TryGetValue(col, out var ct))
                 return ValidationResult.Ok();
 
             // NotNull
@@ -515,7 +514,7 @@ namespace XQLite.AddIn
             {
                 case ColumnKind.Int:
                     {
-                        if (XqlCommon.IsNullish(value)) 
+                        if (XqlCommon.IsNullish(value))
                             return ValidationResult.Ok();
                         if (!XqlCommon.TryToInt64(value!, out var iv))
                             return ValidationResult.Fail(ErrCode.E_TYPE_MISMATCH, "Expect INT.");
@@ -537,7 +536,7 @@ namespace XQLite.AddIn
                     }
                 case ColumnKind.Text:
                     {
-                        if (XqlCommon.IsNullish(value)) 
+                        if (XqlCommon.IsNullish(value))
                             return ValidationResult.Ok();
                         break;
                     }
@@ -566,6 +565,87 @@ namespace XQLite.AddIn
             return ValidationResult.Ok();
         }
 
+        internal static string HeaderNameOf(string sheetName) => $"_XQL_HDR_{sheetName}";
+
+        // 1) 조회: TryGetHeaderMarker — ws.Names + wb.Names 모두 검색
+        internal static bool TryGetHeaderMarker(Excel.Worksheet ws, out Excel.Range headerRange)
+        {
+            headerRange = null!;
+            Excel.Workbook? wb = null; Excel.Name? nm = null;
+            try
+            {
+                var key = HeaderNameOf(ws.Name);
+
+                // (1) Workbook 범위에서 먼저 찾기
+                try
+                {
+                    wb = (Excel.Workbook)ws.Parent;
+                    nm = wb.Names.Item(key);
+                }
+                catch { nm = null; }
+
+                // (2) 없으면 Worksheet 범위에서 찾기
+                if (nm == null)
+                {
+                    try { nm = ws.Names.Item(key); } catch { nm = null; }
+                }
+
+                if (nm == null) return false;
+
+                var rg = nm.RefersToRange;
+                if (rg == null) return false;
+
+                headerRange = rg;
+                return true;
+            }
+            catch { return false; }
+            finally { XqlCommon.ReleaseCom(nm); XqlCommon.ReleaseCom(wb); }
+        }
+
+        // 2) 생성/이동: SetHeaderMarker — workbook 범위로 통일
+        internal static void SetHeaderMarker(Excel.Worksheet ws, Excel.Range header)
+        {
+            Excel.Workbook? wb = null; Excel.Name? nm = null;
+            try
+            {
+                var key = HeaderNameOf(ws.Name);
+
+                // 기존 것(양쪽 범위 모두) 제거
+                try { ws.Names.Item(key)?.Delete(); } catch { }
+                try { wb = (Excel.Workbook)ws.Parent; wb.Names.Item(key)?.Delete(); } catch { }
+
+                if (wb == null) wb = (Excel.Workbook)ws.Parent;
+
+                // RefersTo 수식 만들기: ='<SheetName>'!$A$1:$D$1
+                var sheetName = ws.Name.Replace("'", "''"); // ' 이중화
+                var addr = header.Address[RowAbsolute: true, ColumnAbsolute: true,
+                                          ReferenceStyle: Excel.XlReferenceStyle.xlA1,
+                                          External: false];
+                var refersTo = $"='{sheetName}'!{addr}";
+
+                nm = wb.Names.Add(Name: key, RefersTo: refersTo);
+                try { nm.Visible = false; } catch { }
+            }
+            finally { XqlCommon.ReleaseCom(nm); XqlCommon.ReleaseCom(wb); }
+        }
+
+        // 3) 삭제: ClearHeaderMarker — ws / wb 양쪽 모두 삭제
+        internal static void ClearHeaderMarker(Excel.Worksheet ws)
+        {
+            Excel.Workbook? wb = null;
+            try
+            {
+                var key = HeaderNameOf(ws.Name);
+                try { ws.Names.Item(key)?.Delete(); } catch { }
+                try { wb = (Excel.Workbook)ws.Parent; wb.Names.Item(key)?.Delete(); } catch { }
+            }
+            finally { XqlCommon.ReleaseCom(wb); }
+        }
+
+
+        internal static bool IsSameRange(Excel.Range a, Excel.Range b)
+            => a.Worksheet.Name == b.Worksheet.Name && a.Row == b.Row && a.Column == b.Column
+               && a.Rows.Count == b.Rows.Count && a.Columns.Count == b.Columns.Count;
 
         private static string Escape(string s) => s.Replace("\\", "\\\\").Replace(":", "\\:");
         private static string Unescape(string s) => s.Replace("\\:", ":").Replace("\\\\", "\\");
@@ -587,7 +667,7 @@ namespace XQLite.AddIn
         public void SetColumn(string name, ColumnType t) => Columns[name] = t;
     }
 
-    internal enum ColumnKind { Text, Int, Real, Bool, Date, Json }
+    internal enum ColumnKind { Text, Int, Real, Bool, Date, Json, Any }
 
     internal sealed class ColumnType
     {

@@ -1,14 +1,17 @@
 ﻿// XqlGqlBackend.cs (async-first, 정리 버전)
 
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Threading;
-using System.Threading.Tasks;
 using GraphQL;
 using GraphQL.Client.Http;
 using GraphQL.Client.Serializer.Newtonsoft;
+using Microsoft.Office.Interop.Excel;
 using Newtonsoft.Json.Linq;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reactive.Linq;
+using System.Runtime.Remoting.Contexts;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace XQLite.AddIn
 {
@@ -175,20 +178,20 @@ namespace XQLite.AddIn
         {
             StopSubscription();
             var req = new GraphQLRequest { Query = SUB_ROWS, Variables = new { since } };
-            var stream = _ws.CreateSubscriptionStream<JObject>(req);
+            var observable = _ws.CreateSubscriptionStream<JObject>(req);
 
-            _subscription = stream.Subscribe(
-                p => { _subRetry = 0; try { onEvent(ParseSub(p.Data)); } catch { } },
-                _ => Resubscribe(onEvent, since),
-                () => Resubscribe(onEvent, since)
-            );
+            var sub = observable.Subscribe(
+            onNext: p => { _subRetry = 0; try { onEvent(ParseSub(p.Data)); } catch { } },
+            onError: _ => Resubscribe(onEvent, since),
+            onCompleted: () => Resubscribe(onEvent, since));
+            Interlocked.Exchange(ref _subscription, sub)?.Dispose();
         }
 
         private void Resubscribe(Action<ServerEvent> onEvent, long since)
         {
             StopSubscription();
-            var delay = TimeSpan.FromMilliseconds(Math.Min(30_000, 500 * Math.Pow(2, _subRetry++)));
-            new Timer(_ => StartSubscription(onEvent, since), null, delay, Timeout.InfiniteTimeSpan);
+            var delayMs = (int)Math.Min(30_000, 500 * Math.Pow(2, Math.Min(_subRetry++, 10)));
+            _ = new Timer(_ => StartSubscription(onEvent, since), null, delayMs, Timeout.Infinite);
         }
 
         public void StopSubscription()
@@ -315,16 +318,15 @@ namespace XQLite.AddIn
             {
                 foreach (var p in pts.OfType<JObject>())
                 {
-#pragma warning disable CS8604
                     var rp = new RowPatch
                     {
                         Table = p["table"]?.ToString() ?? "",
                         RowKey = p["row_key"]?.ToObject<object>() ?? 0,
                         RowVersion = (long?)p["row_version"] ?? 0,
-                        Deleted = p["deleted"]?.Type == JTokenType.Boolean && (bool)p["deleted"],
+                        Deleted = p["deleted"]?.Type == JTokenType.Boolean && (bool)p["deleted"]!,
                         Cells = new Dictionary<string, object?>(StringComparer.Ordinal)
                     };
-#pragma warning restore CS8604
+
                     if (p["cells"] is JObject cc)
                         foreach (var prop in cc.Properties())
                             rp.Cells[prop.Name] = prop.Value.Type == JTokenType.Null ? null : prop.Value.ToObject<object?>();
@@ -351,16 +353,15 @@ namespace XQLite.AddIn
             {
                 foreach (var p in pts.OfType<JObject>())
                 {
-#pragma warning disable CS8604
                     var rp = new RowPatch
                     {
                         Table = p["table"]?.ToString() ?? "",
                         RowKey = p["row_key"]?.ToObject<object>() ?? 0,
                         RowVersion = (long?)p["row_version"] ?? 0,
-                        Deleted = p["deleted"]?.Type == JTokenType.Boolean && (bool)p["deleted"],
+                        Deleted = p["deleted"]?.Type == JTokenType.Boolean && (bool)p["deleted"]!,
                         Cells = new Dictionary<string, object?>(StringComparer.Ordinal)
                     };
-#pragma warning restore CS8604
+
                     if (p["cells"] is JObject cc)
                         foreach (var prop in cc.Properties())
                             rp.Cells[prop.Name] = prop.Value.Type == JTokenType.Null ? null : prop.Value.ToObject<object?>();
@@ -376,7 +377,6 @@ namespace XQLite.AddIn
     // DTOs
     // =======================================================================
 
-    // 공용 DTO
     internal readonly record struct EditCell(string Table, object RowKey, string Column, object? Value);
 
     internal sealed class RowPatch

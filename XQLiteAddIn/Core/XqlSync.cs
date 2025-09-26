@@ -19,8 +19,8 @@ namespace XQLite.AddIn
         private readonly IXqlBackend _backend;
         private readonly XqlSheet _sheet;
         private readonly ConcurrentQueue<EditCell> _outbox = new();
-        private readonly object _flushGate = new();
-        private readonly object _pullGate = new();
+        private readonly SemaphoreSlim _pushSem = new(1, 1);
+        private readonly SemaphoreSlim _pullSem = new(1, 1);
 
         private long _maxRowVersion;
         public long MaxRowVersion => Interlocked.Read(ref _maxRowVersion);
@@ -80,7 +80,6 @@ namespace XQLite.AddIn
             try { Stop(); } catch { }
             try { _pushTimer.Dispose(); } catch { }
             try { _pullTimer.Dispose(); } catch { }
-            try { _backend.Dispose(); } catch { }
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -97,31 +96,35 @@ namespace XQLite.AddIn
         private void SafeFlushUpserts()
         {
             if (!_started || _disposed) return;
-            lock (_flushGate)
+
+            // 재진입 방지용 비동기 락(아래 #2 참고)이 있으면 lock 제거 가능
+            try
             {
-                // 콜백 재진입 방지: 큐가 비면 즉시 종료
-                if (_outbox.IsEmpty) return;
-                _ = Task.Run(FlushUpsertsCore)  // async void 제거
-                     .ContinueWith(t => {
-                         if (t.Exception != null)
-                             _conflicts.Enqueue(Conflict.System("upsert.core", t.Exception.InnerException?.Message ?? "unknown"));
-                     }, TaskScheduler.Default);
+                if (!_pushSem.Wait(0)) return;
+                _ = Task.Run(async () =>
+                {
+                    try { await FlushUpsertsCore(); }
+                    catch (Exception ex) { _conflicts.Enqueue(Conflict.System("upsert.core", ex.Message)); }
+                    finally { _pushSem.Release(); }
+                });
+            }
+            catch (Exception ex)
+            {
+                _conflicts.Enqueue(Conflict.System("flush", ex.Message));
             }
         }
 
         private async Task<PullResult?> SafePull(long? sinceOverride = null)
         {
             if (!_started || _disposed) return null;
-            Task<PullResult>? job;
-            lock (_pullGate)
-            {
-                job = PullCore(sinceOverride ?? MaxRowVersion); // 락 안에서 Task만 획득
-            }
-            try { return await job.ConfigureAwait(false); }
+            if (!_pullSem.Wait(0)) return null;
+            var task = PullCore(sinceOverride ?? MaxRowVersion);
+            try { return await task.ConfigureAwait(false); }
             catch (Exception ex) { _conflicts.Enqueue(Conflict.System("pull", ex.Message)); return null; }
+            finally { _pullSem.Release(); }
         }
 
-        private async void FlushUpsertsCore()
+        private async Task FlushUpsertsCore()
         {
             try
             {

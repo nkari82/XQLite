@@ -134,8 +134,16 @@ namespace XQLite.AddIn
                 await _backend.AcquireLock(key, _nickname).ConfigureAwait(false);
                 return true;
             }
-            catch { return false; }
-            finally { XqlCommon.ReleaseCom(lo); XqlCommon.ReleaseCom(ws); XqlCommon.ReleaseCom(rng); }
+            catch 
+            { 
+                return false; 
+            }
+            finally 
+            { 
+                XqlCommon.ReleaseCom(lo); 
+                XqlCommon.ReleaseCom(ws); 
+                XqlCommon.ReleaseCom(rng); 
+            }
         }
 
         // (선택) 특정 구키를 새키로 서버에서 교체 시도: 새키 획득 후 내 락 해제

@@ -79,31 +79,8 @@ namespace XQLite.AddIn
         public void Cmd_RecoverFromExcel()
         {
             // 원클릭 복구: 엑셀 파일을 원본으로 DB 재생성
-            _backup.RecoverFromExcel();
+            var _ = _backup.RecoverFromExcel();
         }
-
-#if false
-        public void Cmd_SetHeaderTooltipsForActiveSheet()
-        {
-            RunOnUiThread(() =>
-            {
-                var sh = (Excel.Worksheet)_app.ActiveSheet;
-                if (sh == null) return;
-
-                if (!_sheet.TryGetSheet(sh.Name, out var sheetMeta))
-                    return;
-
-                var dict = _sheet.TryGetSheet(sh.Name, out var sm)
-                    ? sm.Columns.ToDictionary(
-                        kv => kv.Key,
-                        kv => kv.Value.ToTooltip(),
-                        StringComparer.Ordinal)
-                    : new Dictionary<string, string>(StringComparer.Ordinal);
-                XqlSheetView.SetHeaderTooltips(sh, dict);
-                XqlCommon.ReleaseCom(sh);
-            });
-        }
-#endif
 
         // ========= Excel 이벤트 =========
 
@@ -144,6 +121,10 @@ namespace XQLite.AddIn
                 var sh = Sh as Excel.Worksheet;
                 if (sh == null || Target == null) return;
 
+                XqlSheetView.RefreshTooltipsIfHeaderEdited(sh, Target);
+                XqlCommon.ReleaseCom(Target);
+                XqlCommon.ReleaseCom(sh);
+
                 // 변경 범위가 여러 셀일 수 있음
                 foreach (Excel.Range cell in Target.Cells)
                 {
@@ -177,16 +158,26 @@ namespace XQLite.AddIn
 
         private static void ApplyValidationVisual(Excel.Range cell, ValidationResult vr)
         {
-            try { cell.Comment?.Delete(); } catch { }
-            if (!vr.IsOk)
+            if (vr.IsOk)
             {
-                try
-                {
-                    var msg = vr.Message.Length <= 512 ? vr.Message : (vr.Message.Substring(0, 509) + "...");
-                    cell.AddComment(msg); cell.Comment?.Visible = false;
-                }
-                catch { }
+                SafeClearComment(cell);
+                return;
             }
+
+            SafeClearComment(cell);
+            SafeSetComment(cell, TruncateForComment(vr.Message));
+
+            // ✨ 데이터 바디 영역에서 잘못된 타입/형식 입력 시 한 번 경고
+            try
+            {
+                if (cell.Row > 1) // 헤더(1행) 제외
+                {
+                    System.Windows.Forms.MessageBox.Show(vr.Message, "XQLite",
+                        System.Windows.Forms.MessageBoxButtons.OK,
+                        System.Windows.Forms.MessageBoxIcon.Warning);
+                }
+            }
+            catch { /* UI 경고 실패는 무시 */ }
         }
 
         private static string TruncateForComment(string s)
