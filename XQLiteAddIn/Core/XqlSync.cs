@@ -1,4 +1,5 @@
 ﻿// XqlSync.cs  (ExcelPatchApplier 포함 버전)
+using ExcelDna.Integration;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -6,7 +7,7 @@ using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
-using ExcelDna.Integration;
+using static System.Windows.Forms.VisualStyles.VisualStyleElement.Tab;
 using Excel = Microsoft.Office.Interop.Excel;
 
 namespace XQLite.AddIn
@@ -194,7 +195,7 @@ namespace XQLite.AddIn
 
             var map = new Dictionary<CellKey, EditCell>(temp.Count);
             foreach (var e in temp) map[new CellKey(e.Table, e.RowKey, e.Column)] = e;
-            return [.. map.Values];
+            return map.Values.ToList();
         }
 
         private readonly record struct CellKey(string Table, object RowKey, string Column);
@@ -223,37 +224,54 @@ namespace XQLite.AddIn
                 foreach (var grp in patches.GroupBy(p => p.Table, StringComparer.Ordinal))
                 {
                     Excel.Worksheet? ws = null;
+
+                    ws = FindWorksheetByTable(app, grp.Key, out var smeta);
+                    if (ws == null || smeta == null) continue;
+
+                    // 헤더/컬럼 맵
+                    Excel.Range? header = null; Excel.ListObject? lo = null;
                     try
                     {
-                        ws = FindWorksheetByTable(app, grp.Key, out var smeta);
-                        if (ws == null || smeta == null) continue;
-
-                        // 헤더/컬럼 맵
-                        var (header, headers) = XqlSheet.GetHeaderAndNames(ws);
+                        lo = XqlSheet.FindListObjectByTable(ws, grp.Key);
+                        header = lo?.HeaderRowRange ?? XqlSheet.GetHeaderRange(ws);
+                        var headers = new List<string>(header.Columns.Count);
+                        for (int i = 1; i <= header.Columns.Count; i++)
+                        {
+                            Excel.Range? hc = null; try
+                            {
+                                hc = (Excel.Range)header.Cells[1, i];
+                                var nm = (hc.Value2 as string)?.Trim();
+                                headers.Add(string.IsNullOrEmpty(nm) ? XqlCommon.ColumnIndexToLetter(header.Column + i - 1) : nm!);
+                            }
+                            finally { XqlCommon.ReleaseCom(hc); }
+                        }
                         if (headers.Count == 0) continue;
 
                         // 키 컬럼 인덱스 결정 (메타 우선)
-                        int keyCol = XqlSheet.FindKeyColumnIndex(headers, smeta.KeyColumn);
+                        int keyIdx1 = XqlSheet.FindKeyColumnIndex(headers, smeta.KeyColumn); // 1-based
+                        int keyAbsCol = header.Column + keyIdx1 - 1;                         // 절대열
                         int firstDataRow = header.Row + 1;
 
                         foreach (var patch in grp)
                         {
                             try
                             {
-                                int? row = XqlSheet.FindRowByKey(ws, firstDataRow, keyCol, patch.RowKey);
+                                int? row = XqlSheet.FindRowByKey(ws, firstDataRow, keyAbsCol, patch.RowKey);
                                 if (patch.Deleted)
                                 {
                                     if (row.HasValue) SafeDeleteRow(ws, row.Value);
                                     continue;
                                 }
-                                if (!row.HasValue) row = AppendNewRow(ws, firstDataRow);
+                                if (!row.HasValue) row = AppendNewRow(ws, firstDataRow, lo);
 
-                                ApplyCells(ws, row!.Value, headers, smeta, patch.Cells);
+                                ApplyCells(ws, row!.Value, header, headers, smeta, patch.Cells);
                             }
                             catch { /* per-row safe */ }
                         }
+
+
                     }
-                    finally { XqlCommon.ReleaseCom(ws); }
+                    finally { XqlCommon.ReleaseCom(lo); XqlCommon.ReleaseCom(header); XqlCommon.ReleaseCom(ws); }
                 }
             }
 
@@ -262,6 +280,7 @@ namespace XQLite.AddIn
             {
                 smeta = null;
 
+                Excel.Worksheet? match = null;
                 // 1) 시트명 == 테이블명인 경우
                 try
                 {
@@ -276,39 +295,57 @@ namespace XQLite.AddIn
                                 if (string.Equals(m.TableName ?? name, table, StringComparison.Ordinal))
                                 {
                                     smeta = m;
-                                    return w;
+                                    match = w;
+                                    break;
                                 }
                                 // 시트명 자체가 테이블명인 케이스도 통과
                                 if (string.Equals(name, table, StringComparison.Ordinal) && smeta == null)
                                 {
                                     smeta = m;
-                                    return w;
+                                    match = w;
+                                    break;
                                 }
                             }
                         }
-                        finally { XqlCommon.ReleaseCom(w); }
+                        finally
+                        {
+                            if (!object.ReferenceEquals(match, w)) XqlCommon.ReleaseCom(w);
+                        }
                     }
                 }
                 catch { }
 
-                return null;
+                return match;
             }
 
-            private static int AppendNewRow(Excel.Worksheet ws, int firstDataRow)
+            private static int AppendNewRow(Excel.Worksheet ws, int firstDataRow, Excel.ListObject? lo)
             {
-                int last = firstDataRow;
-                try
+                // 1) 표가 있으면 표에 행 추가(범위 자동 확장)
+                if (lo != null)
                 {
-                    var used = ws.UsedRange;
-                    last = used.Row + used.Rows.Count - 1;
-                    XqlCommon.ReleaseCom(used);
+                    try
+                    {
+                        var lr = lo.ListRows.Add();    // 테이블 마지막에 1행 추가
+                        XqlCommon.ReleaseCom(lr);
+                        var body = lo.DataBodyRange;   // 새로고침된 바디 참조
+                        if (body != null)
+                        {
+                            int row = body.Row + body.Rows.Count - 1;
+                            XqlCommon.ReleaseCom(body);
+                            return row;
+                        }
+                    }
+                    catch { /* 실패 시 폴백 */ }
                 }
+                // 2) 폴백: UsedRange 기반으로 시트에 직접 추가
+                int last = firstDataRow;
+                try { var used = ws.UsedRange; last = used.Row + used.Rows.Count - 1; XqlCommon.ReleaseCom(used); }
                 catch { }
                 return Math.Max(firstDataRow, last + 1);
             }
 
             // ✅ 메타 컬럼에 정의된 컬럼만 적용
-            private static void ApplyCells(Excel.Worksheet ws, int row, List<string> headers, SheetMeta meta, Dictionary<string, object?> cells)
+            private static void ApplyCells(Excel.Worksheet ws, int row, Excel.Range header, List<string> headers, SheetMeta meta, Dictionary<string, object?> cells)
             {
                 for (int c = 0; c < headers.Count; c++)
                 {
@@ -321,7 +358,7 @@ namespace XQLite.AddIn
                     Excel.Range? rg = null;
                     try
                     {
-                        rg = (Excel.Range)ws.Cells[row, c + 1];
+                        rg = (Excel.Range)ws.Cells[row, header.Column + c]; // ✅ 헤더 절대열 기준
                         if (val == null) { rg.Value2 = null; continue; }
 
                         switch (val)
@@ -332,11 +369,18 @@ namespace XQLite.AddIn
                             case double d: rg.Value2 = d; break;
                             case float f: rg.Value2 = (double)f; break;
                             case decimal m: rg.Value2 = (double)m; break;
-                            case DateTime dt: rg.Value2 = dt; break;
-                            default: rg.Value2 = val.ToString(); break;
+                            case DateTime dt: rg.Value2 = dt.ToOADate(); break;
+                            default: rg.Value2 = Convert.ToString(val, System.Globalization.CultureInfo.InvariantCulture); break;
                         }
+
+                        // 서버 패치로 변경된 셀 하이라이트
+                        XqlCommon.MarkTouchedCell(rg);
                     }
-                    catch { }
+                    catch (Exception ex)
+                    {
+                        XqlCommon.LogError($"패치 적용 실패: {ex.Message}", ws.Name,
+                        rg?.Address[false, false] ?? "");
+                    }
                     finally { XqlCommon.ReleaseCom(rg); }
                 }
             }

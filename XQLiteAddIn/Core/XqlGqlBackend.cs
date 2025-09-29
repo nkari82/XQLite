@@ -9,7 +9,6 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reactive.Linq;
-using System.Runtime.Remoting.Contexts;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -274,7 +273,13 @@ namespace XQLite.AddIn
         // ── Parser bridge ────────────────────────────────────────────────────
         private static UpsertResult ParseUpsert(JObject? data)
         {
-            var res = new UpsertResult { MaxRowVersion = 0, Errors = [], Conflicts = [] };
+            var res = new UpsertResult
+            {
+                MaxRowVersion = 0,
+                Errors = new List<string>(),
+                Conflicts = new List<Conflict>()
+            };
+
             if (data == null) return res;
 
             var root = data["upsertCells"] ?? data["upsertRows"];

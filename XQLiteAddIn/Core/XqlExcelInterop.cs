@@ -28,7 +28,8 @@ namespace XQLite.AddIn
         private bool _started;
         private readonly object _uiGate = new();
 
-        private volatile string _lastCellRef = string.Empty;
+        private static int _lastWarnTick;
+        private string? _lastCellRef; // ← 추가: 선택 변경 추적(디버깅/프레즌스 등에서 활용 가능)
 
         public XqlExcelInterop(Excel.Application app, XqlSync sync, XqlCollab collab, XqlSheet sheet, XqlBackup backup)
         {
@@ -118,6 +119,7 @@ namespace XQLite.AddIn
         private void App_SheetChange(object Sh, Excel.Range Target)
         {
             Excel.Worksheet? sh = null;
+            Excel.ListObject? loSel = null; Excel.Range? header = null;
             try
             {
                 sh = Sh as Excel.Worksheet;
@@ -126,11 +128,24 @@ namespace XQLite.AddIn
                 // 헤더 편집 시 툴팁 재적용
                 XqlSheetView.RefreshTooltipsIfHeaderEdited(sh, Target);
 
+                // ── 헤더 범위(표 헤더 또는 마커/폴백)를 한 번만 계산
+                try
+                {
+                    loSel = XqlSheet.FindListObjectContaining(sh, Target);
+                    header = loSel?.HeaderRowRange;
+                    if (header == null && XqlSheet.TryGetHeaderMarker(sh, out var hdr)) header = hdr;
+                    if (header == null) header = XqlSheet.GetHeaderRange(sh);
+                }
+                catch { /* ignore */ }
+                int headerRow = header?.Row ?? 0;
+
                 // 변경 범위가 여러 셀일 수 있음
                 foreach (Excel.Range cell in Target.Cells)
                 {
                     try
                     {
+                        // ✅ 헤더 행은 업서트/검증 제외 (툴팁 재적용만 별도로 수행됨)
+                        if (headerRow > 0 && cell.Row <= headerRow) { continue; }
                         var ctx = ReadCellContext(sh, cell); // table,rowKey,colName,value
                         var vr = _sheet.ValidateCell(sh.Name, ctx.colName, ctx.value);
                         ApplyValidationVisual(sh, cell, vr); // ← ws 전달
@@ -150,6 +165,8 @@ namespace XQLite.AddIn
             catch { /* swallow */ }
             finally
             {
+                XqlCommon.ReleaseCom(header);
+                XqlCommon.ReleaseCom(loSel);
                 XqlCommon.ReleaseCom(Target);
                 XqlCommon.ReleaseCom(sh);
             }
@@ -162,14 +179,19 @@ namespace XQLite.AddIn
             SafeClearComment(cell);
             SafeSetComment(cell, TruncateForComment(vr.Message));
 
+
+            bool isDataCell = false;
+
+            // 1) 표 바디에 속하면 무조건 데이터 셀
+            var lo = cell.ListObject ?? XqlSheet.FindListObjectContaining(ws, cell);
+            Excel.Range? inter = null;
             try
             {
-                bool isDataCell = false;
-
-                // 1) 표 바디에 속하면 무조건 데이터 셀
-                var lo = cell.ListObject ?? XqlSheet.FindListObjectContaining(ws, cell);
                 if (lo?.DataBodyRange != null)
-                    isDataCell = ws.Application.Intersect(lo.DataBodyRange, cell) != null;
+                {
+                    inter = XqlCommon.IntersectSafe(ws, lo.DataBodyRange, cell);
+                    isDataCell = inter != null;
+                }
 
                 // 2) 표가 없으면: 헤더 마커(or Fallback) 아래 행부터를 데이터로 간주
                 if (!isDataCell)
@@ -186,12 +208,20 @@ namespace XQLite.AddIn
 
                 if (isDataCell)
                 {
-                    System.Windows.Forms.MessageBox.Show(vr.Message, "XQLite",
-                        System.Windows.Forms.MessageBoxButtons.OK,
-                        System.Windows.Forms.MessageBoxIcon.Warning);
+                    // 로그 + 에러 하이라이트
+                    XqlCommon.LogWarn(vr.Message, ws.Name, cell.Address[false, false]);
+                    XqlCommon.MarkInvalidCell(cell);
+
+                    if (ShouldWarnNow())
+                    {
+                        System.Windows.Forms.MessageBox.Show(vr.Message, "XQLite",
+                            System.Windows.Forms.MessageBoxButtons.OK,
+                            System.Windows.Forms.MessageBoxIcon.Warning);
+                    }
                 }
             }
-            catch { /* UI 경고 실패는 무시 */ }
+            catch { }
+            finally { XqlCommon.ReleaseCom(inter); XqlCommon.ReleaseCom(lo); }
         }
 
         private static string TruncateForComment(string s)
@@ -235,6 +265,7 @@ namespace XQLite.AddIn
         ReadCellContext(Excel.Worksheet sh, Excel.Range cell)
         {
             string tableName = sh.Name;
+            Excel.Range? hc = null, kc = null;
 
             // 1) 표/헤더 찾기
             var lo = cell.ListObject ?? XqlSheet.FindListObjectContaining(sh, cell);
@@ -244,31 +275,42 @@ namespace XQLite.AddIn
 
             if (header != null)
             {
+                // 표가 있으면 테이블명 매핑 사용
+                if (lo != null)
+                    tableName = XqlTableNameMap.Map(lo.Name, sh.Name);
+
                 // 컬럼명: 현재 셀의 '헤더 열'에서 읽기 (비었으면 A/B/C…)
-                var hc = (Excel.Range)sh.Cells[header.Row, cell.Column];
+                hc = (Excel.Range)sh.Cells[header.Row, cell.Column];
                 var name = (hc.Value2 as string)?.Trim();
                 if (string.IsNullOrEmpty(name)) name = XqlCommon.ColumnIndexToLetter(hc.Column);
                 XqlCommon.ReleaseCom(hc);
                 string colName = name!;
 
                 // 키: 메타 키 우선, 없으면 헤더 기준 첫 컬럼
-                var (hdrRange, names) = XqlSheet.GetHeaderAndNames(sh);
-                try
-                {
-                    int keyCol = XqlSheet.FindKeyColumnIndex(names, XqlAddIn.Sheet!.GetOrCreateSheet(sh.Name).KeyColumn);
-                    var rkCell = (Excel.Range)sh.Cells[cell.Row, keyCol];
-                    object rowKey = rkCell.Value2 ?? cell.Row;
-                    XqlCommon.ReleaseCom(rkCell);
+                var meta = XqlAddIn.Sheet!.GetOrCreateSheet(sh.Name);
+                int keyAbsCol = XqlSheet.FindKeyColumnAbsolute(header, meta.KeyColumn);
+                var rkCell = (Excel.Range)sh.Cells[cell.Row, keyAbsCol];
+                object rowKey = rkCell.Value2 ?? cell.Row;
+                XqlCommon.ReleaseCom(rkCell);
 
-                    return (tableName, rowKey, colName, ReadCellValueNormalized(cell));
-                }
-                finally { XqlCommon.ReleaseCom(hdrRange); }
+                return (tableName, rowKey, colName, ReadCellValueNormalized(cell));
             }
 
             // 2) 폴백: 기존 동작 유지
-            string fallbackCol = ((Excel.Range)sh.Cells[1, cell.Column]).Value2 as string
-                                 ?? $"C{cell.Column}";
-            object fallbackKey = ((Excel.Range)sh.Cells[cell.Row, 1]).Value2 ?? cell.Row;
+            string fallbackCol;
+            object fallbackKey;
+
+            try
+            {
+                hc = (Excel.Range)sh.Cells[1, cell.Column];
+                var hName = (hc.Value2 as string)?.Trim();
+                fallbackCol = string.IsNullOrEmpty(hName)
+                     ? XqlCommon.ColumnIndexToLetter(cell.Column)
+                     : hName!;
+                kc = (Excel.Range)sh.Cells[cell.Row, 1];
+                fallbackKey = kc.Value2 ?? cell.Row;
+            }
+            finally { XqlCommon.ReleaseCom(hc); XqlCommon.ReleaseCom(kc); }
             return (tableName, fallbackKey, fallbackCol, ReadCellValueNormalized(cell));
         }
 
@@ -301,6 +343,17 @@ namespace XQLite.AddIn
             if (v is bool b) return b;
 
             return v; // 그 외는 원본 유지
+        }
+
+
+        // 유효성 경고 쓰로틀 (연속 MsgBox 억제)
+        private static bool ShouldWarnNow()
+        {
+            int now = Environment.TickCount;
+            // 300ms 이내 재호출이면 무시
+            if (unchecked(now - _lastWarnTick) < 300) return false;
+            _lastWarnTick = now;
+            return true;
         }
 
         // ========= UI 스레드 보조 =========

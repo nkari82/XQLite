@@ -201,7 +201,7 @@ namespace XQLite.AddIn
         }
 
         // UI(Excel) 스레드에서 안전하게 실행하고 결과를 돌려받는 헬퍼
-        private static T? OnMainThread<T>(Func<T?> work, int timeoutMs = 300)
+        private static T? OnMainThread<T>(Func<T?> work, int timeoutMs = 800)
         {
             T? result = default;
             var done = new System.Threading.ManualResetEventSlim(false);

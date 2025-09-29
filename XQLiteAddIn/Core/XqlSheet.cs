@@ -1,14 +1,9 @@
 ﻿// XqlSheet.cs
-using Microsoft.Office.Interop.Excel;
 using Newtonsoft.Json.Linq;
 using System;
 using System.Collections.Generic;
-using System.IO;
 using System.Linq;
-using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
-using XQLite.AddIn;
-using static System.Net.Mime.MediaTypeNames;
 using Excel = Microsoft.Office.Interop.Excel;
 
 namespace XQLite.AddIn
@@ -61,19 +56,65 @@ namespace XQLite.AddIn
         /// </summary>
         internal static (Excel.Range header, List<string> names) GetHeaderAndNames(Excel.Worksheet ws)
         {
-            int usedCols = 1;
-            try { usedCols = Math.Max(1, ws.UsedRange?.Columns?.Count ?? 1); } catch { usedCols = 1; }
-
-            Excel.Range header = ws.Range[ws.Cells[1, 1], ws.Cells[1, usedCols]];
-            var names = new List<string>(capacity: usedCols);
-            for (int c = 1; c <= usedCols; c++)
+            int firstCol = 1, lastCol = 1;
+            Excel.Range? used = null, cell = null;
+            try
             {
-                var cell = (Excel.Range)header.Cells[1, c];
-                names.Add(Convert.ToString(cell.Value2) ?? string.Empty);
-                XqlCommon.ReleaseCom(cell);
+                try
+                {
+                    used = ws.UsedRange;
+                    firstCol = used.Column;
+                    lastCol = used.Column + used.Columns.Count - 1;
+                }
+                catch
+                {
+                    firstCol = 1; lastCol = 1;
+                }
+                finally
+                {
+                    XqlCommon.ReleaseCom(used);
+                }
+
+                // 경계 보정
+                if (lastCol < firstCol) lastCol = firstCol;
+
+                // 1행의 [firstCol..lastCol]을 헤더로 간주
+                var header = ws.Range[ws.Cells[1, firstCol], ws.Cells[1, lastCol]];
+
+                int colCount = header.Columns.Count;
+                var names = new List<string>(capacity: colCount);
+
+                for (int i = 1; i <= colCount; i++)
+                {
+                    try
+                    {
+                        // ⚠️ 헤더 내부 상대 인덱스 사용 (1-based)
+                        cell = (Excel.Range)header.Cells[1, i];
+
+                        var raw = (Convert.ToString(cell.Value2) ?? "").Trim();
+                        // 빈 칸이면 A,B,C… 폴백
+                        names.Add(string.IsNullOrEmpty(raw)
+                                  ? XqlCommon.ColumnIndexToLetter(firstCol + i - 1)
+                                  : raw!);
+                    }
+                    finally
+                    {
+                        XqlCommon.ReleaseCom(cell);
+                        cell = null;
+                    }
+                }
+
+                // header는 호출자가 ReleaseCom 해야 함
+                return (header, names);
             }
-            return (header, names.Select(s => s.Trim()).ToList());
+            catch
+            {
+                // 최소 안전 폴백
+                var header = ws.Range[ws.Cells[1, 1], ws.Cells[1, 1]];
+                return (header, new List<string> { XqlCommon.ColumnIndexToLetter(1) });
+            }
         }
+
 
         // ───────────────────────── Header (fallback to UsedRange row1)
         // XqlSheetView.cs에서만 사용하므로 옮길수 도 있다.
@@ -83,7 +124,7 @@ namespace XQLite.AddIn
             try
             {
                 used = sh.UsedRange;
-                int lastCol = Math.Max(1, used.Columns.Count);
+                int lastCol = Math.Max(1, used.Column + used.Columns.Count - 1);
                 int hr = 1; // 헤더는 1행 기준 (마커/ResolveHeader가 우선이며, 이는 Fallback)
                 int last = 1;
                 for (int c = lastCol; c >= 1; --c)
@@ -92,7 +133,7 @@ namespace XQLite.AddIn
                     try
                     {
                         cell = (Excel.Range)sh.Cells[hr, c];
-                        var txt = (cell.Value2 as string)?.Trim();
+                        var txt = (Convert.ToString(cell.Value2) ?? "").Trim();
                         if (!string.IsNullOrEmpty(txt)) { last = c; break; }
                     }
                     finally { XqlCommon.ReleaseCom(cell); }
@@ -148,30 +189,47 @@ namespace XQLite.AddIn
             if (ws is null || rng is null) return null;
 
             Excel.ListObject? match = null;
-            foreach (Excel.ListObject? lo in ws.ListObjects)
+
+            foreach (Excel.ListObject lo in ws.ListObjects)
             {
-                if (lo is null) continue;
-                Excel.Range? header = null;
-                Excel.Range? body = null;
+                bool keep = false;
+                Excel.Range? header = null, body = null;
+                Excel.Range? inter1 = null, inter2 = null;
+
                 try
                 {
                     header = lo.HeaderRowRange;
                     body = lo.DataBodyRange;
-                    if ((header != null && XqlCommon.IntersectSafe(ws, rng, header) != null) ||
-                        (body != null && XqlCommon.IntersectSafe(ws, rng, body) != null))
+
+                    bool hit = false;
+                    if (header != null)
                     {
-                        match = lo;   // ★ 선택한 객체는 해제하지 않음
+                        inter1 = XqlCommon.IntersectSafe(ws, rng, header);
+                        hit |= inter1 != null;
+                    }
+                    if (!hit && body != null)
+                    {
+                        inter2 = XqlCommon.IntersectSafe(ws, rng, body);
+                        hit |= inter2 != null;
+                    }
+
+                    if (hit)
+                    {
+                        match = lo;   // 매치된 객체는 호출자에게 반환(해제 금지)
+                        keep = true;
                         break;
                     }
                 }
                 finally
                 {
-                    XqlCommon.ReleaseCom(header);
+                    XqlCommon.ReleaseCom(inter2);
+                    XqlCommon.ReleaseCom(inter1);
                     XqlCommon.ReleaseCom(body);
-                    if (!object.ReferenceEquals(match, lo)) // 선택되지 않은 경우만 해제
-                        XqlCommon.ReleaseCom(lo);
+                    XqlCommon.ReleaseCom(header);
+                    if (!keep) XqlCommon.ReleaseCom(lo); // 매치 실패건만 해제
                 }
             }
+
             return match;
         }
 
@@ -218,8 +276,33 @@ namespace XQLite.AddIn
                 }
                 XqlCommon.ReleaseCom(lo);    // 매치 실패건만 해제
             }
-            if (match != null) return match;
 
+            // 4) 폴백: 통합문서 전체 스캔 (비싼 연산이므로 최후순위)
+            try
+            {
+                var app2 = ws.Application as Excel.Application;
+                if (app2 != null)
+                {
+                    foreach (Excel.Worksheet w in app2.Worksheets)
+                    {
+                        try
+                        {
+                            foreach (Excel.ListObject lo2 in w.ListObjects)
+                            {
+                                try
+                                {
+                                    if (string.Equals(lo2.Name, loName, StringComparison.Ordinal) ||
+    string.Equals($"{w.Name}.{lo2.Name}", tableNameOrQualified, StringComparison.Ordinal))
+                                        return lo2; // ← 매치된 것은 반환(해제 금지)
+                                }
+                                finally { if (!object.ReferenceEquals(match, lo2)) XqlCommon.ReleaseCom(lo2); }
+                            }
+                        }
+                        finally { if (!object.ReferenceEquals(match, w)) XqlCommon.ReleaseCom(w); }
+                    }
+                }
+            }
+            catch { }
             return null;
         }
 
@@ -291,7 +374,8 @@ namespace XQLite.AddIn
                 var sheet = parts[1];
                 var table = parts[2];
 
-                int hRow = 0, hCol = 0, dr = 0, dc = 0;
+                int hRow = 0, hCol = 0;
+                int colOffset = 0, rowOffset = 0;
                 string? hdr = null;
 
                 foreach (var seg in parts.Skip(3))
@@ -301,13 +385,13 @@ namespace XQLite.AddIn
                         var hc = seg.Substring(1).Split('C');
                         hRow = int.Parse(hc[0]); hCol = int.Parse(hc[1]);
                     }
-                    else if (seg.StartsWith("dx=")) dc = ParseIntOrDefault(seg, 3);
-                    else if (seg.StartsWith("dr=")) dr = ParseIntOrDefault(seg, 3);
-                    else if (seg.StartsWith("dc=")) dc = ParseIntOrDefault(seg, 3);
+                    else if (seg.StartsWith("dx=")) colOffset = ParseIntOrDefault(seg, 3);
+                    else if (seg.StartsWith("dr=")) rowOffset = ParseIntOrDefault(seg, 3);
+                    else if (seg.StartsWith("dc=")) colOffset = ParseIntOrDefault(seg, 3);
                     else if (seg.StartsWith("hdr=")) hdr = Unescape(seg.Substring(4));
                 }
 
-                d = new RelDesc(kind, sheet, table, hRow, hCol, dr, dc, hdr);
+                d = new RelDesc(kind, sheet, table, hRow, hCol, rowOffset, colOffset, hdr);
                 return true;
             }
             catch { return false; }
@@ -473,6 +557,24 @@ namespace XQLite.AddIn
                 var used = ws.UsedRange;
                 int lastRow = used.Row + used.Rows.Count - 1;
                 XqlCommon.ReleaseCom(used);
+
+                // 1) 빠른 경로: Range.Find (정확 일치)
+                Excel.Range? rg = null, hit = null;
+                try
+                {
+                    rg = ws.Range[ws.Cells[firstDataRow, keyCol], ws.Cells[lastRow, keyCol]];
+                    hit = rg.Find(What: key, After: Type.Missing,
+                                  LookIn: Excel.XlFindLookIn.xlValues,
+                                  LookAt: Excel.XlLookAt.xlWhole,
+                                  SearchOrder: Excel.XlSearchOrder.xlByRows,
+                                  SearchDirection: Excel.XlSearchDirection.xlNext,
+                                  MatchCase: false);
+                    if (hit != null) return hit.Row;
+                }
+                catch { /* fall through */ }
+                finally { XqlCommon.ReleaseCom(hit); XqlCommon.ReleaseCom(rg); }
+
+                // 2) 폴백: 선형 탐색 (기존 동작)
                 for (int r = firstDataRow; r <= lastRow; r++)
                 {
                     Excel.Range? cell = null;
@@ -480,13 +582,9 @@ namespace XQLite.AddIn
                     {
                         cell = (Excel.Range)ws.Cells[r, keyCol];
                         var v = cell.Value2;
-                        if (XqlCommon.EqualKey(v, key))
-                            return r;
+                        if (XqlCommon.EqualKey(v, key)) return r;
                     }
-                    finally
-                    {
-                        XqlCommon.ReleaseCom(cell);
-                    }
+                    finally { XqlCommon.ReleaseCom(cell); }
                 }
             }
             catch { }
@@ -692,8 +790,8 @@ namespace XQLite.AddIn
                     if (nm.Equals(key, StringComparison.OrdinalIgnoreCase) ||
                         nml.Equals(key, StringComparison.OrdinalIgnoreCase))
                     {
-                        hit = n;                 // 매치된 것은 반환(해제 금지, 호출자 소유)
-                        continue;
+                        hit = n;                 // 매치: 즉시 종료
+                        break;
                     }
                 }
                 finally
@@ -711,6 +809,43 @@ namespace XQLite.AddIn
             catch { /* ignore */ }
             finally { XqlCommon.ReleaseCom(nm); }
         }
+
+
+        // XqlSheet.cs — 아래 유틸 추가 (파일 내 임의 위치: 다른 static 메서드 근처)
+        internal static int FindKeyColumnAbsolute(Excel.Range header, string keyName)
+        {
+            // 1) 지정 키명 우선
+            if (!string.IsNullOrWhiteSpace(keyName))
+            {
+                int hit = FindBy(header, keyName);
+                if (hit > 0) return hit;
+            }
+            // 2) 'id' → 'key' → 3) 첫 열
+            int id = FindBy(header, "id");
+            if (id > 0) return id;
+            int key = FindBy(header, "key");
+            if (key > 0) return key;
+            return header.Column;
+
+            static int FindBy(Excel.Range hdr, string name)
+            {
+                for (int i = 1; i <= hdr.Columns.Count; i++)
+                {
+                    Excel.Range? c = null;
+                    try
+                    {
+                        c = (Excel.Range)hdr.Cells[1, i];
+                        var n = (c.Value2 as string)?.Trim();
+                        if (!string.IsNullOrEmpty(n) &&
+                            string.Equals(n, name, StringComparison.OrdinalIgnoreCase))
+                            return hdr.Column + i - 1; // 절대 열번호
+                    }
+                    finally { XqlCommon.ReleaseCom(c); }
+                }
+                return 0;
+            }
+        }
+
 
     }
 

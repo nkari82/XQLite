@@ -1,10 +1,7 @@
 ﻿// XqlSheetView.cs
 using ExcelDna.Integration;
-using Microsoft.Office.Interop.Excel;
 using System;
 using System.Collections.Generic;
-using System.Linq;
-using System.Security.Cryptography;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using Excel = Microsoft.Office.Interop.Excel;
@@ -297,6 +294,8 @@ namespace XQLite.AddIn
                     {
                         cell = (Excel.Range)header.Cells[1, i];
                         var text = tips.TryGetValue(i, out var t) ? t : string.Empty;
+                        if (!string.IsNullOrEmpty(text) && text.Length > 512)
+                            text = text.Substring(0, 509) + "...";
 
                         // 비워야 하면 삭제(이미 없으면 skip)
                         if (string.IsNullOrEmpty(text))
@@ -365,7 +364,7 @@ namespace XQLite.AddIn
                     var hdr = lo?.HeaderRowRange;
                     if (hdr != null)
                     {
-                        var hit = ws.Application.Intersect(hdr, target);
+                        var hit = XqlCommon.IntersectSafe(ws, hdr, target);
                         isHeaderEdit = hit != null;
                         XqlCommon.ReleaseCom(hit);
                     }
@@ -389,9 +388,7 @@ namespace XQLite.AddIn
                             header2 = XqlSheet.GetHeaderRange(ws2);
 
                         var sm = sheetSvc.GetOrCreateSheet(sheetName);
-                        var tips = BuildHeaderTooltips(sm, header2);
-                        SetHeaderTooltips(header2, tips);         // 코멘트 재적용
-                        ApplyHeaderOutlineBorder(header2);        // 외곽선 유지(옵션)
+                        ApplyHeaderUi(ws2, header2, sm, withValidation: true);
                     }
                     catch { /* 무음 */ }
                     finally { XqlCommon.ReleaseCom(header2); XqlCommon.ReleaseCom(ws2); }
@@ -412,24 +409,23 @@ namespace XQLite.AddIn
             {
                 for (int i = 1; i <= header.Columns.Count; i++)
                 {
-                    Excel.Range? h = null; Excel.Range? body = null; Excel.Range? rng = null;
+                    Excel.Range? h = null; Excel.Range? rng = null;
                     try
                     {
                         h = (Excel.Range)header.Cells[1, i];
                         string? name = (h.Value2 as string)?.Trim();
                         if (string.IsNullOrEmpty(name)) name = XqlCommon.ColumnIndexToLetter(h.Column);
 
-                        // 메타에 없더라도 일단 '열 전체'에 완화 규칙(Any)로 깔고, 있으면 실제 타입으로 다시 덮어쓴다.
-                        rng = ColBelowToEnd(ws, h);
-                        ApplyValidationForKind(rng, ColumnKind.Text /*완화; 먼저 깨끗이 덮고*/);
+                        // 표가 있으면 그 컬럼의 DataBodyRange에만 DV 적용
+                        try { rng = lo.ListColumns[i]?.DataBodyRange; } catch { rng = null; }
+                        if (rng == null) rng = ColBelowToEnd(ws, h); // 표가 비어 있으면 폴백
 
-                        if (!sm.Columns.TryGetValue(name!, out var ct))
-                            continue;
-
-                        // 실제 타입으로 다시 덮어쓰기
-                        ApplyValidationForKind(rng, ct.Kind);
+                        if (sm.Columns.TryGetValue(name!, out var ct))
+                            ApplyValidationForKind(rng, ct.Kind);
+                        else
+                            try { rng.Validation.Delete(); } catch { /* clean only */ }
                     }
-                    finally { XqlCommon.ReleaseCom(h); XqlCommon.ReleaseCom(body); XqlCommon.ReleaseCom(rng); }
+                    finally { XqlCommon.ReleaseCom(h); XqlCommon.ReleaseCom(rng); }
                 }
                 return;
             }
@@ -448,7 +444,7 @@ namespace XQLite.AddIn
                     if (!string.IsNullOrEmpty(name) && sm.Columns.TryGetValue(name!, out var ct))
                         ApplyValidationForKind(col, ct.Kind);
                     else
-                        ApplyValidationForKind(col, ColumnKind.Text /*완화*/);
+                        try { col.Validation.Delete(); } catch { /* clean only */ }
                 }
                 finally { XqlCommon.ReleaseCom(h); XqlCommon.ReleaseCom(col); }
             }

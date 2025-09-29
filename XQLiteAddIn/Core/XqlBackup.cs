@@ -22,7 +22,7 @@ namespace XQLite.AddIn
         private readonly XqlSheet _sheet;
         private readonly IXqlBackend _backend;
 
-        public XqlBackup(IXqlBackend backend, XqlSheet sheet, string endpoint, string apiKey)
+        public XqlBackup(IXqlBackend backend, XqlSheet sheet)
         {
             _sheet = sheet ?? throw new ArgumentNullException(nameof(sheet));
             _backend = backend;
@@ -109,7 +109,7 @@ namespace XQLite.AddIn
                     var rows = ReadSheetRows(app, sheetName, sm);
                     if (rows.Count == 0) continue;
 
-                    foreach (var chunk in XqlCommon.Chunk(RowsToCellEdits(sm.TableName ?? sheetName, rows), batchSize))
+                    foreach (var chunk in XqlCommon.Chunk(RowsToCellEdits(sm.TableName ?? sheetName, sm, rows), batchSize))
                         await _backend.UpsertCells(chunk).ConfigureAwait(false);
                 }
             }
@@ -174,8 +174,7 @@ namespace XQLite.AddIn
         private static List<Dictionary<string, object?>> ReadSheetRows(Excel.Application app, string sheetName, SheetMeta sm)
         {
             var list = new List<Dictionary<string, object?>>();
-            Excel.Worksheet? ws = null;
-            Excel.Range? used = null;
+            Excel.Worksheet? ws = null; Excel.Range? used = null; Excel.Range? header = null; Excel.ListObject? lo = null;
             try
             {
                 ws = app.Worksheets.Cast<Excel.Worksheet>()
@@ -183,33 +182,65 @@ namespace XQLite.AddIn
                 if (ws == null) return list;
 
                 used = ws.UsedRange;
-                int rows = used.Rows.Count;
-                int cols = used.Columns.Count;
-                if (rows < 2 || cols < 1) return list;
 
-                // 헤더 수집 (1행)
-                var headers = new List<string>(cols);
-                for (int c = 1; c <= cols; c++)
+                int usedLastRow = used.Row + used.Rows.Count - 1;
+                XqlCommon.ReleaseCom(used); used = null;
+
+                // 1) 헤더 탐색: 마커 → 표 헤더 → Fallback
+                if (!XqlSheet.TryGetHeaderMarker(ws, out header))
                 {
-                    string name = "";
-                    try { name = Convert.ToString(((Excel.Range)ws.Cells[1, c]).Value2) ?? ""; } catch { }
-                    headers.Add(name.Trim());
+                    lo = ws.ListObjects?.Count > 0 ? ws.ListObjects[1] : null;
+                    if (lo?.HeaderRowRange != null) header = lo.HeaderRowRange;
+                    if (header == null) header = XqlSheet.GetHeaderRange(ws);
+                }
+                if (header == null) return list;
+
+
+                // 2) 헤더 수집 (배열 경로)
+                var headers = new List<string>(header.Columns.Count);
+                var hv = header.Value2 as object[,];
+                if (hv != null)
+                {
+                    int cols = header.Columns.Count;
+                    for (int i = 1; i <= cols; i++)
+                    {
+                        var nm = (Convert.ToString(hv[1, i]) ?? "").Trim();
+                        headers.Add(string.IsNullOrEmpty(nm) ? XqlCommon.ColumnIndexToLetter(header.Column + i - 1) : nm);
+                    }
+                }
+                else
+                {
+                    for (int i = 1; i <= header.Columns.Count; i++)
+                    {
+                        Excel.Range? hc = null;
+                        try
+                        {
+                            hc = (Excel.Range)header.Cells[1, i];
+                            var nm = (hc.Value2 as string)?.Trim();
+                            headers.Add(string.IsNullOrEmpty(nm) ? XqlCommon.ColumnIndexToLetter(header.Column + i - 1) : nm!);
+                        }
+                        finally { XqlCommon.ReleaseCom(hc); }
+                    }
                 }
 
-                // 데이터 행
-                for (int r = 2; r <= rows; r++)
+                // 3) 데이터 행: header 바로 아래부터 UsedRange 끝까지
+                int firstDataRow = header.Row + 1;
+                int lastRow = Math.Max(firstDataRow, usedLastRow);
+                for (int r = firstDataRow; r <= lastRow; r++)
                 {
                     var row = new Dictionary<string, object?>(StringComparer.Ordinal);
                     bool any = false;
-                    for (int c = 1; c <= cols; c++)
+                    for (int i = 1; i <= header.Columns.Count; i++)
                     {
-                        var key = headers[c - 1];
+                        var key = headers[i - 1];
                         if (string.IsNullOrWhiteSpace(key)) continue;
                         if (!sm.Columns.ContainsKey(key)) continue; // 메타에 없는 컬럼 skip
 
+                        Excel.Range? cell = null;
                         object? v = null;
-                        try { v = ((Excel.Range)ws.Cells[r, c]).Value2; } catch { }
-
+                        try { cell = (Excel.Range)ws.Cells[r, header.Column + i - 1]; v = cell.Value2; }
+                        catch { }
+                        finally { XqlCommon.ReleaseCom(cell); }
                         // Excel 정수=double → 그대로 보관 (서버가 형변환)
                         row[key] = v;
                         if (v != null && !(v is string s && string.IsNullOrWhiteSpace(s))) any = true;
@@ -220,22 +251,25 @@ namespace XQLite.AddIn
             catch { }
             finally
             {
-                XqlCommon.ReleaseCom(used);
+                XqlCommon.ReleaseCom(header);
+                XqlCommon.ReleaseCom(lo);
                 XqlCommon.ReleaseCom(ws);
             }
             return list;
         }
 
-        private static List<EditCell> RowsToCellEdits(string table, List<Dictionary<string, object?>> rows)
+        private static List<EditCell> RowsToCellEdits(string table, SheetMeta sm, List<Dictionary<string, object?>> rows)
         {
             var cells = new List<EditCell>(rows.Count * 4);
             for (int i = 0; i < rows.Count; i++)
             {
                 var r = rows[i];
                 // 행 키는 "id" 또는 "key" 또는 1열 값을 우선 사용 (여기선 id/key 우선)
-                object rowKey = r.TryGetValue("id", out var idv) && idv != null ? idv :
-                                r.TryGetValue("key", out var kv) && kv != null ? kv :
-                                i + 1;
+                object rowKey =
+                (sm.KeyColumn is { Length: > 0 } && r.TryGetValue(sm.KeyColumn, out var pk) && pk != null) ? pk :
+                (r.TryGetValue("id", out var idv) && idv != null ? idv :
+                r.TryGetValue("key", out var kv) && kv != null ? kv :
+                i + 1);
 
                 foreach (var kvp in r)
                 {
