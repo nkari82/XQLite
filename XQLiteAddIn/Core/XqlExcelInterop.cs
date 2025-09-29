@@ -99,31 +99,32 @@ namespace XQLite.AddIn
 
         private void App_SheetSelectionChange(object Sh, Excel.Range Target)
         {
+            Excel.Worksheet? sh = null;
             try
             {
-                var sh = Sh as Excel.Worksheet;
+                sh = Sh as Excel.Worksheet;
                 if (sh == null || Target == null) return;
 
-                var cellRef = $"{sh.Name}!{Target.Address[false, false]}";
-                _lastCellRef = cellRef;
-
-
+                _lastCellRef = $"{sh.Name}!{Target.Address[false, false]}";
+            }
+            catch { /* swallow */ }
+            finally
+            {
                 XqlCommon.ReleaseCom(Target);
                 XqlCommon.ReleaseCom(sh);
             }
-            catch { /* swallow */ }
         }
 
         private void App_SheetChange(object Sh, Excel.Range Target)
         {
+            Excel.Worksheet? sh = null;
             try
             {
-                var sh = Sh as Excel.Worksheet;
+                sh = Sh as Excel.Worksheet;
                 if (sh == null || Target == null) return;
 
+                // 헤더 편집 시 툴팁 재적용
                 XqlSheetView.RefreshTooltipsIfHeaderEdited(sh, Target);
-                XqlCommon.ReleaseCom(Target);
-                XqlCommon.ReleaseCom(sh);
 
                 // 변경 범위가 여러 셀일 수 있음
                 foreach (Excel.Range cell in Target.Cells)
@@ -132,16 +133,12 @@ namespace XQLite.AddIn
                     {
                         var ctx = ReadCellContext(sh, cell); // table,rowKey,colName,value
                         var vr = _sheet.ValidateCell(sh.Name, ctx.colName, ctx.value);
-                        ApplyValidationVisual(cell, vr);
-
+                        ApplyValidationVisual(sh, cell, vr); // ← ws 전달
                         if (vr.IsOk)
-                        {
                             _sync.EnqueueCellEdit(ctx.table, ctx.rowKey, ctx.colName, ctx.value);
-                        }
                     }
                     catch (Exception ex)
                     {
-                        // 셀 주석으로 에러 표시
                         SafeSetComment(cell, $"Edit error: {ex.Message}");
                     }
                     finally
@@ -149,28 +146,45 @@ namespace XQLite.AddIn
                         XqlCommon.ReleaseCom(cell);
                     }
                 }
-
+            }
+            catch { /* swallow */ }
+            finally
+            {
                 XqlCommon.ReleaseCom(Target);
                 XqlCommon.ReleaseCom(sh);
             }
-            catch { /* swallow */ }
         }
 
-        private static void ApplyValidationVisual(Excel.Range cell, ValidationResult vr)
+        private static void ApplyValidationVisual(Excel.Worksheet ws, Excel.Range cell, ValidationResult vr)
         {
-            if (vr.IsOk)
-            {
-                SafeClearComment(cell);
-                return;
-            }
+            if (vr.IsOk) { SafeClearComment(cell); return; }
 
             SafeClearComment(cell);
             SafeSetComment(cell, TruncateForComment(vr.Message));
 
-            // ✨ 데이터 바디 영역에서 잘못된 타입/형식 입력 시 한 번 경고
             try
             {
-                if (cell.Row > 1) // 헤더(1행) 제외
+                bool isDataCell = false;
+
+                // 1) 표 바디에 속하면 무조건 데이터 셀
+                var lo = cell.ListObject ?? XqlSheet.FindListObjectContaining(ws, cell);
+                if (lo?.DataBodyRange != null)
+                    isDataCell = ws.Application.Intersect(lo.DataBodyRange, cell) != null;
+
+                // 2) 표가 없으면: 헤더 마커(or Fallback) 아래 행부터를 데이터로 간주
+                if (!isDataCell)
+                {
+                    Excel.Range? hdr = null;
+                    try
+                    {
+                        if (!XqlSheet.TryGetHeaderMarker(ws, out hdr))
+                            hdr = XqlSheet.GetHeaderRange(ws);
+                        if (hdr != null) isDataCell = cell.Row > hdr.Row;
+                    }
+                    finally { XqlCommon.ReleaseCom(hdr); }
+                }
+
+                if (isDataCell)
                 {
                     System.Windows.Forms.MessageBox.Show(vr.Message, "XQLite",
                         System.Windows.Forms.MessageBoxButtons.OK,
@@ -217,19 +231,47 @@ namespace XQLite.AddIn
 
         // ========= 컨텍스트/값 읽기 =========
 
-        private static (string table, object rowKey, string colName, object? value) ReadCellContext(Excel.Worksheet sh, Excel.Range cell)
+        private static (string table, object rowKey, string colName, object? value)
+        ReadCellContext(Excel.Worksheet sh, Excel.Range cell)
         {
-            // 가정:
-            // - 1행: 헤더(컬럼명)
-            // - 1열: 키 컬럼(행 키)
-            string table = sh.Name;
+            string tableName = sh.Name;
 
-            string colName = ((Excel.Range)sh.Cells[1, cell.Column]).Value2 as string ?? $"C{cell.Column}";
-            object rowKey = ((Excel.Range)sh.Cells[cell.Row, 1]).Value2 ?? cell.Row;
+            // 1) 표/헤더 찾기
+            var lo = cell.ListObject ?? XqlSheet.FindListObjectContaining(sh, cell);
+            Excel.Range? header = lo?.HeaderRowRange;
+            if (header == null && XqlSheet.TryGetHeaderMarker(sh, out var hdr))
+                header = hdr;
 
-            object? value = ReadCellValueNormalized(cell);
-            return (table, rowKey, colName, value);
+            if (header != null)
+            {
+                // 컬럼명: 현재 셀의 '헤더 열'에서 읽기 (비었으면 A/B/C…)
+                var hc = (Excel.Range)sh.Cells[header.Row, cell.Column];
+                var name = (hc.Value2 as string)?.Trim();
+                if (string.IsNullOrEmpty(name)) name = XqlCommon.ColumnIndexToLetter(hc.Column);
+                XqlCommon.ReleaseCom(hc);
+                string colName = name!;
+
+                // 키: 메타 키 우선, 없으면 헤더 기준 첫 컬럼
+                var (hdrRange, names) = XqlSheet.GetHeaderAndNames(sh);
+                try
+                {
+                    int keyCol = XqlSheet.FindKeyColumnIndex(names, XqlAddIn.Sheet!.GetOrCreateSheet(sh.Name).KeyColumn);
+                    var rkCell = (Excel.Range)sh.Cells[cell.Row, keyCol];
+                    object rowKey = rkCell.Value2 ?? cell.Row;
+                    XqlCommon.ReleaseCom(rkCell);
+
+                    return (tableName, rowKey, colName, ReadCellValueNormalized(cell));
+                }
+                finally { XqlCommon.ReleaseCom(hdrRange); }
+            }
+
+            // 2) 폴백: 기존 동작 유지
+            string fallbackCol = ((Excel.Range)sh.Cells[1, cell.Column]).Value2 as string
+                                 ?? $"C{cell.Column}";
+            object fallbackKey = ((Excel.Range)sh.Cells[cell.Row, 1]).Value2 ?? cell.Row;
+            return (tableName, fallbackKey, fallbackCol, ReadCellValueNormalized(cell));
         }
+
 
         private static object? ReadCellValueNormalized(Excel.Range cell)
         {

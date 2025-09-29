@@ -5,6 +5,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Security.Cryptography;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using Excel = Microsoft.Office.Interop.Excel;
 using MessageBox = System.Windows.Forms.MessageBox;
@@ -78,53 +79,52 @@ namespace XQLite.AddIn
             finally { XqlCommon.ReleaseCom(candidate); XqlCommon.ReleaseCom(ws); }
         }
 
-        // 컬럼 타입 → 툴팁 문자열
-        private static string ColumnTooltipFor(ColumnType ct)
+        // 메타에 있으면 메타 기반, 없으면 폴백
+        private static string ColumnTooltipFor(SheetMeta sm, string colName)
         {
-            // XqlSheet.cs의 ColumnType.ToTooltip() 재사용
-            return ct?.ToTooltip() ?? "TEXT • NULL OK";
-        }
-
-        // 이름 매칭이 안 될 때 인덱스 기반 폴백
-        private static string ColumnTooltipFallback(SheetMeta sm, int keyIndex)
-        {
-            if (sm == null || sm.Columns == null || sm.Columns.Count == 0) return "TEXT • NULL OK";
-            // Dictionary라도 .NET 최신 런타임에서 삽입순서를 유지하므로 안전한 폴백으로 사용
-            if (keyIndex >= 0 && keyIndex < sm.Columns.Count)
+            try
             {
-                var ct = sm.Columns.ElementAt(keyIndex).Value;
-                return ColumnTooltipFor(ct);
+                if (!string.IsNullOrWhiteSpace(colName) &&
+                    sm.Columns != null &&
+                    sm.Columns.TryGetValue(colName, out var ct) && ct != null)
+                {
+                    // SheetMeta.ColumnMeta가 ToTooltip()을 제공한다면 그대로 활용
+                    try { return ct.ToTooltip(); } catch { /* fall through */ }
+                    // 제공하지 않으면 최소 정보 구성 (Kind/Null/Check 등 프로젝트 모델에 맞춰 보강 가능)
+                    return $"{ct.Kind} • {(ct.Nullable ? "NULL OK" : "NOT NULL")}";
+                }
             }
-            return "TEXT • NULL OK";
+            catch { /* ignore */ }
+
+            return ColumnTooltipFallback(); // 폴백
         }
 
-        // 헤더 Range로부터 “이름 우선, 위치 폴백” 툴팁 맵 구성
-        internal static IReadOnlyDictionary<string, string> BuildHeaderTooltips(SheetMeta sm, Excel.Range header)
+        private static string ColumnTooltipFallback() => "TEXT • NULL OK";
+
+        // 헤더 범위를 돌며 i열(1-based) → 툴팁 텍스트를 만든다.
+        internal static IReadOnlyDictionary<int, string> BuildHeaderTooltips(SheetMeta sm, Excel.Range header)
         {
-            var dict = new Dictionary<string, string>(StringComparer.Ordinal);
+            var tips = new Dictionary<int, string>(capacity: Math.Max(1, header?.Columns.Count ?? 0));
+            if (header == null) return tips;
 
-            // 1) 이름 기반
-            foreach (var kv in sm.Columns)
-                dict[kv.Key] = ColumnTooltipFor(kv.Value);
-
-            // 2) 위치 기반 폴백(@1, @2, …): 이름이 없는 칸/미등록 이름 대응
-            int idx = 0;
-            foreach (Excel.Range cell in header.Cells)
+            int cols = header.Columns.Count;
+            for (int i = 1; i <= cols; i++)
             {
+                Excel.Range? h = null;
                 try
                 {
-                    var name = (cell.Value2 as string)?.Trim();
-                    if (!string.IsNullOrEmpty(name) && dict.ContainsKey(name!))
-                    {
-                        idx++;
-                        continue; // 이름 매칭이 되면 위치 폴백 불필요
-                    }
-                    dict[$"@{++idx}"] = ColumnTooltipFallback(sm, idx - 1);
+                    h = (Excel.Range)header.Cells[1, i];
+                    var colName = (h.Value2 as string)?.Trim();
+                    if (string.IsNullOrEmpty(colName))
+                        colName = XqlCommon.ColumnIndexToLetter(h.Column);
+
+                    tips[i] = ColumnTooltipFor(sm, colName!); // 아래 헬퍼 사용
                 }
-                finally { XqlCommon.ReleaseCom(cell); }
+                finally { XqlCommon.ReleaseCom(h); }
             }
-            return dict;
+            return tips;
         }
+
         public static void RefreshHeader()
         {
             var app = (Excel.Application)ExcelDnaUtil.Application;
@@ -270,38 +270,73 @@ namespace XQLite.AddIn
             return names;
         }
 
-        internal static void SetHeaderTooltips(Excel.Range header, IReadOnlyDictionary<string, string> tips)
-        {
-            int pos = 0;
-            foreach (Excel.Range cell in header.Cells)
-            {
-                try
-                {
-                    var nameKey = (cell.Value2 as string)?.Trim();
-                    var posKey = $"@{++pos}";
-                    if (!tips.TryGetValue(nameKey ?? string.Empty, out var tip))
-                        tips.TryGetValue(posKey, out tip);
-                    if (string.IsNullOrEmpty(tip)) continue;
 
-                    // 변경시에만 갱신 + 512자 절삭 + 숨김
-                    Excel.Comment? c = null;
+        private static string SafeCommentText(Excel.Comment c)
+        {
+            try { return (c.Text() ?? "").Trim(); } catch { return ""; }
+        }
+
+        // 헤더 코멘트(툴팁)를 깔끔하게 갱신: 같으면 건너뛰고, 다르면 '제자리(Text) 갱신' 우선
+        internal static void SetHeaderTooltips(Excel.Range header, IReadOnlyDictionary<int, string> tips)
+        {
+            if (header == null || tips == null || tips.Count == 0) return;
+
+            var app = (Excel.Application)header.Application;
+            bool oldSU = true, oldEv = true;
+            try
+            {
+                // 화면/이벤트 잠시 OFF → 플리커 최소화
+                try { oldSU = app.ScreenUpdating; app.ScreenUpdating = false; } catch { }
+                try { oldEv = app.EnableEvents; app.EnableEvents = false; } catch { }
+
+                int cols = header.Columns.Count;
+                for (int i = 1; i <= cols; i++)
+                {
+                    Excel.Range? cell = null; Excel.Comment? cmt = null;
                     try
                     {
-                        c = cell.Comment;
-                        var old = c is null ? null : c.Text() as string;
-                        var safe = tip.Length <= 512 ? tip : (tip.Substring(0, 509) + "...");
-                        if (!string.Equals(old?.Trim(), safe, StringComparison.Ordinal))
+                        cell = (Excel.Range)header.Cells[1, i];
+                        var text = tips.TryGetValue(i, out var t) ? t : string.Empty;
+
+                        // 비워야 하면 삭제(이미 없으면 skip)
+                        if (string.IsNullOrEmpty(text))
                         {
-                            try { c?.Delete(); } catch { }
-                            c = cell.AddComment(safe);
-                            try { if (c != null) c.Visible = false; } catch { }
+                            try { cell.Comment?.Delete(); } catch { }
+                            continue;
+                        }
+
+                        cmt = cell.Comment;
+                        if (cmt != null)
+                        {
+                            // 같다면 아무 것도 안 함(재그림 없음)
+                            var cur = SafeCommentText(cmt);
+                            if (string.Equals(cur, text, StringComparison.Ordinal)) continue;
+
+                            // 제자리 갱신 시도 → 실패하면 최후에 delete+add
+                            try { cmt.Text(text); }
+                            catch
+                            {
+                                try { cmt.Delete(); } catch { }
+                                try { cell.AddComment(text); } catch { /* ignore */ }
+                            }
+                        }
+                        else
+                        {
+                            // 없을 때만 Add(삼각형 신규 생성) → 플리커 횟수 최소화
+                            try { cell.AddComment(text); } catch { /* ignore */ }
                         }
                     }
-                    finally { XqlCommon.ReleaseCom(c); }
+                    finally { XqlCommon.ReleaseCom(cmt); XqlCommon.ReleaseCom(cell); }
                 }
-                finally { XqlCommon.ReleaseCom(cell); }
+            }
+            finally
+            {
+                // 원복은 실패해도 무시
+                try { app.EnableEvents = oldEv; } catch { }
+                try { app.ScreenUpdating = oldSU; } catch { }
             }
         }
+
 
         // 헤더 1행이 편집되면 툴팁 재적용
         public static void RefreshTooltipsIfHeaderEdited(Excel.Worksheet ws, Excel.Range target)
@@ -660,39 +695,45 @@ namespace XQLite.AddIn
                 ApplyDataValidationForHeader(ws, header, sm);
         }
 
+        // Excel 내부가 헤더를 재구성하는 타이밍을 기다렸다가 재적용(디바운스)
         private static void EnqueueReapplyHeaderUi(string sheetName, bool withValidation)
         {
+            string key = $"{sheetName}:{withValidation}";
             lock (_reapplyLock)
             {
-                if (!_reapplyPending.Add($"{sheetName}:{withValidation}"))
-                    return; // 이미 대기 중이면 또 올리지 않음
+                if (!_reapplyPending.Add(key)) return; // 이미 대기 중이면 무시
             }
 
-            ExcelAsyncUtil.QueueAsMacro(() =>
+            // 약간 기다렸다가 메인 스레드에서 일괄 재적용 → 깜빡임 최소
+            Task.Run(async () =>
             {
-                Excel.Worksheet? ws2 = null; Excel.Range? h2 = null;
-                try
-                {
-                    var app2 = (Excel.Application)ExcelDnaUtil.Application;
-                    ws2 = XqlSheet.FindWorksheet(app2, sheetName);
-                    if (ws2 == null) return;
+                await Task.Delay(120).ConfigureAwait(false); // 80~150ms 권장
 
-                    if (!XqlSheet.TryGetHeaderMarker(ws2, out h2))
-                        h2 = XqlSheet.GetHeaderRange(ws2);
-                    if (h2 == null) return;
-
-                    var sm = XqlAddIn.Sheet!.GetOrCreateSheet(sheetName);
-                    ApplyHeaderUi(ws2, h2, sm, withValidation); // ← 단일 진입점
-                }
-                catch { /* 무음 */ }
-                finally
+                ExcelAsyncUtil.QueueAsMacro(() =>
                 {
-                    XqlCommon.ReleaseCom(h2); XqlCommon.ReleaseCom(ws2);
-                    lock (_reapplyLock) { _reapplyPending.Remove($"{sheetName}:{withValidation}"); }
-                }
+                    Excel.Worksheet? ws2 = null; Excel.Range? h2 = null;
+                    try
+                    {
+                        var app2 = (Excel.Application)ExcelDnaUtil.Application;
+                        ws2 = XqlSheet.FindWorksheet(app2, sheetName);
+                        if (ws2 == null) return;
+
+                        if (!XqlSheet.TryGetHeaderMarker(ws2, out h2))
+                            h2 = XqlSheet.GetHeaderRange(ws2);
+                        if (h2 == null) return;
+
+                        var sm = XqlAddIn.Sheet!.GetOrCreateSheet(sheetName);
+                        ApplyHeaderUi(ws2, h2, sm, withValidation); // 툴팁+보더(+검증)
+                    }
+                    finally
+                    {
+                        XqlCommon.ReleaseCom(h2);
+                        XqlCommon.ReleaseCom(ws2);
+                        lock (_reapplyLock) { _reapplyPending.Remove(key); }
+                    }
+                });
             });
         }
-
 
         // (Option) JSON/특수 타입 보조 검사 – 메시지 박스 직접 띄우기
         // Worksheet_Change if (XqlSheet.TryGetSheet(ws.Name, out var sm)) XqlSheetView.EnforceTypeOnChange(ws, target, sm);

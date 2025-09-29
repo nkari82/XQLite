@@ -3,6 +3,7 @@ using Microsoft.Office.Interop.Excel;
 using Newtonsoft.Json.Linq;
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
@@ -205,21 +206,19 @@ namespace XQLite.AddIn
                 finally { XqlCommon.ReleaseCom(ws2); }
             }
 
+            Excel.ListObject? match = null;
             foreach (Excel.ListObject? lo in ws.ListObjects)
             {
                 if (lo is null) continue;
-                try
+                var qualified = $"{ws.Name}.{lo.Name}";
+                if (string.Equals(qualified, tableNameOrQualified, StringComparison.Ordinal))
                 {
-                    var qualified = $"{ws.Name}.{lo.Name}";
-                    if (string.Equals(qualified, tableNameOrQualified, StringComparison.Ordinal))
-                        return lo; // ★ 선택된 객체 해제 금지(호출자 책임)
+                    match = lo;              // ← 매치된 것은 반환(해제 금지)
+                    break;
                 }
-                finally
-                {
-                    // 매치됐으면 반환되므로 여기 오지 않음. 매치 실패건만 해제.
-                    XqlCommon.ReleaseCom(lo);
-                }
+                XqlCommon.ReleaseCom(lo);    // 매치 실패건만 해제
             }
+            if (match != null) return match;
 
             return null;
         }
@@ -567,81 +566,104 @@ namespace XQLite.AddIn
 
         internal static string HeaderNameOf(string sheetName) => $"_XQL_HDR_{sheetName}";
 
-        // 1) 조회: TryGetHeaderMarker — ws.Names + wb.Names 모두 검색
         internal static bool TryGetHeaderMarker(Excel.Worksheet ws, out Excel.Range headerRange)
         {
             headerRange = null!;
-            Excel.Workbook? wb = null; Excel.Name? nm = null;
+            Excel.Workbook? wb = null;
+            Excel.Names? wbNames = null, wsNames = null;
+            Excel.Name? nm = null;
             try
             {
                 var key = HeaderNameOf(ws.Name);
 
-                // (1) Workbook 범위에서 먼저 찾기
-                try
-                {
-                    wb = (Excel.Workbook)ws.Parent;
-                    nm = wb.Names.Item(key);
-                }
-                catch { nm = null; }
+                // 1) Workbook 범위 먼저
+                wb = (Excel.Workbook)ws.Parent;
+                wbNames = wb.Names;
+                nm = TryFindName(wbNames, key);
 
-                // (2) 없으면 Worksheet 범위에서 찾기
+                // 2) 없으면 Worksheet 범위
                 if (nm == null)
                 {
-                    try { nm = ws.Names.Item(key); } catch { nm = null; }
+                    wsNames = ws.Names;
+                    nm = TryFindName(wsNames, key);
                 }
 
                 if (nm == null) return false;
 
-                var rg = nm.RefersToRange;
+                Excel.Range? rg = null;
+                try { rg = nm.RefersToRange; }     // 일부 이름은 RefersToRange 접근 시 예외 → null 처리
+                catch { rg = null; }
                 if (rg == null) return false;
 
-                headerRange = rg;
+                headerRange = rg;                   // 반환: 호출자가 ReleaseCom 해야 함
                 return true;
             }
             catch { return false; }
-            finally { XqlCommon.ReleaseCom(nm); XqlCommon.ReleaseCom(wb); }
+            finally
+            {
+                XqlCommon.ReleaseCom(nm);
+                XqlCommon.ReleaseCom(wsNames);
+                XqlCommon.ReleaseCom(wbNames);
+                XqlCommon.ReleaseCom(wb);
+            }
         }
 
-        // 2) 생성/이동: SetHeaderMarker — workbook 범위로 통일
         internal static void SetHeaderMarker(Excel.Worksheet ws, Excel.Range header)
         {
-            Excel.Workbook? wb = null; Excel.Name? nm = null;
+            Excel.Workbook? wb = null;
+            Excel.Names? wbNames = null, wsNames = null;
+            Excel.Name? nm = null;
             try
             {
                 var key = HeaderNameOf(ws.Name);
 
-                // 기존 것(양쪽 범위 모두) 제거
-                try { ws.Names.Item(key)?.Delete(); } catch { }
-                try { wb = (Excel.Workbook)ws.Parent; wb.Names.Item(key)?.Delete(); } catch { }
+                wb = (Excel.Workbook)ws.Parent;
+                wbNames = wb.Names;
+                wsNames = ws.Names;
 
-                if (wb == null) wb = (Excel.Workbook)ws.Parent;
+                // 기존 것(양쪽 범위) 안전 삭제
+                TryDeleteName(wsNames, key);
+                TryDeleteName(wbNames, key);
 
-                // RefersTo 수식 만들기: ='<SheetName>'!$A$1:$D$1
-                var sheetName = ws.Name.Replace("'", "''"); // ' 이중화
-                var addr = header.Address[RowAbsolute: true, ColumnAbsolute: true,
-                                          ReferenceStyle: Excel.XlReferenceStyle.xlA1,
-                                          External: false];
+                // RefersTo: ='<시트명>'!$A$1:$D$1  (시트명 홑따옴표 이스케이프)
+                var sheetName = ws.Name.Replace("'", "''");
+                var addr = header.Address[true, true, Excel.XlReferenceStyle.xlA1, false];
                 var refersTo = $"='{sheetName}'!{addr}";
 
-                nm = wb.Names.Add(Name: key, RefersTo: refersTo);
+                nm = wbNames.Add(Name: key, RefersTo: refersTo);
                 try { nm.Visible = false; } catch { }
             }
-            finally { XqlCommon.ReleaseCom(nm); XqlCommon.ReleaseCom(wb); }
+            finally
+            {
+                XqlCommon.ReleaseCom(nm);
+                XqlCommon.ReleaseCom(wsNames);
+                XqlCommon.ReleaseCom(wbNames);
+                XqlCommon.ReleaseCom(wb);
+            }
         }
 
-        // 3) 삭제: ClearHeaderMarker — ws / wb 양쪽 모두 삭제
         internal static void ClearHeaderMarker(Excel.Worksheet ws)
         {
             Excel.Workbook? wb = null;
+            Excel.Names? wbNames = null, wsNames = null;
             try
             {
                 var key = HeaderNameOf(ws.Name);
-                try { ws.Names.Item(key)?.Delete(); } catch { }
-                try { wb = (Excel.Workbook)ws.Parent; wb.Names.Item(key)?.Delete(); } catch { }
-            }
-            finally { XqlCommon.ReleaseCom(wb); }
-        }
+                wb = (Excel.Workbook)ws.Parent;
+                wbNames = wb.Names;
+                wsNames = ws.Names;
 
+                TryDeleteName(wsNames, key);
+                TryDeleteName(wbNames, key);
+            }
+            catch { /* ignore */ }
+            finally
+            {
+                XqlCommon.ReleaseCom(wsNames);
+                XqlCommon.ReleaseCom(wbNames);
+                XqlCommon.ReleaseCom(wb);
+            }
+        }
 
         internal static bool IsSameRange(Excel.Range a, Excel.Range b)
             => a.Worksheet.Name == b.Worksheet.Name && a.Row == b.Row && a.Column == b.Column
@@ -656,6 +678,40 @@ namespace XQLite.AddIn
                              System.Globalization.CultureInfo.InvariantCulture, out var v)) return v;
             return def;
         }
+
+        // XqlSheet.cs 내부(클래스 private static 영역)
+        private static Excel.Name? TryFindName(Excel.Names names, string key)
+        {
+            Excel.Name? hit = null;
+            foreach (Excel.Name n in names)
+            {
+                try
+                {
+                    var nm = n.Name ?? string.Empty;
+                    var nml = n.NameLocal ?? string.Empty;
+                    if (nm.Equals(key, StringComparison.OrdinalIgnoreCase) ||
+                        nml.Equals(key, StringComparison.OrdinalIgnoreCase))
+                    {
+                        hit = n;                 // 매치된 것은 반환(해제 금지, 호출자 소유)
+                        continue;
+                    }
+                }
+                finally
+                {
+                    if (!object.ReferenceEquals(hit, n)) XqlCommon.ReleaseCom(n); // 매치 실패건만 해제
+                }
+            }
+            return hit;
+        }
+
+        private static void TryDeleteName(Excel.Names names, string key)
+        {
+            var nm = TryFindName(names, key);
+            try { nm?.Delete(); }
+            catch { /* ignore */ }
+            finally { XqlCommon.ReleaseCom(nm); }
+        }
+
     }
 
     // ───────────────────────── Models (같은 파일에 유지)

@@ -39,6 +39,7 @@ namespace XQLite.AddIn
           <button id='btnInsertHeader' label='헤더 삽입' size='large'
                   onAction='OnInsertHeader' imageMso='TableInsertDialog'
                   screentip='메타 헤더 삽입'
+                  getEnabled='GetEnabled_InsertHeader'
                   supertip='선택 영역을 표 헤더로 지정하고, 컬럼 메타·검증·툴팁을 설치합니다.'/>
           <button id='btnRefreshHeader' label='새로고침'
                   onAction='OnRefreshHeader' imageMso='Refresh'
@@ -116,6 +117,18 @@ namespace XQLite.AddIn
 
         // Backup 모듈이 준비돼야 Export/Recover/Diag 활성화
         public bool GetEnabled_Backup(IRibbonControl _) => XqlAddIn.Backup != null;
+
+        public bool GetEnabled_InsertHeader(IRibbonControl _)
+        {
+            try
+            {
+                var app = (Excel.Application)ExcelDnaUtil.Application;
+                if (app.ActiveSheet is not Excel.Worksheet ws) return false;
+                // 헤더가 이미 있으면 비활성화
+                return !XqlSheet.TryGetHeaderMarker(ws, out var _);
+            }
+            catch { return true; } // 오류 시에는 일단 노출
+        }
 
         // ───────────────────────── General ─────────────────────────
         public void OnConfig(IRibbonControl _)
