@@ -91,7 +91,9 @@ namespace XQLite.AddIn
                     finally { ReleaseCom(box); }
 
                     // 표준 컬럼 폭
-                    ws.Columns["A:C"].AutoFit();
+#pragma warning disable CS8602 // null 가능 참조에 대한 역참조입니다.
+                    (ws.Columns["A:C"] as Excel.Range).AutoFit();
+#pragma warning restore CS8602 // null 가능 참조에 대한 역참조입니다.
 
                     // 내부 함수
                     static void Put(Excel.Worksheet w, int r0, int c0, string text, bool bold = false, int? size = null)
