@@ -245,9 +245,10 @@ namespace XQLite.AddIn
         public async Task<byte[]?> TryExportDatabase(CancellationToken ct = default)
         {
             var resp = await _http.SendQueryAsync<JObject>(new GraphQLRequest { Query = Q_EXPORT_DB }, ct).ConfigureAwait(false);
-            var s = resp.Data?["exportDatabase"]?.ToString();
+            var s = (string?)resp.Data?["exportDatabase"];
             if (string.IsNullOrWhiteSpace(s)) return null;
-            try { return Convert.FromBase64String(s); } catch { return null; }
+            try { return Convert.FromBase64String(s); }
+            catch { return null; }
         }
 
         // ── Presence / Recover ───────────────────────────────────────────────

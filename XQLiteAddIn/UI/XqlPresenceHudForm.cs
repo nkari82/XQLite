@@ -45,40 +45,46 @@ namespace XQLite.AddIn
 
         private async Task RefreshList()
         {
-            // Backend null 가드
-            if (XqlAddIn.Backend is not IXqlBackend be)
-                return;
+            if (XqlAddIn.Backend is not IXqlBackend be) return;
 
             if (Interlocked.Exchange(ref _refreshing, 1) == 1) return;
 
+            CancellationTokenSource? prev = _cts;
             _cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-
-            var list = await be.FetchPresence(_cts.Token).ConfigureAwait(false);
-            if (list == null) return;
-
-            // UI 갱신
-            if (IsHandleCreated)
+            try
             {
-                BeginInvoke(new Action(() =>
-                {
-                    _lv.BeginUpdate();
-                    try
-                    {
-                        _lv.Items.Clear();
-                        foreach (var p in list)
-                        {
-                            var when = p.updated_at ?? "";
-                            var where = string.IsNullOrWhiteSpace(p.sheet) && string.IsNullOrWhiteSpace(p.cell)
-                                        ? ""
-                                        : $"{p.sheet}/{p.cell}";
-                            _lv.Items.Add(new ListViewItem(new[] { p.nickname ?? "", where, when }));
-                        }
-                    }
-                    finally { _lv.EndUpdate(); }
-                }));
-            }
+                prev?.Dispose(); // 이전 CTS 정리
 
-            Interlocked.Exchange(ref _refreshing, 0);
+                var list = await be.FetchPresence(_cts.Token).ConfigureAwait(false);
+
+                // UI 갱신
+                if (IsHandleCreated && !IsDisposed && list != null)
+                {
+                    BeginInvoke(new Action(() =>
+                    {
+                        if (IsDisposed) return;
+                        _lv.BeginUpdate();
+                        try
+                        {
+                            _lv.Items.Clear();
+                            foreach (var p in list)
+                            {
+                                var when = p.updated_at ?? "";
+                                var where = string.IsNullOrWhiteSpace(p.sheet) && string.IsNullOrWhiteSpace(p.cell)
+                                            ? ""
+                                            : $"{p.sheet}/{p.cell}";
+                                _lv.Items.Add(new ListViewItem(new[] { p.nickname ?? "", where, when }));
+                            }
+                        }
+                        finally { _lv.EndUpdate(); }
+                    }));
+                }
+            }
+            catch { /* 네트워크 일시 오류 무음 */ }
+            finally
+            {
+                Interlocked.Exchange(ref _refreshing, 0);
+            }
         }
 
     }

@@ -73,7 +73,7 @@ namespace XQLite.AddIn
                 _collab = new XqlCollab(_backend, XqlConfig.Nickname, heartbeatSec: XqlConfig.HeartbeatSec); // 내부 타이머 운용
 
                 //    - XqlBackup: 진단/복구/풀덤프
-                _backup = new XqlBackup(_backend, _sheet, XqlConfig.Endpoint, XqlConfig.ApiKey); // 현재 시그니처 기준
+                _backup = new XqlBackup(_backend, _sheet); // 현재 시그니처 기준
 
                 // 3) Excel 이벤트 훅
                 var app = (Excel.Application)ExcelDnaUtil.Application;

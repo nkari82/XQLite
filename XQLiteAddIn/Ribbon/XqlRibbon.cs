@@ -39,7 +39,6 @@ namespace XQLite.AddIn
           <button id='btnInsertHeader' label='헤더 삽입' size='large'
                   onAction='OnInsertHeader' imageMso='TableInsertDialog'
                   screentip='메타 헤더 삽입'
-                  getEnabled='GetEnabled_InsertHeader'
                   supertip='선택 영역을 표 헤더로 지정하고, 컬럼 메타·검증·툴팁을 설치합니다.'/>
           <button id='btnRefreshHeader' label='새로고침'
                   onAction='OnRefreshHeader' imageMso='Refresh'
@@ -92,17 +91,14 @@ namespace XQLite.AddIn
         <group id='grpBackup' label='백업/복구/진단'>
           <button id='btnRecover'   label='복구' size='large'
                   onAction='OnRecover' imageMso='FileCompactAndRepairDatabase'
-                  getEnabled='GetEnabled_Backup'
                   screentip='복구'
                   supertip='엑셀 파일을 DB 원본으로 간주하여 서버를 재구성합니다.'/>
           <button id='btnExport'    label='내보내기'
                   onAction='OnExport' imageMso='ExportTextFile'
-                  getEnabled='GetEnabled_Backup'
                   screentip='Export'
                   supertip='DB와 메타/로그를 zip으로 내보냅니다.'/>
           <button id='btnDiag'      label='진단 내보내기'
                   onAction='OnDiag' imageMso='FileSaveAs'
-                  getEnabled='GetEnabled_Backup'
                   screentip='Diagnostics Export'
                   supertip='문제 분석을 위한 진단 패키지를 zip으로 내보냅니다.'/>
         </group>
@@ -114,21 +110,6 @@ namespace XQLite.AddIn
 
         // ───────────────────────── Ribbon lifecycle / dynamic enable ─────────────────────────
         public void OnRibbonLoad(IRibbonUI ribbon) => _ribbon = ribbon;
-
-        // Backup 모듈이 준비돼야 Export/Recover/Diag 활성화
-        public bool GetEnabled_Backup(IRibbonControl _) => XqlAddIn.Backup != null;
-
-        public bool GetEnabled_InsertHeader(IRibbonControl _)
-        {
-            try
-            {
-                var app = (Excel.Application)ExcelDnaUtil.Application;
-                if (app.ActiveSheet is not Excel.Worksheet ws) return false;
-                // 헤더가 이미 있으면 비활성화
-                return !XqlSheet.TryGetHeaderMarker(ws, out var _);
-            }
-            catch { return true; } // 오류 시에는 일단 노출
-        }
 
         // ───────────────────────── General ─────────────────────────
         public void OnConfig(IRibbonControl _)

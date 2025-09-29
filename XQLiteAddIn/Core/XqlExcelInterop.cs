@@ -70,7 +70,6 @@ namespace XQLite.AddIn
         }
 
         // ========= 명령(리본/메뉴) =========
-
         public void Cmd_CommitSync()
         {
             // 서버에서 증분 Pull → Excel 반영은 XqlSync가 수행 (머지/충돌 로직 포함)
@@ -178,7 +177,7 @@ namespace XQLite.AddIn
             if (vr.IsOk)
             {
                 SafeClearComment(cell);
-                XqlCommon.TryClearInvalidMark(cell); // ← 추가: 연분홍 제거
+                XqlSheetView.TryClearInvalidMark(cell); // ← 추가: 연분홍 제거
                 return;
             }
 
@@ -216,8 +215,8 @@ namespace XQLite.AddIn
                 if (isDataCell)
                 {
                     // 로그 + 에러 하이라이트
-                    XqlCommon.LogWarn(vr.Message, ws.Name, cell.Address[false, false]);
-                    XqlCommon.MarkInvalidCell(cell);
+                    XqlLog.Warn(vr.Message, ws.Name, cell.Address[false, false]);
+                    XqlSheetView.MarkInvalidCell(cell);
 
                     if (ShouldWarnNow())
                     {

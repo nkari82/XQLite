@@ -89,7 +89,7 @@ namespace XQLite.AddIn
             catch (Exception ex)
             {
                 // 실패는 무음 처리(Excel 안정성 우선), 로그 시트에만 남김
-                XqlCommon.LogWarn("ExportDiagnostics failed: " + ex.Message);
+                XqlLog.Warn("ExportDiagnostics failed: " + ex.Message);
             }
         }
 
@@ -105,7 +105,7 @@ namespace XQLite.AddIn
                 var app = (Excel.Application)ExcelDnaUtil.Application;
 
                 // 요약 집계 시작
-                XqlCommon.RecoverSummaryBegin();
+                XqlSheetView.RecoverSummaryBegin();
 
                 foreach (var sheetName in GetWorkbookSheets(app))
                 {
@@ -121,16 +121,16 @@ namespace XQLite.AddIn
                         var res = await _backend.UpsertCells(chunk).ConfigureAwait(false);
                         // 충돌이 있으면 Conflict 워크시트에 적재
                         if (res?.Conflicts != null && res.Conflicts.Count > 0)
-                            XqlCommon.AppendConflicts(res.Conflicts.Cast<object>());
+                            XqlSheetView.AppendConflicts(res.Conflicts.Cast<object>());
                         // 요약 집계(행/셀 기준은 운영 목적에 맞춰 조정 가능. 여기선 '셀 건수'로 반영)
                         var conflicts = res?.Conflicts?.Count ?? 0;
                         var errors = res?.Errors?.Count ?? 0;
                         var affected = chunk.Count; // 업서트한 셀 개수
-                        XqlCommon.RecoverSummaryPush(table, affected, conflicts, errors);
+                        XqlSheetView.RecoverSummaryPush(table, affected, conflicts, errors);
                     }
                 }
 
-                XqlCommon.RecoverSummaryShow();
+                XqlSheetView.RecoverSummaryShow();
             }
             catch { /* 무음 실패 (UI는 Inspector/Diag로 확인) */ }
         }

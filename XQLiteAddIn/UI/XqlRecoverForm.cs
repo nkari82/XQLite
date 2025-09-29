@@ -136,9 +136,14 @@ namespace XQLite.AddIn
 
         private void UpdateUi(int cur, int total, string text)
         {
-            if (total <= 0) total = 1;
-            int pct = Math.Min(100, Math.Max(0, (int)(100.0 * cur / total)));
-            pb.Value = pct; lbl.Text = text;
+            if (!IsHandleCreated || IsDisposed) return;
+            BeginInvoke(new Action(() =>
+            {
+                if (IsDisposed) return;
+                if (total <= 0) total = 1;
+                int pct = Math.Min(100, Math.Max(0, (int)(100.0 * cur / total)));
+                pb.Value = pct; lbl.Text = text;
+            }));
         }
 
         // ─────────────────────────────────────────────────────────

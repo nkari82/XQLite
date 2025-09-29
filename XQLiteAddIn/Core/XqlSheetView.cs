@@ -2,6 +2,9 @@
 using ExcelDna.Integration;
 using System;
 using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+using System.Reflection;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using Excel = Microsoft.Office.Interop.Excel;
@@ -20,6 +23,12 @@ namespace XQLite.AddIn
         // ── [NEW] 지연 재적용(QueueAsMacro) + 시트별 중복 큐잉 제거
         private static readonly object _reapplyLock = new object();
         private static readonly HashSet<string> _reapplyPending = new HashSet<string>(StringComparer.Ordinal);
+
+
+        private static readonly object _sumLock = new();
+        private static HashSet<string> _sumTables = new(StringComparer.Ordinal);
+        private static int _sumAffected, _sumConflicts, _sumErrors, _sumBatches;
+        private static long _sumStartTicks;
 
 
         // ───────────────────────── Public API (Ribbon에서 호출)
@@ -450,6 +459,284 @@ namespace XQLite.AddIn
             }
         }
 
+        // ─────────────────────────────────────────────────────────────────
+        //  MarkTouchedCell: 서버 패치/중요 이벤트가 닿은 셀을 은은히 표시
+        // ─────────────────────────────────────────────────────────────────
+        public static void MarkTouchedCell(Excel.Range rg)
+        {
+            if (rg == null) return;
+            try
+            {
+                var interior = rg.Interior;
+                interior.Pattern = Excel.XlPattern.xlPatternSolid;
+                // 연녹색 (0xCCFFCC) — 가독성 좋고 과하지 않음
+                interior.Color = 0x00CCFFCC;
+            }
+            catch { /* ignore */ }
+        }
+
+        // 검증 실패 등 “주의” 셀 표시 (연한 붉은색)
+        public static void MarkInvalidCell(Excel.Range rg)
+        {
+            if (rg == null) return;
+            try
+            {
+                var interior = rg.Interior;
+                interior.Pattern = Excel.XlPattern.xlPatternSolid;
+                // 연분홍 (OLE BGR): 0xCCCCFF
+                interior.Color = 0x00CCCCFF;
+            }
+            catch { /* ignore */ }
+        }
+
+        // === 새로 추가: 우리 마크만 조건부 해제 ===
+        public static void TryClearInvalidMark(Excel.Range rg)
+        {
+            TryClearColor(rg, 0x00CCCCFF); // 연분홍
+        }
+        public static void TryClearTouchedMark(Excel.Range rg)
+        {
+            TryClearColor(rg, 0x00CCFFCC); // 연녹색
+        }
+        private static void TryClearColor(Excel.Range rg, int colorBgr)
+        {
+            if (rg == null) return;
+            try
+            {
+                var it = rg.Interior;
+                // Color는 Variant로 오므로 안전 변환
+                int cur = Convert.ToInt32(it.Color);
+                if (cur == colorBgr)
+                    it.ColorIndex = Excel.XlColorIndex.xlColorIndexNone; // 사용자 색 보존
+            }
+            catch { /* ignore */ }
+        }
+
+
+        public static void RecoverSummaryBegin()
+        {
+            lock (_sumLock)
+            {
+                _sumTables = new HashSet<string>(StringComparer.Ordinal);
+                _sumAffected = _sumConflicts = _sumErrors = _sumBatches = 0;
+                _sumStartTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+            }
+        }
+
+        public static void RecoverSummaryPush(string table, int affected, int conflicts, int errors)
+        {
+            lock (_sumLock)
+            {
+                _sumTables.Add(table ?? "");
+                _sumAffected += Math.Max(0, affected);
+                _sumConflicts += Math.Max(0, conflicts);
+                _sumErrors += Math.Max(0, errors);
+                _sumBatches++;
+            }
+        }
+
+        public static void RecoverSummaryShow(string? title = "Recover Summary")
+        {
+            ExcelAsyncUtil.QueueAsMacro(() =>
+            {
+                Excel.Application app = (Excel.Application)ExcelDnaUtil.Application;
+                Excel.Workbook? wb = null; Excel.Worksheet? ws = null;
+                Excel.Range? r = null;
+                try
+                {
+                    wb = app.ActiveWorkbook; if (wb == null) return;
+                    ws = FindOrCreateSheet(wb, "_XQL_Summary");
+
+                    // 시트 초기화(카드 영역만 깔끔하게)
+                    ws.Cells.ClearContents();
+                    ws.Cells.ClearFormats();
+
+                    int tables = _sumTables.Count;
+                    double elapsedMs = TicksToMs(System.Diagnostics.Stopwatch.GetTimestamp() - _sumStartTicks);
+
+                    // 카드 렌더
+                    Put(ws, 1, 1, title!, bold: true, size: 16);
+                    Put(ws, 3, 1, "Tables");
+                    Put(ws, 3, 2, tables.ToString());
+                    Put(ws, 4, 1, "Batches");
+                    Put(ws, 4, 2, _sumBatches.ToString());
+                    Put(ws, 5, 1, "Affected Rows");
+                    Put(ws, 5, 2, _sumAffected.ToString());
+                    Put(ws, 6, 1, "Conflicts");
+                    Put(ws, 6, 2, _sumConflicts.ToString());
+                    Put(ws, 7, 1, "Errors");
+                    Put(ws, 7, 2, _sumErrors.ToString());
+                    Put(ws, 8, 1, "Elapsed (ms)");
+                    Put(ws, 8, 2, elapsedMs.ToString("0"));
+
+                    // 색상/강조
+                    var box = ws.Range[ws.Cells[1, 1], ws.Cells[9, 3]];
+                    try
+                    {
+                        var interior = box.Interior;
+                        interior.Pattern = Excel.XlPattern.xlPatternSolid;
+                        interior.Color = 0x00F0F0F0;
+                        box.Borders.LineStyle = Excel.XlLineStyle.xlContinuous;
+                    }
+                    catch { }
+                    finally { XqlCommon.ReleaseCom(box); }
+
+                    // 표준 컬럼 폭
+#pragma warning disable CS8602 // null 가능 참조에 대한 역참조입니다.
+                    (ws.Columns["A:C"] as Excel.Range).AutoFit();
+#pragma warning restore CS8602 // null 가능 참조에 대한 역참조입니다.
+
+                    // 내부 함수
+                    static void Put(Excel.Worksheet w, int r0, int c0, string text, bool bold = false, int? size = null)
+                    {
+                        var cell = (Excel.Range)w.Cells[r0, c0];
+                        try
+                        {
+                            cell.Value2 = text;
+                            if (bold) cell.Font.Bold = true;
+                            if (size.HasValue) cell.Font.Size = size.Value;
+                        }
+                        finally { XqlCommon.ReleaseCom(cell); }
+                    }
+                }
+                catch { }
+                finally { XqlCommon.ReleaseCom(r); XqlCommon.ReleaseCom(ws); XqlCommon.ReleaseCom(wb); }
+            });
+
+            static double TicksToMs(long ticks)
+            {
+                double freq = System.Diagnostics.Stopwatch.Frequency;
+                return ticks * 1000.0 / freq;
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // Conflict 워크시트에 행 추가 (Conflicts shape가 달라도 Reflection로 안전파싱)
+        // 컬럼: Timestamp | Table | RowKey | Column | Local | Server | Type | Message | Sheet | Address
+        // ─────────────────────────────────────────────────────────────
+        public static void AppendConflicts(IEnumerable<object>? conflicts)
+        {
+            if (conflicts == null) return;
+            var items = conflicts.ToList();
+            if (items.Count == 0) return;
+
+            ExcelAsyncUtil.QueueAsMacro(() =>
+            {
+                Excel.Application app = (Excel.Application)ExcelDnaUtil.Application;
+                Excel.Workbook? wb = null; Excel.Worksheet? ws = null;
+                Excel.Range? ur = null, row = null;
+                try
+                {
+                    wb = app.ActiveWorkbook;
+                    if (wb == null) return;
+                    ws = FindOrCreateSheet(wb, "_XQL_Conflicts");
+
+                    // 헤더 1회 보장
+                    ur = ws.UsedRange as Excel.Range;
+                    bool needHeader = (ur?.Cells?.Count ?? 0) <= 1 || ((ws.Cells[1, 1] as Excel.Range)?.Value2 == null);
+                    XqlCommon.ReleaseCom(ur); ur = null;
+                    if (needHeader)
+                    {
+                        string[] headers = { "Timestamp", "Table", "RowKey", "Column", "Local", "Server", "Type", "Message", "Sheet", "Address" };
+                        for (int i = 0; i < headers.Length; i++)
+                            (ws.Cells[1, i + 1] as Excel.Range)!.Value2 = headers[i];
+                        // 간단 오토필터
+                        Excel.Range hdr = ws.Range[ws.Cells[1, 1], ws.Cells[1, headers.Length]];
+                        try { ws.ListObjects.Add(Excel.XlListObjectSourceType.xlSrcRange, hdr, Type.Missing, Excel.XlYesNoGuess.xlYes); } catch { }
+                        XqlCommon.ReleaseCom(hdr);
+                    }
+
+                    // 현재 마지막 행
+                    ur = ws.UsedRange as Excel.Range;
+                    int last = (ur?.Row ?? 1) + ((ur?.Rows?.Count ?? 1) - 1);
+                    XqlCommon.ReleaseCom(ur); ur = null;
+
+                    foreach (var cf in items)
+                    {
+                        int next = Math.Max(2, last + 1);
+                        row = ws.Range[ws.Cells[next, 1], ws.Cells[next, 10]];
+
+                        string ts = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff");
+                        string tbl = Prop(cf, "Table");
+                        string rk = Prop(cf, "RowKey");
+                        string col = Prop(cf, "Column");
+                        string loc = Prop(cf, "Local") is string ? Prop(cf, "Local") : ToStr(PropObj(cf, "Local"));
+                        string srv = Prop(cf, "Server") is string ? Prop(cf, "Server") : ToStr(PropObj(cf, "Server"));
+                        string typ = Prop(cf, "Type");
+                        string msg = Prop(cf, "Message");
+                        string sh = Prop(cf, "Sheet");
+                        string addr = Prop(cf, "Address");
+
+                        // 값 채우기
+#pragma warning disable CS8602 // null 가능 참조에 대한 역참조입니다.
+                        (row.Cells[1, 1] as Excel.Range).Value2 = ts;
+                        (row.Cells[1, 2] as Excel.Range).Value2 = tbl;
+                        (row.Cells[1, 3] as Excel.Range).Value2 = rk;
+                        (row.Cells[1, 4] as Excel.Range).Value2 = col;
+                        (row.Cells[1, 5] as Excel.Range).Value2 = loc;
+                        (row.Cells[1, 6] as Excel.Range).Value2 = srv;
+                        (row.Cells[1, 7] as Excel.Range).Value2 = typ;
+                        (row.Cells[1, 8] as Excel.Range).Value2 = msg;
+                        (row.Cells[1, 9] as Excel.Range).Value2 = sh;
+                        (row.Cells[1, 10] as Excel.Range).Value2 = addr;
+#pragma warning restore CS8602 // null 가능 참조에 대한 역참조입니다.
+
+                        // 약한 색 (주의 = 연분홍)
+                        try
+                        {
+                            var interior = row.Interior;
+                            interior.Pattern = Excel.XlPattern.xlPatternSolid;
+                            interior.Color = 0x00CCCCFF;
+                        }
+                        catch { }
+
+                        // 대상 셀 하이퍼링크 (가능할 때)
+                        if (!string.IsNullOrWhiteSpace(sh) && !string.IsNullOrWhiteSpace(addr))
+                        {
+                            try
+                            {
+                                string subAddr = $"'{sh.Replace("'", "''")}'!{addr}";
+                                ws.Hyperlinks.Add(Anchor: row.Cells[1, 10], Address: "", SubAddress: subAddr, TextToDisplay: addr);
+                            }
+                            catch { }
+                        }
+
+                        last = next;
+                        XqlCommon.ReleaseCom(row); row = null;
+                    }
+                }
+                catch { }
+                finally
+                {
+                    XqlCommon.ReleaseCom(row); XqlCommon.ReleaseCom(ur); XqlCommon.ReleaseCom(ws); XqlCommon.ReleaseCom(wb);
+                }
+            });
+
+            // —— 로컬 헬퍼
+            static string Prop(object o, string name)
+                => Convert.ToString(PropObj(o, name), CultureInfo.InvariantCulture) ?? "";
+            static object? PropObj(object o, string name)
+                => o.GetType().GetProperty(name, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase)?.GetValue(o);
+            static string ToStr(object? v)
+                => Convert.ToString(v, CultureInfo.InvariantCulture) ?? "";
+        }
+
+
+        // Private
+
+        private static Excel.Worksheet FindOrCreateSheet(Excel.Workbook wb, string name)
+        {
+            foreach (Excel.Worksheet s in wb.Worksheets)
+            {
+                try { if (string.Equals(s.Name, name, StringComparison.Ordinal)) return s; }
+                finally { XqlCommon.ReleaseCom(s); }
+            }
+            var created = (Excel.Worksheet)wb.Worksheets.Add();
+            created.Name = name;
+            created.Move(After: wb.Worksheets[wb.Worksheets.Count]);
+            return created;
+        }
+
         private static void ApplyHeaderOutlineBorder(Excel.Range header)
         {
             Excel.Borders? bs = null;
@@ -533,7 +820,7 @@ namespace XQLite.AddIn
                         // 우리 마크(연녹색/연분홍)만 조건부로 제거
                         foreach (Excel.Range c in col.Cells)
                         {
-                            try { XqlCommon.TryClearInvalidMark(c); XqlCommon.TryClearTouchedMark(c); }
+                            try { XqlSheetView.TryClearInvalidMark(c); XqlSheetView.TryClearTouchedMark(c); }
                             finally { XqlCommon.ReleaseCom(c); }
                         }
 
@@ -564,7 +851,7 @@ namespace XQLite.AddIn
             Excel.Validation? v = null;
             try
             {
-                // 빈/다중 영역은 스킵 (Excel DV가 잘 안 먹거나 예외 발생)
+                // 빈/다중 영역 스킵 (DV 예외 방지)
                 try
                 {
                     if (rng == null) return;
@@ -573,20 +860,32 @@ namespace XQLite.AddIn
                 }
                 catch { /* ignore */ }
 
-                // 기존 규칙 제거 (잔존/중복으로 Add 실패 방지)
+                // 기존 규칙 제거(잔존 규칙 때문에 Add 실패 방지)
                 try { rng.Validation.Delete(); } catch { }
 
-                bool added = false;
                 v = rng.Validation;
+
+                bool added = false;
+
+                // 지역설정: 리스트 구분자(, 또는 ;)
+                string listSep = ",";
+                try
+                {
+                    var app = (Excel.Application)rng.Application;
+                    var sepObj = app.International[Excel.XlApplicationInternational.xlListSeparator];
+                    if (sepObj is string s && !string.IsNullOrEmpty(s)) listSep = s;
+                }
+                catch { /* fallback , */ }
 
                 switch (kind)
                 {
                     case ColumnKind.Int:
+                        // 안전한 32bit 정수 범위(문자열로 전달해도 OK)
                         v.Add(
                             Excel.XlDVType.xlValidateWholeNumber,
                             Excel.XlDVAlertStyle.xlValidAlertStop,
                             Excel.XlFormatConditionOperator.xlBetween,
-                            -2147483648, 2147483647);
+                            "-2147483648", "2147483647");
                         v.IgnoreBlank = true;
                         v.ErrorTitle = "정수만 허용";
                         v.ErrorMessage = "이 열은 정수만 입력할 수 있습니다.";
@@ -594,11 +893,13 @@ namespace XQLite.AddIn
                         break;
 
                     case ColumnKind.Real:
+                        // Excel이 싫어하는 ±1.79e308 대신 ±1e307로 클램프 (안전)
+                        // 문자열로 전달(=수식) 대신 상수로도 되지만 로캘 영향 줄이려 문자열 사용
                         v.Add(
                             Excel.XlDVType.xlValidateDecimal,
                             Excel.XlDVAlertStyle.xlValidAlertStop,
                             Excel.XlFormatConditionOperator.xlBetween,
-                            -1.79e308, 1.79e308);
+                            "=-1E+307", "=1E+307");
                         v.IgnoreBlank = true;
                         v.ErrorTitle = "실수만 허용";
                         v.ErrorMessage = "이 열은 실수/숫자만 입력할 수 있습니다.";
@@ -606,11 +907,11 @@ namespace XQLite.AddIn
                         break;
 
                     case ColumnKind.Bool:
-                        // TRUE/FALSE 리스트로 제한
+                        // TRUE/FALSE 목록 — 로캘별 리스트 구분자 사용
                         v.Add(
                             Excel.XlDVType.xlValidateList,
                             Excel.XlDVAlertStyle.xlValidAlertStop,
-                            Type.Missing, "TRUE,FALSE");
+                            Type.Missing, $"TRUE{listSep}FALSE", Type.Missing);
                         v.IgnoreBlank = true;
                         v.ErrorTitle = "BOOL만 허용";
                         v.ErrorMessage = "이 열은 TRUE 또는 FALSE만 입력할 수 있습니다.";
@@ -618,27 +919,26 @@ namespace XQLite.AddIn
                         break;
 
                     case ColumnKind.Date:
-                        // 날짜만: 1900-01-01 ~ 9999-12-31
+                        // 지역화된 함수명 문제 회피: DateTime 값을 직접 전달
+                        var dmin = new DateTime(1900, 1, 1);
+                        var dmax = new DateTime(9999, 12, 31);
                         v.Add(
                             Excel.XlDVType.xlValidateDate,
                             Excel.XlDVAlertStyle.xlValidAlertStop,
                             Excel.XlFormatConditionOperator.xlBetween,
-                            "=DATE(1900,1,1)", "=DATE(9999,12,31)");
+                            dmin, dmax);
                         v.IgnoreBlank = true;
                         v.ErrorTitle = "날짜만 허용";
                         v.ErrorMessage = "이 열은 날짜 형식만 입력할 수 있습니다.";
                         added = true;
                         break;
 
-                    // TEXT/JSON/ANY 등은 DV를 깔지 않는다(서버/런타임 검증으로 커버)
-                    // case ColumnKind.Text:
-                    // case ColumnKind.Json:
+                    // TEXT/JSON/ANY 등은 DV 미적용 (서버/런타임 검증으로 처리)
                     default:
                         added = false;
                         break;
                 }
 
-                // ✨ DV를 실제로 추가한 경우에만 속성 설정 → 0x800A03EC 방지
                 if (added)
                 {
                     try { v.ShowError = true; } catch { }
@@ -647,14 +947,13 @@ namespace XQLite.AddIn
             }
             catch
             {
-                // 병합/보호/특수범위 등으로 Add가 실패할 수 있음 — 침묵
+                // 병합/시트 보호/특수 범위 등으로 실패할 수 있음 — 조용히 무시
             }
             finally
             {
                 XqlCommon.ReleaseCom(v);
             }
         }
-
 
         // 헤더: 마커 → (선택 기반) ResolveHeader → Fallback(GetHeaderRange) 순서로 결정
         private static Excel.Range? GetHeaderOrFallback(Excel.Worksheet ws)

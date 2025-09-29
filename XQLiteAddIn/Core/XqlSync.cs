@@ -149,7 +149,7 @@ namespace XQLite.AddIn
                     foreach (var c in resp.Conflicts)
                         _conflicts.Enqueue(c);
                     // 2) 워크시트 Conflict 뷰에도 누적
-                    XqlCommon.AppendConflicts(resp.Conflicts.Cast<object>());
+                    XqlSheetView.AppendConflicts(resp.Conflicts.Cast<object>());
                 }
             }
             catch (Exception ex)
@@ -198,10 +198,17 @@ namespace XQLite.AddIn
             for (int i = 0; i < max && q.TryDequeue(out var e); i++) temp.Add(e);
             if (temp.Count <= 1) return temp;
 
-            var map = new Dictionary<CellKey, EditCell>(temp.Count);
-            foreach (var e in temp) map[new CellKey(e.Table, e.RowKey, e.Column)] = e;
+            string Norm(object o) => XqlCommon.ValueToString(o); // 불변 문자열로 통일
+
+            var map = new Dictionary<(string Table, string RowKey, string Column), EditCell>(temp.Count, (IEqualityComparer<(string Table, string RowKey, string Column)>)StringComparer.Ordinal);
+            foreach (var e in temp)
+            {
+                var key = (e.Table, Norm(e.RowKey), e.Column);
+                map[key] = e; // 마지막 값 우선
+            }
             return map.Values.ToList();
         }
+
 
         private readonly record struct CellKey(string Table, object RowKey, string Column);
 
@@ -379,11 +386,11 @@ namespace XQLite.AddIn
                         }
 
                         // 서버 패치로 변경된 셀 하이라이트
-                        XqlCommon.MarkTouchedCell(rg);
+                        XqlSheetView.MarkTouchedCell(rg);
                     }
                     catch (Exception ex)
                     {
-                        XqlCommon.LogError($"패치 적용 실패: {ex.Message}", ws.Name,
+                        XqlLog.Error($"패치 적용 실패: {ex.Message}", ws.Name,
                         rg?.Address[false, false] ?? "");
                     }
                     finally { XqlCommon.ReleaseCom(rg); }

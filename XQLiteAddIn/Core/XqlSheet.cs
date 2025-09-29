@@ -374,8 +374,7 @@ namespace XQLite.AddIn
                 var sheet = parts[1];
                 var table = parts[2];
 
-                int hRow = 0, hCol = 0;
-                int colOffset = 0, rowOffset = 0;
+                int hRow = 0, hCol = 0, dr = 0, dc = 0;
                 string? hdr = null;
 
                 foreach (var seg in parts.Skip(3))
@@ -385,13 +384,13 @@ namespace XQLite.AddIn
                         var hc = seg.Substring(1).Split('C');
                         hRow = int.Parse(hc[0]); hCol = int.Parse(hc[1]);
                     }
-                    else if (seg.StartsWith("dx=")) colOffset = ParseIntOrDefault(seg, 3);
-                    else if (seg.StartsWith("dr=")) rowOffset = ParseIntOrDefault(seg, 3);
-                    else if (seg.StartsWith("dc=")) colOffset = ParseIntOrDefault(seg, 3);
+                    else if (seg.StartsWith("dx=")) dc = ParseIntOrDefault(seg, 3);
+                    else if (seg.StartsWith("dr=")) dr = ParseIntOrDefault(seg, 3);
+                    else if (seg.StartsWith("dc=")) dc = ParseIntOrDefault(seg, 3);
                     else if (seg.StartsWith("hdr=")) hdr = Unescape(seg.Substring(4));
                 }
 
-                d = new RelDesc(kind, sheet, table, hRow, hCol, rowOffset, colOffset, hdr);
+                d = new RelDesc(kind, sheet, table, hRow, hCol, dr, dc, hdr);
                 return true;
             }
             catch { return false; }
