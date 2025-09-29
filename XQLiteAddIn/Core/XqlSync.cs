@@ -144,8 +144,13 @@ namespace XQLite.AddIn
                     XqlCommon.InterlockedMax(ref _maxRowVersion, resp.MaxRowVersion);
 
                 if (resp.Conflicts is { Count: > 0 })
+                {
+                    // 1) 내부 큐에도 enqueue (기존 동작)
                     foreach (var c in resp.Conflicts)
                         _conflicts.Enqueue(c);
+                    // 2) 워크시트 Conflict 뷰에도 누적
+                    XqlCommon.AppendConflicts(resp.Conflicts.Cast<object>());
+                }
             }
             catch (Exception ex)
             {

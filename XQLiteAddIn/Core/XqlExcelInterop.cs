@@ -174,7 +174,14 @@ namespace XQLite.AddIn
 
         private static void ApplyValidationVisual(Excel.Worksheet ws, Excel.Range cell, ValidationResult vr)
         {
-            if (vr.IsOk) { SafeClearComment(cell); return; }
+
+            if (vr.IsOk)
+            {
+                SafeClearComment(cell);
+                XqlCommon.TryClearInvalidMark(cell); // ← 추가: 연분홍 제거
+                return;
+            }
+
 
             SafeClearComment(cell);
             SafeSetComment(cell, TruncateForComment(vr.Message));

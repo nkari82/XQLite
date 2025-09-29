@@ -7,6 +7,7 @@ using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.ConstrainedExecution;
 using System.Runtime.InteropServices;
 using System.Text;
 using Excel = Microsoft.Office.Interop.Excel;
@@ -64,7 +65,7 @@ namespace XQLite.AddIn
                     double elapsedMs = TicksToMs(System.Diagnostics.Stopwatch.GetTimestamp() - _sumStartTicks);
 
                     // 카드 렌더
-                    Put(ws, 1, 1, title, bold: true, size: 16);
+                    Put(ws, 1, 1, title!, bold: true, size: 16);
                     Put(ws, 3, 1, "Tables");
                     Put(ws, 3, 2, tables.ToString());
                     Put(ws, 4, 1, "Batches");
@@ -449,6 +450,30 @@ namespace XQLite.AddIn
                 interior.Pattern = Excel.XlPattern.xlPatternSolid;
                 // 연분홍 (OLE BGR): 0xCCCCFF
                 interior.Color = 0x00CCCCFF;
+            }
+            catch { /* ignore */ }
+        }
+
+
+        // === 새로 추가: 우리 마크만 조건부 해제 ===
+        public static void TryClearInvalidMark(Excel.Range rg)
+        {
+            TryClearColor(rg, 0x00CCCCFF); // 연분홍
+        }
+        public static void TryClearTouchedMark(Excel.Range rg)
+        {
+            TryClearColor(rg, 0x00CCFFCC); // 연녹색
+        }
+        private static void TryClearColor(Excel.Range rg, int colorBgr)
+        {
+            if (rg == null) return;
+            try
+            {
+                var it = rg.Interior;
+                // Color는 Variant로 오므로 안전 변환
+                int cur = Convert.ToInt32(it.Color);
+                if (cur == colorBgr)
+                    it.ColorIndex = Excel.XlColorIndex.xlColorIndexNone; // 사용자 색 보존
             }
             catch { /* ignore */ }
         }

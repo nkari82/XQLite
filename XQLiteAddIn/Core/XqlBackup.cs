@@ -1,5 +1,6 @@
 ﻿// XqlBackup.cs
 using ExcelDna.Integration;
+using Microsoft.Office.Interop.Excel;
 using Newtonsoft.Json;
 using System;
 using System.Collections.Generic;
@@ -7,6 +8,7 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
+using static System.Windows.Forms.VisualStyles.VisualStyleElement.ProgressBar;
 using Excel = Microsoft.Office.Interop.Excel;
 
 namespace XQLite.AddIn
@@ -86,8 +88,8 @@ namespace XQLite.AddIn
             }
             catch (Exception ex)
             {
-                // 실패는 무시(Excel 안정성 우선), 필요시 로그
-                XqlLog.Warn("ExportDiagnostics failed: " + ex.Message);
+                // 실패는 무음 처리(Excel 안정성 우선), 로그 시트에만 남김
+                XqlCommon.LogWarn("ExportDiagnostics failed: " + ex.Message);
             }
         }
 
@@ -101,6 +103,10 @@ namespace XQLite.AddIn
             try
             {
                 var app = (Excel.Application)ExcelDnaUtil.Application;
+
+                // 요약 집계 시작
+                XqlCommon.RecoverSummaryBegin();
+
                 foreach (var sheetName in GetWorkbookSheets(app))
                 {
                     if (!_sheet.TryGetSheet(sheetName, out var sm)) continue;
@@ -108,10 +114,23 @@ namespace XQLite.AddIn
 
                     var rows = ReadSheetRows(app, sheetName, sm);
                     if (rows.Count == 0) continue;
+                    var table = sm.TableName ?? sheetName; // 요약/충돌 기록에 사용
 
-                    foreach (var chunk in XqlCommon.Chunk(RowsToCellEdits(sm.TableName ?? sheetName, sm, rows), batchSize))
-                        await _backend.UpsertCells(chunk).ConfigureAwait(false);
+                    foreach (var chunk in XqlCommon.Chunk(RowsToCellEdits(table, sm, rows), batchSize))
+                    {
+                        var res = await _backend.UpsertCells(chunk).ConfigureAwait(false);
+                        // 충돌이 있으면 Conflict 워크시트에 적재
+                        if (res?.Conflicts != null && res.Conflicts.Count > 0)
+                            XqlCommon.AppendConflicts(res.Conflicts.Cast<object>());
+                        // 요약 집계(행/셀 기준은 운영 목적에 맞춰 조정 가능. 여기선 '셀 건수'로 반영)
+                        var conflicts = res?.Conflicts?.Count ?? 0;
+                        var errors = res?.Errors?.Count ?? 0;
+                        var affected = chunk.Count; // 업서트한 셀 개수
+                        XqlCommon.RecoverSummaryPush(table, affected, conflicts, errors);
+                    }
                 }
+
+                XqlCommon.RecoverSummaryShow();
             }
             catch { /* 무음 실패 (UI는 Inspector/Diag로 확인) */ }
         }

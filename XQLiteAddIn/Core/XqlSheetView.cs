@@ -529,6 +529,14 @@ namespace XQLite.AddIn
                         var last = ws.Cells[ws.Rows.Count, h.Column];
                         col = ws.Range[first, last];
                         try { col.Validation.Delete(); } catch { }
+
+                        // 우리 마크(연녹색/연분홍)만 조건부로 제거
+                        foreach (Excel.Range c in col.Cells)
+                        {
+                            try { XqlCommon.TryClearInvalidMark(c); XqlCommon.TryClearTouchedMark(c); }
+                            finally { XqlCommon.ReleaseCom(c); }
+                        }
+
                         XqlCommon.ReleaseCom(first); XqlCommon.ReleaseCom(last);
                     }
                     finally { XqlCommon.ReleaseCom(col); XqlCommon.ReleaseCom(h); }
