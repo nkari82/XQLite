@@ -14,26 +14,23 @@ namespace XQLite.AddIn
     {
         private readonly IXqlBackend _backend;
         private readonly string _nickname;
-        private readonly Timer _heartbeat;
-        private volatile bool _started;
+        private readonly Timer _refresh;
 
-        public XqlCollab(IXqlBackend backend, string nickname, int heartbeatSec = 3)
+        public XqlCollab(IXqlBackend backend, string nickname, int refreshSec = 3)
         {
             _backend = backend ?? throw new ArgumentNullException(nameof(backend));
             _nickname = string.IsNullOrWhiteSpace(nickname) ? "anonymous" : nickname.Trim();
-            _heartbeat = new Timer(async _ => await SafeHeartbeat(), null, Timeout.Infinite, Timeout.Infinite);
-            _ = SafeHeartbeat(); // 즉시 1회
-            _heartbeat.Change(TimeSpan.FromSeconds(heartbeatSec), TimeSpan.FromSeconds(heartbeatSec));
-            _started = true;
+            _refresh = new Timer(async _ => await SafeRefresh(), null, Timeout.Infinite, Timeout.Infinite);
+            _ = SafeRefresh(); // 즉시 1회
+            _refresh.Change(TimeSpan.FromSeconds(refreshSec), TimeSpan.FromSeconds(refreshSec));
         }
 
         public void Dispose()
         {
-            _started = false;
             try
             {
-                _heartbeat.Change(Timeout.Infinite, Timeout.Infinite);
-                _heartbeat.Dispose();
+                _refresh.Change(Timeout.Infinite, Timeout.Infinite);
+                _refresh.Dispose();
             }
             catch { }
         }
@@ -41,13 +38,17 @@ namespace XQLite.AddIn
         // ─────────────────────────────────────────────────────────────────────
         // Presence
         // ─────────────────────────────────────────────────────────────────────
-        private async Task SafeHeartbeat()
+        private async Task SafeRefresh()
         {
-            if (!_started) return;
+            if (_refresh == null)
+                return;
+
             try
             {
+                // (선택) 셀 이동 여부 등에 따라 프레즌스 갱신
                 var cell = TryGetCurrentRelativeCellKeyOrNull();
-                await _backend.PresenceHeartbeat(_nickname, cell).ConfigureAwait(false);
+                string? sheet=null, addr=null; /* 필요하면 분리 */
+                await _backend.PresenceTouch(_nickname, sheet, addr).ConfigureAwait(false);
             }
             catch { /* 네트워크 일시 오류는 무시 */ }
         }

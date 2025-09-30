@@ -23,5 +23,9 @@ UI/XqlSchemaForm.cs
 
 Ribbon/XqlRibbon.cs
 
-MockServer
+Server
 src/index.ts
+
+
+문제점.
+1. 로그 시트가 불필요해 보임. 없애 버리는게 나을수도?

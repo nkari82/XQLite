@@ -67,12 +67,28 @@ namespace XQLite.AddIn
                         try
                         {
                             _lv.Items.Clear();
-                            foreach (var p in list)
+                            foreach (var p in (list ?? Array.Empty<PresenceItem>()))
                             {
-                                var when = p.updated_at ?? "";
-                                var where = string.IsNullOrWhiteSpace(p.sheet) && string.IsNullOrWhiteSpace(p.cell)
-                                            ? ""
-                                            : $"{p.sheet}/{p.cell}";
+                                if (p == null) continue;
+
+                                // when 문자열 만들기 (ms → 현지시간)
+                                string when = "";
+                                if (p.updated_at.HasValue && p.updated_at.Value > 0)
+                                {
+                                    try
+                                    {
+                                        var dt = DateTimeOffset.FromUnixTimeMilliseconds(p.updated_at.Value).LocalDateTime;
+                                        when = dt.ToString("MM-dd HH:mm:ss");
+                                    }
+                                    catch { /* ms 값이 이상하면 그냥 공백 */ }
+                                }
+
+                                // where: "sheet/cell" 또는 빈 문자열
+                                string where =
+                                    (string.IsNullOrWhiteSpace(p.sheet) && string.IsNullOrWhiteSpace(p.cell))
+                                    ? ""
+                                    : $"{p.sheet ?? ""}/{p.cell ?? ""}";
+
                                 _lv.Items.Add(new ListViewItem(new[] { p.nickname ?? "", where, when }));
                             }
                         }

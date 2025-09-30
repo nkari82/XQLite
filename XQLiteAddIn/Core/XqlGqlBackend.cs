@@ -11,14 +11,19 @@ using System.Linq;
 using System.Reactive.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using static XQLite.AddIn.IXqlBackend;
 
 namespace XQLite.AddIn
 {
+    
+
     // =======================================================================
     // Backend 인터페이스 (Async 전용)
     // =======================================================================
     internal interface IXqlBackend : IDisposable
     {
+        internal enum ConnState { Disconnected, Connecting, Online, Degraded }
+
         // Sync (데이터 동기화)
         Task<UpsertResult> UpsertCells(IReadOnlyList<EditCell> cells, CancellationToken ct = default);
         Task<PullResult> PullRows(long since, CancellationToken ct = default);
@@ -26,7 +31,7 @@ namespace XQLite.AddIn
         void StopSubscription();
 
         // Collab (Presence/Lock)
-        Task PresenceHeartbeat(string nickname, string? cell, CancellationToken ct = default);
+        Task PresenceTouch(string nickname, string? sheet, string? cell, CancellationToken ct = default);
         Task AcquireLock(string cellOrResourceKey, string by, CancellationToken ct = default);
         Task ReleaseLocksBy(string by, CancellationToken ct = default);
 
@@ -42,6 +47,16 @@ namespace XQLite.AddIn
 
         // Recover
         Task<bool> UpsertRows(string table, List<Dictionary<string, object?>> rows, CancellationToken ct = default);
+
+
+        // 연결상태 하트비트(부작용 없음) — 호출할 때마다 상태 업데이트
+        Task<long> PingAsync(CancellationToken ct = default);
+
+        // 상태 조회/이벤트
+        event Action<ConnState, string?>? StateChanged;
+        ConnState State { get; }
+        string? StateDetail { get; }
+        DateTime LastOkUtc { get; }
     }
 
     // =======================================================================
@@ -58,23 +73,26 @@ namespace XQLite.AddIn
           }
         }";
 
-        private const string Q_PULL = @"query($since:Long!){
-          rows(since_version:$since){
-            max_row_version
-            patches { table row_key row_version deleted cells }
-          }
-        }";
+        // 1) Pull: Long → Int
+        private const string Q_PULL = @"query($since:Int!){
+  rows(since_version:$since){
+    max_row_version
+    patches { table row_key row_version deleted cells }
+  }
+}";
 
-        private const string SUB_ROWS = @"subscription($since:Long){
-          rowsChanged(since_version:$since){
-            max_row_version
-            patches { table row_key row_version deleted cells }
-          }
-        }";
+        // 2) Subscription: rowsChanged → events, 변수 제거
+        private const string SUB_ROWS = @"subscription{
+  events{
+    max_row_version
+    patches { table row_key row_version deleted cells }
+  }
+}";
 
-        private const string MUT_HEARTBEAT = @"mutation($nickname:String!, $cell:String){
-          presenceHeartbeat(nickname:$nickname, cell:$cell){ ok }
-        }";
+        // 3) PresenceTouch는 동일 (변경 없음)
+        private const string MUT_PRESENCE = @"mutation($n:String!,$s:String,$c:String){
+  presenceTouch(nickname:$n, sheet:$s, cell:$c){ ok }
+}";
 
         private const string MUT_ACQUIRE = @"mutation($cell:String!, $by:String!){ acquireLock(cell:$cell, by:$by){ ok } }";
         private const string MUT_RELEASE_BY = @"mutation($by:String!){ releaseLocksBy(by:$by){ ok } }";
@@ -83,27 +101,29 @@ namespace XQLite.AddIn
           createTable(table:$table, key:$key){ ok }
         }";
 
+        // 4) addColumns: notnull → notNull
         private const string MUT_ADD_COLUMNS = @"mutation($table:String!, $columns:[ColumnDefInput!]!){
-          addColumns(table:$table, columns:$columns){ ok }
-        }";
+  addColumns(table:$table, columns:$columns){ ok }
+}";
 
+        // 5) upsertRows: 서버 반환과 일치하게 selection 축소
         private const string MUT_UPSERT_ROWS = @"mutation ($table:String!,$rows:[JSON!]!){
-              upsertRows(table:$table, rows:$rows){
-                affected
-                errors { code message }
-                max_row_version
-              }
-            }";
+  upsertRows(table:$table, rows:$rows){
+    max_row_version
+    errors
+  }
+}";
 
-        private const string Q_META = @"query{
-          meta{ schema_hash max_row_version tables{ name cols{ name kind notnull } } }
-        }";
 
-        private const string Q_AUDIT = @"query($since:Long){
-          audit_log(since_version:$since){
-            ts user table row_key column old_value new_value row_version
-          }
-        }";
+        // 6) meta: JSON 스칼라 → 필드 선택 없이 그대로
+        private const string Q_META = @"query{ meta }";
+
+        // 7) audit: Long → Int
+        private const string Q_AUDIT = @"query($since:Int){
+  audit_log(since_version:$since){
+    ts user table row_key column old_value new_value row_version
+  }
+}";
 
         private const string Q_EXPORT_DB = @"query{ exportDatabase }";
 
@@ -115,8 +135,16 @@ namespace XQLite.AddIn
         private IDisposable? _subscription;
         private int _subRetry = 0;
 
+        private readonly Timer _heartbeat;
+        public ConnState State { get; private set; } = ConnState.Connecting;
+        public string? StateDetail { get; private set; }
+        public DateTime LastOkUtc { get; private set; } = DateTime.MinValue;
+        public event Action<ConnState, string?>? StateChanged;
+
+        private const int HB_TTL_MS = 10_000; // 마지막 성공 이후 이 시간 넘도록 성공 없으면 Disconnected
+
         // ── 생성자 ───────────────────────────────────────────────────────────
-        internal XqlGqlBackend(string httpEndpoint, string? apiKey)
+        internal XqlGqlBackend(string httpEndpoint, string? apiKey, int heartbeatSec = 3)
         {
             var httpUri = new Uri(httpEndpoint);
             var wsUri = new UriBuilder(httpUri) { Scheme = httpUri.Scheme == "https" ? "wss" : "ws" }.Uri;
@@ -134,6 +162,10 @@ namespace XQLite.AddIn
                 _http.HttpClient.DefaultRequestHeaders.Add("x-api-key", apiKey);
                 _ws.HttpClient.DefaultRequestHeaders.Add("x-api-key", apiKey);
             }
+
+            _heartbeat = new Timer(async _ => await SafeHeartbeat(), null, Timeout.Infinite, Timeout.Infinite);
+            _ = SafeHeartbeat(); // 즉시 1회
+            _heartbeat.Change(TimeSpan.FromSeconds(heartbeatSec), TimeSpan.FromSeconds(heartbeatSec));
         }
 
         public void Dispose()
@@ -141,7 +173,65 @@ namespace XQLite.AddIn
             try { StopSubscription(); } catch { }
             try { _http.Dispose(); } catch { }
             try { _ws.Dispose(); } catch { }
+            try
+            {
+                _heartbeat.Change(Timeout.Infinite, Timeout.Infinite);
+                _heartbeat.Dispose();
+            }
+            catch { }
         }
+
+        // ── 상태 갱신 ────────────────────────────────────────────────────────
+        private void SetState(ConnState st, string? detail = null)
+        {
+            if (State == st && detail == StateDetail) return;
+            State = st;
+            StateDetail = detail;
+            if (st == ConnState.Online) LastOkUtc = DateTime.UtcNow;
+            try { StateChanged?.Invoke(st, detail); } catch { }
+        }
+
+        // ⬇️ 연결상태 하트비트 (호출 시 상태 업데이트)
+        public async Task<long> PingAsync(CancellationToken ct = default)
+        {
+            try
+            {
+                var req = new GraphQLHttpRequest { Query = "query { ping }" };
+                var resp = await _http.SendQueryAsync<PingQueryResult>(req, ct).ConfigureAwait(false);
+                var now = resp.Data?.ping ?? 0L;
+                SetState(ConnState.Online, "ping ok");
+                return now;
+            }
+            catch (Exception ex)
+            {
+                var now = DateTime.UtcNow;
+                if (LastOkUtc == DateTime.MinValue)
+                {
+                    SetState(ConnState.Connecting, "ping...");
+                }
+                else
+                {
+                    var ms = (now - LastOkUtc).TotalMilliseconds;
+                    if (ms > HB_TTL_MS) SetState(ConnState.Disconnected, $"ping timeout {(int)(ms / 1000)}s");
+                    else SetState(ConnState.Degraded, $"ping fail: {ex.GetType().Name}");
+                }
+                throw; // 호출측에서 필요 시 무시 가능
+            }
+        }
+
+        private async Task SafeHeartbeat()
+        {
+            if (_heartbeat == null)
+                return;
+
+            try
+            {
+                // 연결상태 확인 (상태는 PingAsync 내부에서 갱신됨)
+                await PingAsync().ConfigureAwait(false);
+            }
+            catch { /* 네트워크 일시 오류는 무시 */ }
+        }
+
 
         // ── Sync ─────────────────────────────────────────────────────────────
         public async Task<UpsertResult> UpsertCells(IReadOnlyList<EditCell> cells, CancellationToken ct = default)
@@ -176,13 +266,14 @@ namespace XQLite.AddIn
         public void StartSubscription(Action<ServerEvent> onEvent, long since)
         {
             StopSubscription();
-            var req = new GraphQLRequest { Query = SUB_ROWS, Variables = new { since } };
+            // 변수 없이 바로 구독
+            var req = new GraphQLRequest { Query = SUB_ROWS };
             var observable = _ws.CreateSubscriptionStream<JObject>(req);
 
             var sub = observable.Subscribe(
-            onNext: p => { _subRetry = 0; try { onEvent(ParseSub(p.Data)); } catch { } },
-            onError: _ => Resubscribe(onEvent, since),
-            onCompleted: () => Resubscribe(onEvent, since));
+                onNext: p => { _subRetry = 0; try { onEvent(ParseSub(p.Data)); } catch { } },
+                onError: _ => Resubscribe(onEvent, since),
+                onCompleted: () => Resubscribe(onEvent, since));
             Interlocked.Exchange(ref _subscription, sub)?.Dispose();
         }
 
@@ -200,8 +291,18 @@ namespace XQLite.AddIn
         }
 
         // ── Collab ───────────────────────────────────────────────────────────
-        public Task PresenceHeartbeat(string nickname, string? cell, CancellationToken ct = default) =>
-            _http.SendMutationAsync<JObject>(new GraphQLRequest { Query = MUT_HEARTBEAT, Variables = new { nickname, cell } }, ct);
+        // ⬇️ 프레즌스 갱신 (연결상태와 무관)
+        public async Task PresenceTouch(string nickname, string? sheet, string? cell, CancellationToken ct = default)
+        {
+            var req = new GraphQLHttpRequest
+            {
+                Query = MUT_PRESENCE,
+                Variables = new { n = nickname, s = sheet, c = cell }
+            };
+            var resp = await _http.SendMutationAsync<PresenceTouchMutation>(req, ct).ConfigureAwait(false);
+            if (resp.Errors != null && resp.Errors.Length > 0)
+                throw new Exception("presenceTouch failed: " + resp.Errors[0].Message);
+        }
 
         public Task AcquireLock(string cellOrResourceKey, string by, CancellationToken ct = default) =>
             _http.SendMutationAsync<JObject>(new GraphQLRequest { Query = MUT_ACQUIRE, Variables = new { cell = cellOrResourceKey, by } }, ct);
@@ -224,7 +325,7 @@ namespace XQLite.AddIn
                     {
                         name = c.Name,
                         kind = c.Kind,
-                        notnull = c.NotNull,
+                        notNull = c.NotNull,   // ✅ 여기!
                         check = c.Check
                     }).ToArray()
                 }
@@ -233,7 +334,7 @@ namespace XQLite.AddIn
         public async Task<JObject?> TryFetchServerMeta(CancellationToken ct = default)
         {
             var resp = await _http.SendQueryAsync<JObject>(new GraphQLRequest { Query = Q_META }, ct).ConfigureAwait(false);
-            return resp.Data?["meta"] as JObject;
+            return resp.Data?["meta"] as JObject; // 서버가 JSON 스칼라를 반환
         }
 
         public async Task<JArray?> TryFetchAuditLog(long? since = null, CancellationToken ct = default)
@@ -269,9 +370,9 @@ namespace XQLite.AddIn
         public async Task<bool> UpsertRows(string table, List<Dictionary<string, object?>> rows, CancellationToken ct = default)
         {
             var req = new GraphQLRequest { Query = MUT_UPSERT_ROWS, Variables = new { table, rows } };
-            var resp = await _http.SendMutationAsync<UpsertResp>(req, ct).ConfigureAwait(false);
-            var data = resp?.Data?.upsertRows;
-            return data != null && (data.errors == null || data.errors.Length == 0);
+            var resp = await _http.SendMutationAsync<JObject>(req, ct).ConfigureAwait(false);
+            var parsed = ParseUpsert(resp.Data);
+            return parsed.Errors == null || parsed.Errors.Count == 0;
         }
 
         // ── Parser bridge ────────────────────────────────────────────────────
@@ -351,8 +452,10 @@ namespace XQLite.AddIn
             var ev = new ServerEvent { MaxRowVersion = 0, Patches = new List<RowPatch>() };
             if (data == null) return ev;
 
-            var root = data["rowsChanged"] as JObject;
-            if (root == null && data["rowsChanged"] is JArray arr && arr.Count > 0)
+            // ✅ 서버는 events
+            var root = data["events"] as JObject;
+            // 혹시 구독 구현에서 배열로 올 수도 있으니 방어
+            if (root == null && data["events"] is JArray arr && arr.Count > 0)
                 root = arr[0] as JObject;
             if (root == null) return ev;
 
@@ -385,6 +488,10 @@ namespace XQLite.AddIn
     // =======================================================================
     // DTOs
     // =======================================================================
+
+    internal sealed class PingQueryResult { public long ping { get; set; } }
+    internal sealed class PresenceTouchMutation { public OkResult? presenceTouch { get; set; } }
+    internal sealed class OkResult { public bool ok { get; set; } }
 
     internal readonly record struct EditCell(string Table, object RowKey, string Column, object? Value);
 
@@ -429,27 +536,27 @@ namespace XQLite.AddIn
         public long? updated_at { get; set; } // ← ms epoch
     }
 
-    internal sealed class PresenceResp 
-    { 
-        public PresenceItem[]? presence { get; set; } 
-    }
-    
-    internal sealed class UpsertResp 
-    { 
-        public UpsertRowsPayload? upsertRows { get; set; } 
+    internal sealed class PresenceResp
+    {
+        public PresenceItem[]? presence { get; set; }
     }
 
-    internal sealed class UpsertRowsPayload 
-    { 
-        public int affected { get; set; } 
-        public GqlErr[]? errors { get; set; } 
-        public long max_row_version { get; set; } 
+    internal sealed class UpsertResp
+    {
+        public UpsertRowsPayload? upsertRows { get; set; }
     }
 
-    internal sealed class GqlErr 
-    { 
-        public string? code { get; set; } 
-        public string? message { get; set; } 
+    internal sealed class UpsertRowsPayload
+    {
+        public int affected { get; set; }
+        public GqlErr[]? errors { get; set; }
+        public long max_row_version { get; set; }
+    }
+
+    internal sealed class GqlErr
+    {
+        public string? code { get; set; }
+        public string? message { get; set; }
     }
 
 

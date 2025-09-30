@@ -1,0 +1,32 @@
+{
+  "name": "xqlite-server",
+  "version": "1.0.0",
+  "description": "XQLite GraphQL server (Node.js + SQLite)",
+  "main": "dist/index.js",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "dev": "ts-node --transpile-only src/index.ts",
+    "dev:inspect": "node --enable-source-maps --inspect -r ts-node/register/transpile-only src/index.ts",
+    "build": "tsc",
+    "start": "node --enable-source-maps dist/index.js",
+    "start:inspect": "node --enable-source-maps --inspect dist/index.js"
+  },
+  "engines": {
+    "node": ">=18.18.0"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "better-sqlite3": "^12.4.1",
+    "graphql": "^16.11.0",
+    "graphql-type-json": "^0.3.2",
+    "graphql-yoga": "^5.16.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^24.5.2",
+    "sourcemap": "^0.1.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.2"
+  }
+}

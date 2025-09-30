@@ -59,7 +59,7 @@ namespace XQLite.AddIn
             try
             {
                 // 1) 백엔드 & 메타
-                _backend = new XqlGqlBackend(XqlConfig.Endpoint, XqlConfig.ApiKey); // GraphQL 클라이언트(HTTP/WS) 공용 인스턴스
+                _backend = new XqlGqlBackend(XqlConfig.Endpoint, XqlConfig.ApiKey, XqlConfig.HeartbeatSec); // GraphQL 클라이언트(HTTP/WS) 공용 인스턴스
                 _sheet = new XqlSheet();
 
                 // 2) 동기화/협업/백업
@@ -70,7 +70,7 @@ namespace XQLite.AddIn
                 _sync.Start(); // 구독 시작 포함
 
                 //    - XqlCollab: TTL/Heartbeat 간격 (초→ms)
-                _collab = new XqlCollab(_backend, XqlConfig.Nickname, heartbeatSec: XqlConfig.HeartbeatSec); // 내부 타이머 운용
+                _collab = new XqlCollab(_backend, XqlConfig.Nickname, XqlConfig.HeartbeatSec); // 내부 타이머 운용
 
                 //    - XqlBackup: 진단/복구/풀덤프
                 _backup = new XqlBackup(_backend, _sheet); // 현재 시그니처 기준

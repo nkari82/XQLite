@@ -34,6 +34,15 @@ namespace XQLite.AddIn
                   supertip='편집분(2초 디바운스)을 즉시 서버에 업서트합니다.'/>
         </group>
 
+        <!-- 연결 상태 -->
+        <group id='grpConn' label='연결'>
+          <button id='btnStatus' size='large'
+                  getLabel='XqlStatus_GetLabel'
+                  getImage='XqlStatus_GetImage'
+                  getSupertip='XqlStatus_GetSupertip'
+                  onAction='XqlStatus_OnClick' />
+        </group>
+
         <!-- 헤더 -->
         <group id='grpMeta' label='헤더'>
           <button id='btnInsertHeader' label='헤더 삽입' size='large'
@@ -109,7 +118,30 @@ namespace XQLite.AddIn
 </customUI>";
 
         // ───────────────────────── Ribbon lifecycle / dynamic enable ─────────────────────────
-        public void OnRibbonLoad(IRibbonUI ribbon) => _ribbon = ribbon;
+        public void OnRibbonLoad(IRibbonUI ribbon)
+        {
+            _ribbon = ribbon;
+            try
+            {
+                // 백엔드 상태 변경 시 버튼만 갱신(+ 상태바 선택 적용)
+                if (XqlAddIn.Backend is XqlGqlBackend be)
+                {
+                    be.StateChanged += (_, __) =>
+                        ExcelAsyncUtil.QueueAsMacro(() =>
+                        {
+                            try
+                            {
+                                var app = ExcelDnaUtil.Application as Excel.Application; // ✅ 캐스팅
+                                if (app != null)
+                                    app.StatusBar = XqlStatus_GetLabel(null!);           // 상태 텍스트 적용
+                            }
+                            catch { /* ignore */ }
+                        });
+
+                }
+            }
+            catch { /* ignore */ }
+        }
 
         // ───────────────────────── General ─────────────────────────
         public void OnConfig(IRibbonControl _)
@@ -119,6 +151,56 @@ namespace XQLite.AddIn
         }
 
         public void OnCommit(IRibbonControl _) => XqlAddIn.ExcelInterop?.Cmd_CommitSync();
+
+        // ───────────────────────── Connection Status (Label / Icon / Tip / Click) ─────────────────────────
+        public string XqlStatus_GetLabel(IRibbonControl _)
+        {
+            var be = XqlAddIn.Backend as XqlGqlBackend;
+            if (be == null) return "Offline";
+
+            string since = "";
+            if (be.LastOkUtc != DateTime.MinValue)
+            {
+                var diff = DateTime.UtcNow - be.LastOkUtc;
+                since = diff.TotalSeconds < 60 ? $"{(int)diff.TotalSeconds}s" : $"{(int)(diff.TotalSeconds / 60)}m";
+                since = " · " + since;
+            }
+
+            return be.State switch
+            {
+                IXqlBackend.ConnState.Online => "Online" + since,
+                IXqlBackend.ConnState.Connecting => "Connecting…",
+                IXqlBackend.ConnState.Degraded => "Degraded" + since,
+                _ => "Offline"
+            };
+        }
+
+        public string XqlStatus_GetImage(IRibbonControl _)
+        {
+            return (XqlAddIn.Backend as XqlGqlBackend)?.State switch
+            {
+                IXqlBackend.ConnState.Online => "PersonaStatusOnline",
+                IXqlBackend.ConnState.Connecting => "PersonaStatusAway",
+                IXqlBackend.ConnState.Degraded => "PersonaStatusBusy",
+                _ => "PersonaStatusOffline"
+            };
+        }
+
+        public string XqlStatus_GetSupertip(IRibbonControl _)
+        {
+            var be = XqlAddIn.Backend as XqlGqlBackend;
+            if (be == null) return "Backend not initialized.";
+            var detail = string.IsNullOrWhiteSpace(be.StateDetail) ? "" : $"\r\n{be.StateDetail}";
+            return $"Server state: {be.State}{detail}";
+        }
+
+        public async void XqlStatus_OnClick(IRibbonControl _)
+        {
+            var be = XqlAddIn.Backend as XqlGqlBackend;
+            if (be == null) return;
+            try { await be.PingAsync(); }
+            catch { /* 실패해도 상태는 이벤트로 갱신됨 */ }
+        }
 
         // ───────────────────────── Backup / Recover / Diagnostics ─────────────────────────
         public void OnRecover(IRibbonControl _)
