@@ -254,13 +254,16 @@ namespace XQLite.AddIn
         // ── Presence / Recover ───────────────────────────────────────────────
         public async Task<PresenceItem[]?> FetchPresence(CancellationToken ct = default)
         {
-            try
+            var req = new GraphQLHttpRequest
             {
-                var req = new GraphQLRequest { Query = Q_PRESENCE };
-                var resp = await _http.SendQueryAsync<PresenceResp>(req, ct).ConfigureAwait(false);
-                return resp?.Data?.presence;
-            }
-            catch { return null; }
+                Query = Q_PRESENCE
+            };
+
+            var resp = await _http.SendQueryAsync<PresenceResp>(req, ct).ConfigureAwait(false);
+            var arr = resp.Data?.presence ?? Array.Empty<PresenceItem>();
+
+            // 혹시라도 역직렬화 중 null 항목이 섞이면 제거
+            return arr.Where(p => p != null).ToArray();
         }
 
         public async Task<bool> UpsertRows(string table, List<Dictionary<string, object?>> rows, CancellationToken ct = default)
@@ -418,11 +421,37 @@ namespace XQLite.AddIn
     }
 
     // GraphQL 응답 DTO
-    internal sealed class PresenceResp { public PresenceItem[]? presence { get; set; } }
-    internal sealed class PresenceItem { public string? nickname { get; set; } public string? sheet { get; set; } public string? cell { get; set; } public string? updated_at { get; set; } }
-    internal sealed class UpsertResp { public UpsertRowsPayload? upsertRows { get; set; } }
-    internal sealed class UpsertRowsPayload { public int affected { get; set; } public GqlErr[]? errors { get; set; } public long max_row_version { get; set; } }
-    internal sealed class GqlErr { public string? code { get; set; } public string? message { get; set; } }
+    internal sealed class PresenceItem
+    {
+        public string? nickname { get; set; }
+        public string? sheet { get; set; }
+        public string? cell { get; set; }
+        public long? updated_at { get; set; } // ← ms epoch
+    }
+
+    internal sealed class PresenceResp 
+    { 
+        public PresenceItem[]? presence { get; set; } 
+    }
+    
+    internal sealed class UpsertResp 
+    { 
+        public UpsertRowsPayload? upsertRows { get; set; } 
+    }
+
+    internal sealed class UpsertRowsPayload 
+    { 
+        public int affected { get; set; } 
+        public GqlErr[]? errors { get; set; } 
+        public long max_row_version { get; set; } 
+    }
+
+    internal sealed class GqlErr 
+    { 
+        public string? code { get; set; } 
+        public string? message { get; set; } 
+    }
+
 
     // Parser 결과 DTO
     internal sealed class UpsertResult
