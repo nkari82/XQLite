@@ -1,9 +1,10 @@
 ﻿// XqlExcelInterop.cs
+using ExcelDna.Integration;
 using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
-using ExcelDna.Integration;
+using System.Threading.Tasks;
 using Excel = Microsoft.Office.Interop.Excel;
 
 namespace XQLite.AddIn
@@ -29,7 +30,6 @@ namespace XQLite.AddIn
         private readonly object _uiGate = new();
 
         private static int _lastWarnTick;
-        private string? _lastCellRef; // ← 추가: 선택 변경 추적(디버깅/프레즌스 등에서 활용 가능)
 
         public XqlExcelInterop(Excel.Application app, XqlSync sync, XqlCollab collab, XqlSheet sheet, XqlBackup backup)
         {
@@ -48,7 +48,6 @@ namespace XQLite.AddIn
             _started = true;
 
             _app.SheetChange += App_SheetChange;
-            _app.SheetSelectionChange += App_SheetSelectionChange;
             _app.WorkbookOpen += App_WorkbookOpen;
             _app.WorkbookBeforeClose += App_WorkbookBeforeClose;
         }
@@ -59,7 +58,6 @@ namespace XQLite.AddIn
             _started = false;
 
             _app.SheetChange -= App_SheetChange;
-            _app.SheetSelectionChange -= App_SheetSelectionChange;
             _app.WorkbookOpen -= App_WorkbookOpen;
             _app.WorkbookBeforeClose -= App_WorkbookBeforeClose;
         }
@@ -70,10 +68,30 @@ namespace XQLite.AddIn
         }
 
         // ========= 명령(리본/메뉴) =========
-        public void Cmd_CommitSync()
+        public async void Cmd_CommitSmart()
         {
-            // 서버에서 증분 Pull → Excel 반영은 XqlSync가 수행 (머지/충돌 로직 포함)
-            _sync.PullSince();
+            try
+            {
+                await EnsureActiveSheetSchemaAsync();
+                await _sync.FlushUpsertsNow(force: true);  // 변경된 셀만 즉시 업서트
+                                                           // Pull은 필요 시(버튼/갭 감지/주기)만
+            }
+            catch (Exception ex)
+            {
+                XqlLog.Warn("CommitSmart failed: " + ex.Message);
+                throw;
+            }
+        }
+
+
+        public async void Cmd_PullOnly()
+        {
+            try { await _sync.PullSince(); }
+            catch (Exception ex)
+            {
+                XqlLog.Warn("PullOnly failed: " + ex.Message);
+                throw;
+            }
         }
 
         public void Cmd_RecoverFromExcel()
@@ -97,80 +115,141 @@ namespace XQLite.AddIn
             XqlCommon.ReleaseCom(wb);
         }
 
-        private void App_SheetSelectionChange(object Sh, Excel.Range Target)
+        // 변경 이벤트에서 호출
+        private void App_SheetChange(object Sh, Excel.Range target)
         {
             Excel.Worksheet? sh = null;
             try
             {
                 sh = Sh as Excel.Worksheet;
-                if (sh == null || Target == null) return;
+                if (sh == null)
+                    return;
 
-                _lastCellRef = $"{sh.Name}!{Target.Address[false, false]}";
+                var sm = _sheet.GetOrCreateSheet(sh.Name);
+                var header = XqlSheetView.ResolveHeader(sh, null, _sheet);      // 헤더 Range
+                if (header == null) return;
+
+                var data = header.Offset[1, 0];                   // 헤더 아래 데이터 영역 시작
+                var intersect = sh.Application.Intersect(target, data) as Excel.Range;
+                if (intersect == null) return;                    // 헤더/외곽은 무시
+
+                var table = string.IsNullOrWhiteSpace(sm.TableName) ? sh.Name : sm.TableName!;
+                var keyColName = string.IsNullOrWhiteSpace(sm.KeyColumn) ? "id" : sm.KeyColumn!;
+
+                foreach (Excel.Range cell in intersect.Cells)
+                {
+                    var colName = (string?)((header.Cells[1, cell.Column - header.Column + 1] as Excel.Range)!.Value2) ?? "";
+                    if (string.IsNullOrWhiteSpace(colName)) colName = XqlCommon.ColumnIndexToLetter(cell.Column);
+
+                    // key 셀 위치
+                    var keyCell = sh.Cells[cell.Row, header.Column] as Excel.Range; // 헤더 첫 컬럼이 key 라는 가정
+                    var rowKeyObj = keyCell?.Value2;
+                    string? rowKey = rowKeyObj?.ToString();
+
+                    // 새 행이면 id 생성 (텍스트 키 가정) — 프로젝트 정책에 맞게 교체 가능
+                    if (string.IsNullOrWhiteSpace(rowKey))
+                    {
+                        if (!string.Equals(colName, keyColName, StringComparison.OrdinalIgnoreCase))
+                            continue; // 키가 없고 key가 아닌 셀 수정이면 보류
+
+                        rowKey = Guid.NewGuid().ToString("N").Substring(0, 12);
+                        keyCell!.Value2 = rowKey; // 시트에 즉시 반영
+                    }
+
+                    // 값 뽑기 (JSON/날짜/불린 변환은 기존 유틸 사용 가능)
+                    object? value = cell.Value2;
+
+                    // ⬇️ 딱 이 셀만 큐잉
+                    _sync.EnqueueIfChanged(table, rowKey!, colName, value);
+                }
             }
-            catch { /* swallow */ }
-            finally
+            catch (Exception ex)
             {
-                XqlCommon.ReleaseCom(Target);
-                XqlCommon.ReleaseCom(sh);
+                XqlLog.Warn("OnWorksheetChange: " + ex.Message);
             }
         }
-
-        private void App_SheetChange(object Sh, Excel.Range Target)
+        /// <summary>
+        /// 활성 시트의 헤더/메타를 읽어 서버에 테이블 없으면 생성, 누락 컬럼을 추가.
+        /// </summary>
+        private async Task EnsureActiveSheetSchemaAsync()
         {
-            Excel.Worksheet? sh = null;
-            Excel.ListObject? loSel = null; Excel.Range? header = null;
+            if (XqlAddIn.Backend is not IXqlBackend be) return;
+
+            var app = ExcelDnaUtil.Application as Excel.Application;
+            if (app == null) return;
+
+            Excel.Worksheet? ws = null; Excel.Range? header = null;
             try
             {
-                sh = Sh as Excel.Worksheet;
-                if (sh == null || Target == null) return;
+                ws = app.ActiveSheet as Excel.Worksheet;
+                if (ws == null) return;
 
-                // 헤더 편집 시 툴팁 재적용
-                XqlSheetView.RefreshTooltipsIfHeaderEdited(sh, Target);
+                var sm = _sheet.GetOrCreateSheet(ws.Name);
 
-                // ── 헤더 범위(표 헤더 또는 마커/폴백)를 한 번만 계산
-                try
+                // ① 헤더/컬럼명
+                var (hdr, names) = XqlSheet.GetHeaderAndNames(ws);
+                header = hdr;
+                if (header == null || names is not { Count: > 0 }) return;
+
+                _sheet.EnsureColumns(ws.Name, names);
+
+                var table = string.IsNullOrWhiteSpace(sm.TableName) ? ws.Name : sm.TableName!;
+                var key = string.IsNullOrWhiteSpace(sm.KeyColumn) ? "id" : sm.KeyColumn!;
+
+                // ② 테이블 보장
+                await be.TryCreateTable(table, key);
+
+                // ③ 서버 컬럼 조회 → '없을 때만' 추가
+                var serverCols = await be.GetTableColumns(table);
+                var serverSet = new HashSet<string>(serverCols.Select(c => c.name), StringComparer.OrdinalIgnoreCase);
+                var addTargets = sm.Columns.Keys.Where(k => !serverSet.Contains(k)).ToList();
+
+                if (addTargets.Count > 0)
                 {
-                    loSel = XqlSheet.FindListObjectContaining(sh, Target);
-                    header = loSel?.HeaderRowRange;
-                    if (header == null && XqlSheet.TryGetHeaderMarker(sh, out var hdr)) header = hdr;
-                    if (header == null) header = XqlSheet.GetHeaderRange(sh);
+                    var defs = addTargets.Select(name =>
+                    {
+                        var ct = sm.Columns[name];
+                        return new ColumnDef
+                        {
+                            Name = name,
+                            Kind = ct.Kind switch
+                            {
+                                ColumnKind.Int => "integer",
+                                ColumnKind.Real => "real",
+                                ColumnKind.Bool => "boolean",
+                                ColumnKind.Date => "integer",
+                                _ => "text"
+                            },
+                            NotNull = !ct.Nullable,
+                            Check = null
+                        };
+                    });
+                    await be.TryAddColumns(table, defs);
                 }
-                catch { /* ignore */ }
-                int headerRow = header?.Row ?? 0;
 
-                // 변경 범위가 여러 셀일 수 있음
-                foreach (Excel.Range cell in Target.Cells)
+                // ④ (옵션) 헤더에 없는 서버 컬럼 DROP
+                if (XqlConfig.DropColumnsOnCommit)
                 {
-                    try
+                    var metaCols = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { key, "row_version", "updated_at", "deleted" };
+                    var headerSet = new HashSet<string>(names, StringComparer.OrdinalIgnoreCase);
+
+                    var drop = serverCols
+                        .Where(c => !c.pk && !metaCols.Contains(c.name))
+                        .Select(c => c.name)
+                        .Where(n => !headerSet.Contains(n))
+                        .ToList();
+
+                    if (drop.Count > 0)
                     {
-                        // ✅ 헤더 행은 업서트/검증 제외 (툴팁 재적용만 별도로 수행됨)
-                        if (headerRow > 0 && cell.Row <= headerRow) { continue; }
-                        var ctx = ReadCellContext(sh, cell); // table,rowKey,colName,value
-                        var vr = _sheet.ValidateCell(sh.Name, ctx.colName, ctx.value);
-                        ApplyValidationVisual(sh, cell, vr); // ← ws 전달
-                        if (vr.IsOk)
-                            _sync.EnqueueCellEdit(ctx.table, ctx.rowKey, ctx.colName, ctx.value);
-                    }
-                    catch (Exception ex)
-                    {
-                        SafeSetComment(cell, $"Edit error: {ex.Message}");
-                    }
-                    finally
-                    {
-                        XqlCommon.ReleaseCom(cell);
+                        try { await be.TryDropColumns(table, drop); }
+                        catch (Exception ex) { XqlLog.Warn("DropColumns skipped: " + ex.Message); }
                     }
                 }
             }
-            catch { /* swallow */ }
-            finally
-            {
-                XqlCommon.ReleaseCom(header);
-                XqlCommon.ReleaseCom(loSel);
-                XqlCommon.ReleaseCom(Target);
-                XqlCommon.ReleaseCom(sh);
-            }
+            catch (Exception ex) { XqlLog.Warn("EnsureActiveSheetSchemaAsync: " + ex.Message); }
+            finally { XqlCommon.ReleaseCom(header); XqlCommon.ReleaseCom(ws); }
         }
-
+#if false
         private static void ApplyValidationVisual(Excel.Worksheet ws, Excel.Range cell, ValidationResult vr)
         {
 
@@ -229,6 +308,7 @@ namespace XQLite.AddIn
             catch { }
             finally { XqlCommon.ReleaseCom(inter); XqlCommon.ReleaseCom(lo); }
         }
+#endif
 
         private static string TruncateForComment(string s)
         {

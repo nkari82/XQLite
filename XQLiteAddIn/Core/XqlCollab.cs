@@ -1,5 +1,6 @@
 ﻿// XqlCollab.cs (Migration + RelativeKey 내장 통합판, refactored)
 using ExcelDna.Integration;
+using Microsoft.Office.Interop.Excel;
 using System;
 using System.Threading;
 using System.Threading.Tasks;
@@ -45,10 +46,9 @@ namespace XQLite.AddIn
 
             try
             {
-                // (선택) 셀 이동 여부 등에 따라 프레즌스 갱신
-                var cell = TryGetCurrentRelativeCellKeyOrNull();
-                string? sheet=null, addr=null; /* 필요하면 분리 */
-                await _backend.PresenceTouch(_nickname, sheet, addr).ConfigureAwait(false);
+                // 현재 선택 위치를 상대키로 얻고, sheet 이름도 함께 보냄
+                var (sheet, cell) = TryGetCurrentSheetAndCellKeyOrNull();
+                await _backend.PresenceTouch(_nickname, sheet, cell).ConfigureAwait(false);
             }
             catch { /* 네트워크 일시 오류는 무시 */ }
         }
@@ -56,17 +56,13 @@ namespace XQLite.AddIn
         // ─────────────────────────────────────────────────────────────────────
         // Lock APIs (항상 상대 키로 정규화하여 서버 호출)
         // ─────────────────────────────────────────────────────────────────────
+        // 🔧 교체: 입력 키를 그대로 사용 (상대키만 지원)
         public async Task<bool> Acquire(string resourceKey)
         {
             try
             {
-                var key = OnMainThread<string?>(() =>
-                {
-                    var app = (Excel.Application)ExcelDnaUtil.Application;
-                    return XqlSheet.MigrateLockKeyIfNeeded(app, resourceKey);
-                });
-                if (string.IsNullOrEmpty(key)) return false;
-                await _backend.AcquireLock(key!, _nickname).ConfigureAwait(false);
+                if (string.IsNullOrWhiteSpace(resourceKey)) return false;
+                await _backend.AcquireLock(resourceKey.Trim(), _nickname).ConfigureAwait(false);
                 return true;
             }
             catch { return false; }
@@ -142,45 +138,29 @@ namespace XQLite.AddIn
             }
         }
 
-        // (선택) 특정 구키를 새키로 서버에서 교체 시도: 새키 획득 후 내 락 해제
-        public async Task<bool> MigrateOnServer(string oldKey)
-        {
-            try
-            {
-                var app = (Excel.Application)ExcelDnaUtil.Application;
-                var newKey = XqlSheet.MigrateLockKeyIfNeeded(app, oldKey);
-                if (newKey == oldKey) return true; // 이미 신포맷
-
-                await _backend.AcquireLock(newKey, _nickname).ConfigureAwait(false);
-                await _backend.ReleaseLocksBy(_nickname).ConfigureAwait(false);
-                return true;
-            }
-            catch { return false; }
-        }
-
         // UI가 현재 커서를 Presence에 태그하고 싶을 때 사용
-        private static string? TryGetCurrentRelativeCellKeyOrNull()
+        private static (string? sheet, string? cellKey) TryGetCurrentSheetAndCellKeyOrNull()
         {
-            return OnMainThread<string?>(() =>
+            return OnMainThread<(string?, string?)>(() =>
             {
                 Excel.Range? rng = null; Excel.Worksheet? ws = null; Excel.ListObject? lo = null;
                 try
                 {
                     var app = (Excel.Application)ExcelDnaUtil.Application;
                     rng = app.Selection as Excel.Range;
-                    if (rng == null) return null;
+                    if (rng == null) return (null, null);
                     ws = (Excel.Worksheet)rng.Worksheet;
                     lo = rng.ListObject ?? XqlSheet.FindListObjectContaining(ws, rng);
-                    if (lo?.HeaderRowRange == null) return null;
+                    if (lo?.HeaderRowRange == null) return (ws?.Name, null);
                     string tableName = XqlTableNameMap.Map(lo.Name, ws.Name);
                     int hRow = lo.HeaderRowRange.Row;
                     int hCol = lo.HeaderRowRange.Column;
                     int rowOffset = rng.Row - (hRow + 1);
                     int colOffset = rng.Column - hCol;
-                    return XqlSheet.CellKey(ws.Name, tableName, hRow, hCol, rowOffset, colOffset);
+                    return (ws.Name, XqlSheet.CellKey(ws.Name, tableName, hRow, hCol, rowOffset, colOffset));
                 }
                 finally { XqlCommon.ReleaseCom(lo); XqlCommon.ReleaseCom(ws); XqlCommon.ReleaseCom(rng); }
-            });
+            })!;
         }
 
         // (선택) 키를 더블클릭으로 점프할 때 사용: 상대키 → 현재 Range 복원

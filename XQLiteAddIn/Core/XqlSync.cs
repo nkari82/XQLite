@@ -4,10 +4,8 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
-using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
-using static System.Windows.Forms.VisualStyles.VisualStyleElement.Tab;
 using Excel = Microsoft.Office.Interop.Excel;
 
 namespace XQLite.AddIn
@@ -22,6 +20,7 @@ namespace XQLite.AddIn
         private readonly ConcurrentQueue<EditCell> _outbox = new();
         private readonly SemaphoreSlim _pushSem = new(1, 1);
         private readonly SemaphoreSlim _pullSem = new(1, 1);
+        private volatile bool _pullAgain;
 
         private long _maxRowVersion;
         public long MaxRowVersion => Interlocked.Read(ref _maxRowVersion);
@@ -32,11 +31,40 @@ namespace XQLite.AddIn
         private volatile bool _started;
         private volatile bool _disposed;
 
-        private readonly ConcurrentQueue<Conflict> _conflicts = new();
-        public bool TryDequeueConflict(out Conflict c) => _conflicts.TryDequeue(out c);
-
         // ⬇️ 엑셀 반영기
         private readonly ExcelPatchApplier _applier;
+
+        private const int UPSERT_CHUNK = 512;   // 1회 전송 셀 수
+        private const int UPSERT_SLICE_MS = 250; // 한번에 잡는 시간
+
+        private readonly ConcurrentQueue<Conflict> _conflicts = new();
+
+        private readonly ConcurrentDictionary<string, string?> _lastPushed = new(StringComparer.Ordinal);
+        private static string Key(EditCell e) => $"{e.Table}\n{XqlCommon.ValueToString(e.RowKey)}\n{e.Column}";
+
+        // Excel 값 정규화: null/빈문자/숫자/불린/date를 문자열로 안정 변환
+        private static string? Canon(object? v)
+        {
+            if (v is null) return null;
+            if (v is bool b) return b ? "1" : "0";
+            if (v is double d) return d.ToString("R", System.Globalization.CultureInfo.InvariantCulture); // Value2 숫자
+            if (v is DateTime dt) return dt.ToUniversalTime().Ticks.ToString(); // 필요 시 epoch ms로 변경
+            var s = v.ToString();
+            return string.IsNullOrWhiteSpace(s) ? null : s;
+        }
+
+        public void EnqueueIfChanged(string table, string rowKey, string column, object? value)
+        {
+            var e = new EditCell { Table = table, RowKey = rowKey, Column = column, Value = value };
+            var k = Key(e);
+            var norm = Canon(value);
+            if (_lastPushed.TryGetValue(k, out var prev) && prev == norm)
+                return; // 동일값 → 전송 생략
+            _outbox.Enqueue(e);
+        }
+
+        public bool TryDequeueConflict(out Conflict c) => _conflicts.TryDequeue(out c);
+
 
         public XqlSync(IXqlBackend backend, XqlSheet sheet, int pushIntervalMs = 2000, int pullIntervalMs = 10000)
         {
@@ -83,16 +111,45 @@ namespace XQLite.AddIn
             try { _pullTimer.Dispose(); } catch { }
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public void EnqueueCellEdit(string table, object rowKey, string column, object? value)
+        public void FlushUpsertsNow() => _ = FlushUpsertsNow(false);
+
+        public async Task PullSince(long? sinceOverride = null)
         {
-            if (_disposed) return;
-            _outbox.Enqueue(new EditCell(table, rowKey, column, value));
+            if (!await _pullSem.WaitAsync(0).ConfigureAwait(false))
+            {
+                _pullAgain = true; // 이미 실행 중 → 한 번 더 해달라 표시
+                return;
+            }
+            try
+            {
+                do
+                {
+                    _pullAgain = false;
+                    var since = sinceOverride ?? MaxRowVersion;
+                    var pr = await _backend.PullRows(since).ConfigureAwait(false);
+
+                    if (pr.Patches is { Count: > 0 })
+                        _applier.ApplyOnUiThread(pr.Patches);
+
+                    if (pr.MaxRowVersion > 0)
+                        XqlCommon.InterlockedMax(ref _maxRowVersion, pr.MaxRowVersion);
+                }
+                while (_pullAgain); // 실행 중 요청이 있었으면 즉시 최신 기준으로 1회 더
+            }
+            finally { _pullSem.Release(); }
         }
 
-        public void FlushUpsertsNow() => SafeFlushUpserts();
+        public async Task FlushUpsertsNow(bool force = false)
+        {
+            if (_disposed) return;
 
-        public Task<PullResult?> PullSince() => SafePull(MaxRowVersion);
+            // force면 _started 여부와 무관하게 1회 실행
+            if (!force && (!_started)) return;
+
+            if (!_pushSem.Wait(0)) return;
+            try { await FlushUpsertsCore().ConfigureAwait(false); }
+            finally { _pushSem.Release(); }
+        }
 
         private void SafeFlushUpserts()
         {
@@ -125,39 +182,42 @@ namespace XQLite.AddIn
             finally { _pullSem.Release(); }
         }
 
+        // ⬇️ 교체
         private async Task FlushUpsertsCore()
         {
             try
             {
                 if (_outbox.IsEmpty) return;
 
-                var batch = DrainDedupCells(_outbox, 512);
-                if (batch.Count == 0) return;
-
-                var resp = await _backend.UpsertCells(batch).ConfigureAwait(false);
-
-                if (resp.Errors?.Count > 0)
-                    foreach (var e in resp.Errors)
-                        _conflicts.Enqueue(Conflict.System("upsert", e));
-
-                if (resp.MaxRowVersion > 0)
-                    XqlCommon.InterlockedMax(ref _maxRowVersion, resp.MaxRowVersion);
-
-                if (resp.Conflicts is { Count: > 0 })
+                long deadline = XqlCommon.Monotonic.NowMs() + UPSERT_SLICE_MS;
+                do
                 {
-                    // 1) 내부 큐에도 enqueue (기존 동작)
-                    foreach (var c in resp.Conflicts)
-                        _conflicts.Enqueue(c);
-                    // 2) 워크시트 Conflict 뷰에도 누적
-                    XqlSheetView.AppendConflicts(resp.Conflicts.Cast<object>());
+                    var batch = DrainDedupCells(_outbox, UPSERT_CHUNK);
+                    if (batch.Count == 0) break;
+
+                    var resp = await _backend.UpsertCells(batch).ConfigureAwait(false);
+
+                    // ✅ 성공 반영값을 스냅샷에 기록(이후 동일값 재전송 방지)
+                    foreach (var e in batch)
+                        _lastPushed[Key(e)] = Canon(e.Value);
+
+                    if (resp.Errors is { Count: > 0 })
+                        foreach (var e in resp.Errors)
+                            _conflicts.Enqueue(Conflict.System("upsert", e));
+
+                    if (resp.MaxRowVersion > 0)
+                        XqlCommon.InterlockedMax(ref _maxRowVersion, resp.MaxRowVersion);
+
+                    if (resp.Conflicts is { Count: > 0 })
+                        foreach (var c in resp.Conflicts) _conflicts.Enqueue(c);
                 }
+                while (XqlCommon.Monotonic.NowMs() < deadline && !_outbox.IsEmpty);
             }
             catch (Exception ex)
             {
                 _conflicts.Enqueue(Conflict.System("upsert.core", ex.Message));
             }
         }
-
         private async Task<PullResult> PullCore(long sinceVersion)
         {
             var resp = await _backend.PullRows(sinceVersion).ConfigureAwait(false);
@@ -176,15 +236,16 @@ namespace XQLite.AddIn
         {
             try
             {
-                if (ev.MaxRowVersion > 0)
-                    XqlCommon.InterlockedMax(ref _maxRowVersion, ev.MaxRowVersion);
+                var before = MaxRowVersion;
 
-                // ⬇️ 푸시 패치 즉시 적용 (UI 스레드)
                 if (ev.Patches is { Count: > 0 })
                     _applier.ApplyOnUiThread(ev.Patches);
 
-                // 안전성 위해 한 번 더 Pull (fire-and-forget)
-                var _ = SafePull();
+                if (ev.MaxRowVersion > 0)
+                    XqlCommon.InterlockedMax(ref _maxRowVersion, ev.MaxRowVersion);
+
+                if (ev.MaxRowVersion > before + 1)
+                    _ = PullSince(before); // 갭 보정
             }
             catch (Exception ex)
             {
@@ -192,25 +253,20 @@ namespace XQLite.AddIn
             }
         }
 
+
         private static List<EditCell> DrainDedupCells(ConcurrentQueue<EditCell> q, int max)
         {
             var temp = new List<EditCell>(Math.Min(max * 2, 4096));
             for (int i = 0; i < max && q.TryDequeue(out var e); i++) temp.Add(e);
             if (temp.Count <= 1) return temp;
 
-            string Norm(object o) => XqlCommon.ValueToString(o); // 불변 문자열로 통일
+            // 튜플 comparer 캐스팅 대신 안정적인 문자열 키 사용
+            static string K(EditCell e) => $"{e.Table}\n{XqlCommon.ValueToString(e.RowKey)}\n{e.Column}";
 
-            var map = new Dictionary<(string Table, string RowKey, string Column), EditCell>(temp.Count, (IEqualityComparer<(string Table, string RowKey, string Column)>)StringComparer.Ordinal);
-            foreach (var e in temp)
-            {
-                var key = (e.Table, Norm(e.RowKey), e.Column);
-                map[key] = e; // 마지막 값 우선
-            }
+            var map = new Dictionary<string, EditCell>(temp.Count, StringComparer.Ordinal);
+            foreach (var e in temp) map[K(e)] = e; // 마지막 값 우선
             return map.Values.ToList();
         }
-
-
-        private readonly record struct CellKey(string Table, object RowKey, string Column);
 
         // ========== ⬇️ 엑셀 반영기: 서버 패치 → 시트 적용 (UI 스레드에서 실행) ==========
 

@@ -30,12 +30,22 @@ namespace XQLite.AddIn
         <group id='grpSync' label='동기화'>
           <button id='btnCommit' label='커밋'
                   onAction='OnCommit' imageMso='SaveAll'
-                  screentip='Commit'
-                  supertip='편집분(2초 디바운스)을 즉시 서버에 업서트합니다.'/>
+                  screentip='커밋'
+                  supertip='필요하면 테이블/컬럼을 생성하고, 변경된 셀만 효율적으로 업서트합니다.'/>
+          <button id='btnPull' label='풀'
+                  onAction='OnPull' imageMso='Refresh'
+                  screentip='풀'
+                  supertip='서버의 최신 증분만 내려받아 반영합니다.'/>
+          <toggleButton id='tglDropCols' label='헤더 외 컬럼 DROP'
+                        getPressed='DropCols_GetPressed'
+                        onAction='DropCols_OnToggle'
+                        imageMso='DeleteColumns'
+                        screentip='헤더에 없는 컬럼 삭제'
+                        supertip='켜면 커밋 시 헤더에 없는 서버 컬럼을 DROP합니다(주의: 되돌릴 수 없습니다). 끄면 컬럼은 추가만 합니다.'/>
         </group>
 
         <!-- 연결 상태 -->
-        <group id='grpConn' label='연결'>
+        <group id='grpConn' label='연결 상태'>
           <button id='btnStatus' size='large'
                   getLabel='XqlStatus_GetLabel'
                   getImage='XqlStatus_GetImage'
@@ -104,11 +114,11 @@ namespace XQLite.AddIn
                   supertip='엑셀 파일을 DB 원본으로 간주하여 서버를 재구성합니다.'/>
           <button id='btnExport'    label='내보내기'
                   onAction='OnExport' imageMso='ExportTextFile'
-                  screentip='Export'
+                  screentip='내보내기'
                   supertip='DB와 메타/로그를 zip으로 내보냅니다.'/>
           <button id='btnDiag'      label='진단 내보내기'
                   onAction='OnDiag' imageMso='FileSaveAs'
-                  screentip='Diagnostics Export'
+                  screentip='진단 내보내기'
                   supertip='문제 분석을 위한 진단 패키지를 zip으로 내보냅니다.'/>
         </group>
 
@@ -123,24 +133,22 @@ namespace XQLite.AddIn
             _ribbon = ribbon;
             try
             {
-                // 백엔드 상태 변경 시 버튼만 갱신(+ 상태바 선택 적용)
                 if (XqlAddIn.Backend is XqlGqlBackend be)
                 {
                     be.StateChanged += (_, __) =>
                         ExcelAsyncUtil.QueueAsMacro(() =>
                         {
+                            try { _ribbon?.InvalidateControl("btnStatus"); } catch { }
                             try
                             {
-                                var app = ExcelDnaUtil.Application as Excel.Application; // ✅ 캐스팅
-                                if (app != null)
-                                    app.StatusBar = XqlStatus_GetLabel(null!);           // 상태 텍스트 적용
+                                var app = ExcelDnaUtil.Application as Excel.Application;
+                                if (app != null) app.StatusBar = XqlStatus_GetLabel(null!);
                             }
-                            catch { /* ignore */ }
+                            catch { }
                         });
-
                 }
             }
-            catch { /* ignore */ }
+            catch { }
         }
 
         // ───────────────────────── General ─────────────────────────
@@ -150,28 +158,63 @@ namespace XQLite.AddIn
             catch (Exception ex) { MessageBox.Show(ex.Message, "XQLite", MessageBoxButtons.OK, MessageBoxIcon.Error); }
         }
 
-        public void OnCommit(IRibbonControl _) => XqlAddIn.ExcelInterop?.Cmd_CommitSync();
+        public void OnPull(IRibbonControl _)
+        {
+            try { XqlAddIn.ExcelInterop?.Cmd_PullOnly(); }
+            catch (Exception ex) { MessageBox.Show("Pull 실패: " + ex.Message, "XQLite"); }
+        }
+
+        // 기존 커밋 핸들러는 “스키마 보강 + 푸시 + 필요시 풀”
+        public void OnCommit(IRibbonControl _)
+        {
+            try { XqlAddIn.ExcelInterop?.Cmd_CommitSmart(); }
+            catch (Exception ex) { MessageBox.Show("Commit 실패: " + ex.Message, "XQLite"); }
+        }
+
+        // 리본 토글 상태 반환
+        public bool DropCols_GetPressed(IRibbonControl _)
+        {
+            try { return XqlConfig.DropColumnsOnCommit; }  // 설정 값 그대로 반영
+            catch { return false; }
+        }
+
+        // 토글 변경 시 저장
+        public void DropCols_OnToggle(IRibbonControl _, bool pressed)
+        {
+            try
+            {
+                XqlConfig.DropColumnsOnCommit = pressed; // 설정 반영
+                XqlConfig.Save();                        // 영구 저장
+                                                         // 즉시 UI 반영(선택): 상태바에 잠깐 안내
+                var app = ExcelDnaUtil.Application as Excel.Application;
+                if (app != null) app.StatusBar = pressed ? "DROP Columns on Commit: ON" : "DROP Columns on Commit: OFF";
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("설정 저장 실패: " + ex.Message, "XQLite");
+            }
+        }
 
         // ───────────────────────── Connection Status (Label / Icon / Tip / Click) ─────────────────────────
         public string XqlStatus_GetLabel(IRibbonControl _)
         {
             var be = XqlAddIn.Backend as XqlGqlBackend;
-            if (be == null) return "Offline";
+            if (be == null) return "오프라인";
 
             string since = "";
             if (be.LastOkUtc != DateTime.MinValue)
             {
                 var diff = DateTime.UtcNow - be.LastOkUtc;
-                since = diff.TotalSeconds < 60 ? $"{(int)diff.TotalSeconds}s" : $"{(int)(diff.TotalSeconds / 60)}m";
+                since = diff.TotalSeconds < 60 ? $"{(int)diff.TotalSeconds}초" : $"{(int)(diff.TotalSeconds / 60)}분";
                 since = " · " + since;
             }
 
             return be.State switch
             {
-                IXqlBackend.ConnState.Online => "Online" + since,
-                IXqlBackend.ConnState.Connecting => "Connecting…",
-                IXqlBackend.ConnState.Degraded => "Degraded" + since,
-                _ => "Offline"
+                IXqlBackend.ConnState.Online => "온라인" + since,
+                IXqlBackend.ConnState.Connecting => "연결 중…",
+                IXqlBackend.ConnState.Degraded => "품질 저하" + since,
+                _ => "오프라인"
             };
         }
 
@@ -189,9 +232,9 @@ namespace XQLite.AddIn
         public string XqlStatus_GetSupertip(IRibbonControl _)
         {
             var be = XqlAddIn.Backend as XqlGqlBackend;
-            if (be == null) return "Backend not initialized.";
+            if (be == null) return "백엔드가 초기화되지 않았습니다.";
             var detail = string.IsNullOrWhiteSpace(be.StateDetail) ? "" : $"\r\n{be.StateDetail}";
-            return $"Server state: {be.State}{detail}";
+            return $"서버 상태: {be.State}{detail}";
         }
 
         public async void XqlStatus_OnClick(IRibbonControl _)

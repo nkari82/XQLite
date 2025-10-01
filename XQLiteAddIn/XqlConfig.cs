@@ -30,6 +30,8 @@ namespace XQLite.AddIn
         [JsonProperty]
         public static int LockTtlSec { get; set; } = 10;
 
+        [JsonProperty]
+        public static bool DropColumnsOnCommit { get; set; } = false;
 
         private static string? _resolvedPath;
 
@@ -69,7 +71,8 @@ namespace XQLite.AddIn
                 PullSec,
                 DebounceMs,
                 HeartbeatSec,
-                LockTtlSec
+                LockTtlSec,
+                DropColumnsOnCommit,
             };
 
             var json = JsonConvert.SerializeObject(data, Formatting.Indented);
@@ -116,6 +119,7 @@ namespace XQLite.AddIn
                 DebounceMs = (int?)x["DebounceMs"] ?? DebounceMs;
                 HeartbeatSec = (int?)x["HeartbeatSec"] ?? HeartbeatSec;
                 LockTtlSec = (int?)x["LockTtlSec"] ?? LockTtlSec;
+                DropColumnsOnCommit = (bool?)x["DropColumnsOnCommit"] ?? DropColumnsOnCommit;
 
                 return true;
             }

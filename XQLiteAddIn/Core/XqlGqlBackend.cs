@@ -3,7 +3,6 @@
 using GraphQL;
 using GraphQL.Client.Http;
 using GraphQL.Client.Serializer.Newtonsoft;
-using Microsoft.Office.Interop.Excel;
 using Newtonsoft.Json.Linq;
 using System;
 using System.Collections.Generic;
@@ -15,7 +14,7 @@ using static XQLite.AddIn.IXqlBackend;
 
 namespace XQLite.AddIn
 {
-    
+
 
     // =======================================================================
     // Backend 인터페이스 (Async 전용)
@@ -25,7 +24,8 @@ namespace XQLite.AddIn
         internal enum ConnState { Disconnected, Connecting, Online, Degraded }
 
         // Sync (데이터 동기화)
-        Task<UpsertResult> UpsertCells(IReadOnlyList<EditCell> cells, CancellationToken ct = default);
+        Task<UpsertResult> UpsertCells(IEnumerable<EditCell> cells, CancellationToken ct = default);
+
         Task<PullResult> PullRows(long since, CancellationToken ct = default);
         void StartSubscription(Action<ServerEvent> onEvent, long since);
         void StopSubscription();
@@ -52,6 +52,10 @@ namespace XQLite.AddIn
         // 연결상태 하트비트(부작용 없음) — 호출할 때마다 상태 업데이트
         Task<long> PingAsync(CancellationToken ct = default);
 
+        Task<List<ColumnInfo>> GetTableColumns(string table, CancellationToken ct = default);
+
+        Task TryDropColumns(string table, IEnumerable<string> names, CancellationToken ct = default);
+
         // 상태 조회/이벤트
         event Action<ConnState, string?>? StateChanged;
         ConnState State { get; }
@@ -65,34 +69,36 @@ namespace XQLite.AddIn
     internal sealed class XqlGqlBackend : IXqlBackend
     {
         // ── GraphQL 문서 (서버 스키마에 맞춰 사용) ───────────────────────────────
-        private const string MUT_UPSERT = @"mutation($cells:[CellEditInput!]!){
-          upsertCells(cells:$cells){
-            max_row_version
-            errors
-            conflicts { table row_key column message server_version local_version }
-          }
-        }";
 
         // 1) Pull: Long → Int
         private const string Q_PULL = @"query($since:Int!){
-  rows(since_version:$since){
-    max_row_version
-    patches { table row_key row_version deleted cells }
-  }
-}";
+            rows(since_version:$since){
+                max_row_version
+                patches { table row_key row_version deleted cells }
+            }
+        }";
 
         // 2) Subscription: rowsChanged → events, 변수 제거
         private const string SUB_ROWS = @"subscription{
-  events{
-    max_row_version
-    patches { table row_key row_version deleted cells }
-  }
-}";
+            events{
+                max_row_version
+                patches { table row_key row_version deleted cells }
+            }
+        }";
+
+        private const string MUT_UPSERT_CELLS = @"
+            mutation($cells:[CellEditInput!]!){
+                upsertCells(cells:$cells){
+                max_row_version
+                errors
+                conflicts { table row_key column message }
+            }
+        }";
 
         // 3) PresenceTouch는 동일 (변경 없음)
         private const string MUT_PRESENCE = @"mutation($n:String!,$s:String,$c:String){
-  presenceTouch(nickname:$n, sheet:$s, cell:$c){ ok }
-}";
+            presenceTouch(nickname:$n, sheet:$s, cell:$c){ ok }
+        }";
 
         private const string MUT_ACQUIRE = @"mutation($cell:String!, $by:String!){ acquireLock(cell:$cell, by:$by){ ok } }";
         private const string MUT_RELEASE_BY = @"mutation($by:String!){ releaseLocksBy(by:$by){ ok } }";
@@ -103,31 +109,39 @@ namespace XQLite.AddIn
 
         // 4) addColumns: notnull → notNull
         private const string MUT_ADD_COLUMNS = @"mutation($table:String!, $columns:[ColumnDefInput!]!){
-  addColumns(table:$table, columns:$columns){ ok }
-}";
+            addColumns(table:$table, columns:$columns){ ok }
+        }";
 
         // 5) upsertRows: 서버 반환과 일치하게 selection 축소
         private const string MUT_UPSERT_ROWS = @"mutation ($table:String!,$rows:[JSON!]!){
-  upsertRows(table:$table, rows:$rows){
-    max_row_version
-    errors
-  }
-}";
-
+                upsertRows(table:$table, rows:$rows){
+                max_row_version
+                errors
+            }
+        }";
 
         // 6) meta: JSON 스칼라 → 필드 선택 없이 그대로
         private const string Q_META = @"query{ meta }";
 
         // 7) audit: Long → Int
         private const string Q_AUDIT = @"query($since:Int){
-  audit_log(since_version:$since){
-    ts user table row_key column old_value new_value row_version
-  }
-}";
+                audit_log(since_version:$since){
+                ts user table row_key column old_value new_value row_version
+            }
+        }";
 
         private const string Q_EXPORT_DB = @"query{ exportDatabase }";
 
         private const string Q_PRESENCE = @"query { presence { nickname sheet cell updated_at } }";
+
+        // ── GQL
+        private const string Q_TABLE_COLUMNS = @"query($t:String!){
+            tableColumns(table:$t){ name type notnull pk }
+        }";
+
+        private const string MUT_DROP_COLUMNS = @"mutation($t:String!,$ns:[String!]!){
+            dropColumns(table:$t, names:$ns){ ok }
+        }";
 
         // ── 필드 ─────────────────────────────────────────────────────────────
         private readonly GraphQLHttpClient _http;
@@ -234,34 +248,16 @@ namespace XQLite.AddIn
 
 
         // ── Sync ─────────────────────────────────────────────────────────────
-        public async Task<UpsertResult> UpsertCells(IReadOnlyList<EditCell> cells, CancellationToken ct = default)
-        {
-            var req = new GraphQLRequest
-            {
-                Query = MUT_UPSERT,
-                Variables = new
-                {
-                    cells = cells.Select(c => new
-                    {
-                        table = c.Table,
-                        row_key = c.RowKey,
-                        column = c.Column,
-                        value = c.Value
-                    }).ToArray()
-                }
-            };
-
-            // 뮤테이션은 SendMutationAsync 사용
-            var resp = await _http.SendMutationAsync<JObject>(req, ct).ConfigureAwait(false);
-            return ParseUpsert(resp.Data);
-        }
-
         public async Task<PullResult> PullRows(long since, CancellationToken ct = default)
         {
-            var req = new GraphQLRequest { Query = Q_PULL, Variables = new { since } };
+            // 서버 rows(since_version: Int!) 스키마 보호
+            var since32 = (int)Math.Min(Math.Max(since, int.MinValue), int.MaxValue);
+
+            var req = new GraphQLRequest { Query = Q_PULL, Variables = new { since = since32 } };
             var resp = await _http.SendQueryAsync<JObject>(req, ct).ConfigureAwait(false);
             return ParsePull(resp.Data);
         }
+
 
         public void StartSubscription(Action<ServerEvent> onEvent, long since)
         {
@@ -311,11 +307,15 @@ namespace XQLite.AddIn
             _http.SendMutationAsync<JObject>(new GraphQLRequest { Query = MUT_RELEASE_BY, Variables = new { by } }, ct);
 
         // ── Backup / Schema ──────────────────────────────────────────────────
-        public Task TryCreateTable(string table, string key, CancellationToken ct = default) =>
-            _http.SendMutationAsync<JObject>(new GraphQLRequest { Query = MUT_CREATE_TABLE, Variables = new { table, key } }, ct);
+        public Task TryCreateTable(string table, string key, CancellationToken ct = default)
+            => _http.SendMutationAsync<object>(new GraphQLRequest
+            {
+                Query = MUT_CREATE_TABLE,
+                Variables = new { table, key }
+            }, ct);
 
-        public Task TryAddColumns(string table, IEnumerable<ColumnDef> cols, CancellationToken ct = default) =>
-            _http.SendMutationAsync<JObject>(new GraphQLRequest
+        public Task TryAddColumns(string table, IEnumerable<ColumnDef> cols, CancellationToken ct = default)
+            => _http.SendMutationAsync<object>(new GraphQLRequest
             {
                 Query = MUT_ADD_COLUMNS,
                 Variables = new
@@ -325,7 +325,7 @@ namespace XQLite.AddIn
                     {
                         name = c.Name,
                         kind = c.Kind,
-                        notNull = c.NotNull,   // ✅ 여기!
+                        notNull = c.NotNull,
                         check = c.Check
                     }).ToArray()
                 }
@@ -373,6 +373,41 @@ namespace XQLite.AddIn
             var resp = await _http.SendMutationAsync<JObject>(req, ct).ConfigureAwait(false);
             var parsed = ParseUpsert(resp.Data);
             return parsed.Errors == null || parsed.Errors.Count == 0;
+        }
+
+        public async Task<UpsertResult> UpsertCells(IEnumerable<EditCell> cells, CancellationToken ct = default)
+        {
+            var req = new GraphQLRequest { Query = MUT_UPSERT_CELLS, Variables = new { cells } };
+            var resp = await _http.SendMutationAsync<JObject>(req, ct).ConfigureAwait(false);
+
+            var root = resp.Data?["upsertCells"] as JObject
+                       ?? throw new Exception("upsertCells: empty response");
+
+            return new UpsertResult
+            {
+                MaxRowVersion = (long?)root["max_row_version"] ?? 0,
+                Errors = root["errors"] is JArray ea ? ea.Select(x => x?.ToString() ?? "").ToList() : null,
+                Conflicts = root["conflicts"] is JArray ca ? ca.ToObject<List<Conflict>>() : null
+            };
+        }
+
+        // ── 호출
+        public async Task<List<ColumnInfo>> GetTableColumns(string table, CancellationToken ct = default)
+        {
+            var req = new GraphQLRequest { Query = Q_TABLE_COLUMNS, Variables = new { t = table } };
+            var resp = await _http.SendQueryAsync<JObject>(req, ct).ConfigureAwait(false);
+            var arr = resp.Data?["tableColumns"] as JArray;
+            return arr?.ToObject<List<ColumnInfo>>() ?? new List<ColumnInfo>();
+        }
+
+        public Task TryDropColumns(string table, IEnumerable<string> names, CancellationToken ct = default)
+        {
+            var list = names?.Distinct(StringComparer.Ordinal) ?? Enumerable.Empty<string>();
+            return _http.SendMutationAsync<object>(new GraphQLRequest
+            {
+                Query = MUT_DROP_COLUMNS,
+                Variables = new { t = table, ns = list.ToArray() }
+            }, ct);
         }
 
         // ── Parser bridge ────────────────────────────────────────────────────
@@ -561,6 +596,15 @@ namespace XQLite.AddIn
 
 
     // Parser 결과 DTO
+
+    public sealed class ColumnInfo
+    {
+        public string name { get; set; } = "";
+        public string? type { get; set; }
+        public bool notnull { get; set; }
+        public bool pk { get; set; }
+    }
+
     internal sealed class UpsertResult
     {
         public long MaxRowVersion;

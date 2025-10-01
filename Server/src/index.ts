@@ -120,6 +120,17 @@ function ensureTable(table: string, key: string) {
 
 type ColumnDefInput = { name: string; kind?: string; notNull?: boolean; check?: string };
 
+const GqlColumnInfo = new GraphQLObjectType({
+  name: "ColumnInfo",
+  fields: {
+    name: { type: new GraphQLNonNull(GraphQLString) },
+    type: { type: GraphQLString },        // declared type (affinity용)
+    notnull: { type: new GraphQLNonNull(GraphQLBoolean) },
+    pk: { type: new GraphQLNonNull(GraphQLBoolean) },
+  }
+});
+
+
 function addColumns(table: string, defs: ColumnDefInput[]) {
   const pragmaCols = db.prepare(`PRAGMA table_info("${table}")`).all() as any[];
   const have = new Set<string>(pragmaCols.map(c => String(c.name)));
@@ -465,6 +476,19 @@ const Query = new GraphQLObjectType({
         const s = db.prepare(`SELECT table_name,key_column FROM _schema`).all() as any[];
         return { meta: Object.fromEntries(m.map(r => [r.k, r.v])), schema: s };
       }
+    },
+    tableColumns: {
+      args: { table: { type: new GraphQLNonNull(GraphQLString) } },
+      type: new GraphQLNonNull(new GraphQLList(new GraphQLNonNull(GqlColumnInfo))),
+      resolve: (_src, { table }: { table: string }) => {
+        const rows = db.prepare(`PRAGMA table_info("${table}")`).all() as any[];
+        return rows.map(r => ({
+          name: String(r.name),
+          type: r.type ? String(r.type) : null,
+          notnull: Number(r.notnull) === 1,
+          pk: Number(r.pk) >= 1
+        }));
+      }
     }
   }
 });
@@ -551,6 +575,24 @@ const Mutation = new GraphQLObjectType({
       type: new GraphQLNonNull(GqlOk),
       resolve: (_src, { by }: { by: string }) => {
         db.prepare<[string]>(`DELETE FROM _locks WHERE by=?`).run(by);
+        return { ok: true };
+      }
+    },
+    dropColumns: {
+      args: {
+        table: { type: new GraphQLNonNull(GraphQLString) },
+        names: { type: new GraphQLNonNull(new GraphQLList(new GraphQLNonNull(GraphQLString))) }
+      },
+      type: new GraphQLNonNull(GqlOk),
+      resolve: (_src, { table, names }: { table: string; names: string[] }) => {
+        if (!names.length) return { ok: true };
+        const tx = db.transaction(() => {
+          for (const n of names) {
+            // SQLite 3.35+ 지원: DROP COLUMN
+            db.exec(`ALTER TABLE "${table}" DROP COLUMN "${n}"`);
+          }
+        });
+        tx();
         return { ok: true };
       }
     },

@@ -1,13 +1,12 @@
 ﻿// XqlCommon.cs
-using ExcelDna.Integration;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
-using System.Reflection;
-using System.Runtime.ConstrainedExecution;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
 using Excel = Microsoft.Office.Interop.Excel;
@@ -17,6 +16,13 @@ namespace XQLite.AddIn
 {
     internal static class XqlCommon
     {
+        // XqlCommon.cs (공용으로 쓰고 싶다면)
+        public static class Monotonic
+        {
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            public static long NowMs() => (Stopwatch.GetTimestamp() * 1000L) / Stopwatch.Frequency;
+        }
+
         // Excel Column Index -> "A, B, ..., Z, AA ..." 폴백 헤더명
         internal static string ColumnIndexToLetter(int col)
         {
