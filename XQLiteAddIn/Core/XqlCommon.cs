@@ -1,4 +1,5 @@
 ﻿// XqlCommon.cs
+using Newtonsoft.Json;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -21,6 +22,50 @@ namespace XQLite.AddIn
         {
             [MethodImpl(MethodImplOptions.AggressiveInlining)]
             public static long NowMs() => (Stopwatch.GetTimestamp() * 1000L) / Stopwatch.Frequency;
+        }
+
+        public readonly struct ExcelBatchScope : IDisposable
+        {
+            private readonly Excel.Application? _app;
+            private readonly bool _oldEvents, _oldScreen, _oldAlerts;
+            private readonly Excel.XlCalculation _oldCalc;
+
+            public ExcelBatchScope(Excel.Application? app)
+            {
+                _app = app;
+                if (app == null)
+                {
+                    _oldEvents = _oldScreen = _oldAlerts = false;
+                    _oldCalc = Excel.XlCalculation.xlCalculationAutomatic;
+                    return;
+                }
+                try
+                {
+                    _oldEvents = app.EnableEvents;
+                    _oldScreen = app.ScreenUpdating;
+                    _oldAlerts = app.DisplayAlerts;
+                    _oldCalc = app.Calculation;
+
+                    app.EnableEvents = false;
+                    app.ScreenUpdating = false;
+                    app.DisplayAlerts = false;
+                    app.Calculation = Excel.XlCalculation.xlCalculationManual;
+                }
+                catch { /* ignore */ }
+            }
+
+            public void Dispose()
+            {
+                if (_app == null) return;
+                try
+                {
+                    _app.Calculation = _oldCalc;
+                    _app.DisplayAlerts = _oldAlerts;
+                    _app.ScreenUpdating = _oldScreen;
+                    _app.EnableEvents = _oldEvents;
+                }
+                catch { /* ignore */ }
+            }
         }
 
         // Excel Column Index -> "A, B, ..., Z, AA ..." 폴백 헤더명
@@ -254,6 +299,49 @@ namespace XQLite.AddIn
                 _ => Convert.ToString(v, CultureInfo.InvariantCulture) ?? string.Empty,
             };
             return s.Normalize(NormalizationForm.FormC);
+        }
+
+        // ── 파일/상태 보조 ──────────────────────────────────────────────
+        /// <summary>워크북 경로 옆에 숨김 상태폴더 생성/보장 (기본 ".xql")</summary>
+        public static string EnsureHiddenStateDir(string workbookFullName, string? dirName = null)
+        {
+            string baseDir = Path.GetDirectoryName(workbookFullName)
+                             ?? Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            var leaf = string.IsNullOrWhiteSpace(dirName) ? XqlConfig.StateDirName : dirName!;
+            if (string.IsNullOrWhiteSpace(leaf)) leaf = ".xql";
+            string dir = Path.Combine(baseDir, leaf);
+            try
+            {
+                if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+                var di = new DirectoryInfo(dir);
+                di.Attributes |= FileAttributes.Hidden; // 윈도우 숨김
+            }
+            catch { /* 무시 */ }
+            return dir;
+        }
+
+        public static T? LoadJsonFile<T>(string path)
+        {
+            try { if (!File.Exists(path)) return default; return JsonConvert.DeserializeObject<T>(File.ReadAllText(path)); }
+            catch { return default; }
+        }
+
+        public static void SaveJsonFile<T>(string path, T data)
+        {
+            try
+            {
+                var json = JsonConvert.SerializeObject(data, Formatting.Indented);
+                File.WriteAllText(path, json);
+            }
+            catch { /* 조용히 무시 */ }
+        }
+
+        public static string SanitizeFileStem(string s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return "default";
+            var bad = Path.GetInvalidFileNameChars();
+            var arr = s.Select(ch => bad.Contains(ch) ? '_' : ch).ToArray();
+            return new string(arr);
         }
     }
 }

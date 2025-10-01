@@ -4,8 +4,6 @@ using Microsoft.Office.Interop.Excel;
 using System;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Windows.Forms;
-using System.Windows.Input;
 using Excel = Microsoft.Office.Interop.Excel;
 using Timer = System.Threading.Timer;
 
@@ -171,9 +169,11 @@ namespace XQLite.AddIn
                 try
                 {
                     var app = (Excel.Application)ExcelDnaUtil.Application;
-                    if (XqlSheet.TryParse(key, out var desc) &&
-                        XqlSheet.TryResolve(app, desc, out var range, out _, out _))
-                    { range?.Select(); return true; }
+                    if (XqlSheet.TryParse(key, out var desc) && XqlSheet.TryResolve(app, desc, out var range, out _, out _))
+                    {
+                        try { range?.Select(); return true; }
+                        finally { XqlCommon.ReleaseCom(range); }
+                    }
                 }
                 catch { }
                 return false;

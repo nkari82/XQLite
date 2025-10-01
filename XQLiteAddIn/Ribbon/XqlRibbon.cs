@@ -1,8 +1,8 @@
-﻿using ExcelDna.Integration.CustomUI;
+﻿using ExcelDna.Integration; // ExcelDnaUtil.Application
+using ExcelDna.Integration.CustomUI;
 using System;
 using System.Windows.Forms;
 using Excel = Microsoft.Office.Interop.Excel;
-using ExcelDna.Integration; // ExcelDnaUtil.Application
 
 namespace XQLite.AddIn
 {
@@ -218,15 +218,22 @@ namespace XQLite.AddIn
             };
         }
 
-        public string XqlStatus_GetImage(IRibbonControl _)
+        public stdole.IPictureDisp? XqlStatus_GetImage(IRibbonControl _)
         {
-            return (XqlAddIn.Backend as XqlGqlBackend)?.State switch
+            try
             {
-                IXqlBackend.ConnState.Online => "PersonaStatusOnline",
-                IXqlBackend.ConnState.Connecting => "PersonaStatusAway",
-                IXqlBackend.ConnState.Degraded => "PersonaStatusBusy",
-                _ => "PersonaStatusOffline"
-            };
+                var app = ExcelDnaUtil.Application as Excel.Application;
+                if (app == null) return null;
+                var msoId = (XqlAddIn.Backend as XqlGqlBackend)?.State switch
+                {
+                    IXqlBackend.ConnState.Online => "PersonaStatusOnline",
+                    IXqlBackend.ConnState.Connecting => "PersonaStatusAway",
+                    IXqlBackend.ConnState.Degraded => "PersonaStatusBusy",
+                    _ => "PersonaStatusOffline"
+                };
+                return (stdole.IPictureDisp)app.CommandBars.GetImageMso(msoId, 32, 32);
+            }
+            catch { return null; }
         }
 
         public string XqlStatus_GetSupertip(IRibbonControl _)
@@ -241,7 +248,7 @@ namespace XQLite.AddIn
         {
             var be = XqlAddIn.Backend as XqlGqlBackend;
             if (be == null) return;
-            try { await be.PingAsync(); }
+            try { await be.Ping(); }
             catch { /* 실패해도 상태는 이벤트로 갱신됨 */ }
         }
 

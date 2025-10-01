@@ -722,7 +722,180 @@ namespace XQLite.AddIn
         }
 
 
+
+        public static void ApplyOnUiThread(IReadOnlyList<RowPatch> patches)
+        {
+            ExcelAsyncUtil.QueueAsMacro(() =>
+            {
+                var app = ExcelDnaUtil.Application as Excel.Application;
+                if (app == null || patches == null || patches.Count == 0) return;
+
+                using var scope = new XqlCommon.ExcelBatchScope(app); // 화면/이벤트/자동계산 OFF (짧게)
+
+                InternalApplyCore(app, patches); // ✅ 아래 (B)에 구현
+            });
+        }
+
         // Private
+
+        private static void InternalApplyCore(Excel.Application app, IReadOnlyList<RowPatch> patches)
+        {
+            // 테이블별 그룹 → 한 번에 처리
+            foreach (var grp in patches.GroupBy(p => p.Table, StringComparer.Ordinal))
+            {
+                Excel.Worksheet? ws = null; Excel.Range? header = null; Excel.ListObject? lo = null;
+                try
+                {
+                    // 1) 테이블명 → 워크시트/SheetMeta 찾기
+                    var smeta = default(SheetMeta);
+                    ws = FindWorksheetByTable(app, grp.Key, out smeta);
+                    if (ws == null || smeta == null) continue;
+
+                    // 2) 헤더/테이블 범위
+                    lo = XqlSheet.FindListObjectByTable(ws, grp.Key);
+                    header = lo?.HeaderRowRange ?? XqlSheet.GetHeaderRange(ws);
+                    if (header == null) continue;
+
+                    var headers = new List<string>(header.Columns.Count);
+                    for (int i = 1; i <= header.Columns.Count; i++)
+                    {
+                        Excel.Range? hc = null;
+                        try
+                        {
+                            hc = (Excel.Range)header.Cells[1, i];
+                            var nm = (hc.Value2 as string)?.Trim();
+                            headers.Add(string.IsNullOrEmpty(nm)
+                                ? XqlCommon.ColumnIndexToLetter(header.Column + i - 1)
+                                : nm!);
+                        }
+                        finally { XqlCommon.ReleaseCom(hc); }
+                    }
+                    if (headers.Count == 0) continue;
+
+                    // 3) 키 컬럼(절대열) 계산
+                    int keyIdx1 = XqlSheet.FindKeyColumnIndex(headers, smeta.KeyColumn); // 1-based
+                    int keyAbsCol = header.Column + keyIdx1 - 1;
+                    int firstDataRow = header.Row + 1;
+
+                    // 4) 패치 적용
+                    foreach (var patch in grp)
+                    {
+                        try
+                        {
+                            int? row = XqlSheet.FindRowByKey(ws, firstDataRow, keyAbsCol, patch.RowKey);
+                            if (patch.Deleted)
+                            {
+                                if (row.HasValue) SafeDeleteRow(ws, row.Value);
+                                continue;
+                            }
+                            if (!row.HasValue) row = AppendNewRow(ws, firstDataRow, lo);
+
+                            ApplyCells(ws, row!.Value, header, headers, smeta, patch.Cells);
+                        }
+                        catch { /* per-row 안전 */ }
+                    }
+                }
+                finally
+                {
+                    XqlCommon.ReleaseCom(lo);
+                    XqlCommon.ReleaseCom(header);
+                    XqlCommon.ReleaseCom(ws);
+                }
+            }
+        }
+
+        // === 보조 메서드들 ===
+        private static Excel.Worksheet? FindWorksheetByTable(Excel.Application app, string table, out SheetMeta? smeta)
+        {
+            smeta = null; Excel.Worksheet? match = null;
+            try
+            {
+                foreach (Excel.Worksheet w in app.Worksheets)
+                {
+                    try
+                    {
+                        string name = w.Name;
+                        if (XqlAddIn.Sheet!.TryGetSheet(name, out var m))
+                        {
+                            if (string.Equals(m.TableName ?? name, table, StringComparison.Ordinal) ||
+                                string.Equals(name, table, StringComparison.Ordinal))
+                            {
+                                smeta = m; match = w; break;
+                            }
+                        }
+                    }
+                    finally { if (!ReferenceEquals(match, w)) XqlCommon.ReleaseCom(w); }
+                }
+            }
+            catch { }
+            return match;
+        }
+
+        private static int AppendNewRow(Excel.Worksheet ws, int firstDataRow, Excel.ListObject? lo)
+        {
+            if (lo != null)
+            {
+                try
+                {
+                    var lr = lo.ListRows.Add(); XqlCommon.ReleaseCom(lr);
+                    var body = lo.DataBodyRange;
+                    if (body != null)
+                    {
+                        int row = body.Row + body.Rows.Count - 1;
+                        XqlCommon.ReleaseCom(body);
+                        return row;
+                    }
+                }
+                catch { /* 폴백 */ }
+            }
+            int last = firstDataRow;
+            try { var used = ws.UsedRange; last = used.Row + used.Rows.Count - 1; XqlCommon.ReleaseCom(used); }
+            catch { }
+            return Math.Max(firstDataRow, last + 1);
+        }
+
+        private static void ApplyCells(Excel.Worksheet ws, int row, Excel.Range header,
+                                       List<string> headers, SheetMeta meta, Dictionary<string, object?> cells)
+        {
+            for (int c = 0; c < headers.Count; c++)
+            {
+                var colName = headers[c];
+                if (string.IsNullOrWhiteSpace(colName)) continue;
+                if (!meta.Columns.ContainsKey(colName)) continue;      // 메타에 없는 컬럼 Skip
+                if (!cells.TryGetValue(colName, out var val)) continue;
+
+                Excel.Range? rg = null;
+                try
+                {
+                    rg = (Excel.Range)ws.Cells[row, header.Column + c]; // 절대열 기준
+                    if (val == null) { rg.Value2 = null; continue; }
+
+                    switch (val)
+                    {
+                        case bool b: rg.Value2 = b; break;
+                        case long l: rg.Value2 = (double)l; break;
+                        case int i: rg.Value2 = (double)i; break;
+                        case double d: rg.Value2 = d; break;
+                        case float f: rg.Value2 = (double)f; break;
+                        case decimal m: rg.Value2 = (double)m; break;
+                        case DateTime dt: rg.Value2 = dt.ToOADate(); break;
+                        default: rg.Value2 = Convert.ToString(val, System.Globalization.CultureInfo.InvariantCulture); break;
+                    }
+                    MarkTouchedCell(rg);
+                }
+                catch (Exception ex)
+                {
+                    XqlLog.Error($"패치 적용 실패: {ex.Message}", ws.Name, rg?.Address[false, false] ?? "");
+                }
+                finally { XqlCommon.ReleaseCom(rg); }
+            }
+        }
+
+        private static void SafeDeleteRow(Excel.Worksheet ws, int row)
+        {
+            try { var rg = (Excel.Range)ws.Rows[row]; rg.Delete(); XqlCommon.ReleaseCom(rg); }
+            catch { }
+        }
 
         private static Excel.Worksheet FindOrCreateSheet(Excel.Workbook wb, string name)
         {
@@ -1037,54 +1210,5 @@ namespace XQLite.AddIn
                 });
             });
         }
-
-        // (Option) JSON/특수 타입 보조 검사 – 메시지 박스 직접 띄우기
-        // Worksheet_Change if (XqlSheet.TryGetSheet(ws.Name, out var sm)) XqlSheetView.EnforceTypeOnChange(ws, target, sm);
-#if false
-        internal static void EnforceTypeOnChange(Excel.Worksheet ws, Excel.Range target, SheetMeta sm)
-        {
-            // 헤더/표 찾기
-            var lo = XqlSheet.FindListObjectContaining(ws, target);
-            if (lo?.HeaderRowRange == null || lo.DataBodyRange == null) return;
-
-            // 대상이 바디와 교차?
-            if (ws.Application.Intersect(lo.DataBodyRange, target) == null) return;
-
-            foreach (Excel.Range cell in target.Cells)
-            {
-                Excel.ListColumn? lc = null; Excel.Range? h = null;
-                try
-                {
-                    lc = lo.ListColumns[cell.Column - lo.DataBodyRange.Column + 1];
-                    h = (Excel.Range?)(lc?.Range.Cells[1, 1]);
-                    var name = (h?.Value2 as string)?.Trim();
-                    if (string.IsNullOrEmpty(name) || !sm.Columns.TryGetValue(name!, out var ct)) continue;
-
-                    var txt = (cell.Value2 is string s) ? s : cell.Value2?.ToString();
-                    if (!IsValueValidForKind(txt, ct.Kind))
-                    {
-                        MessageBox.Show($"[{name}] 열은 {ct.Kind} 형식입니다. 올바른 값을 입력하세요.", "XQLite",
-                                         MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                        // 되돌리기(선택): cell.Value2 = null;
-                    }
-                }
-                finally { XqlCommon.ReleaseCom(lc); XqlCommon.ReleaseCom(h); XqlCommon.ReleaseCom(cell); }
-            }
-        }
-
-        private static bool IsValueValidForKind(string? v, ColumnKind kind)
-        {
-            if (string.IsNullOrEmpty(v)) return true; // 빈칸 허용
-            switch (kind)
-            {
-                case ColumnKind.Int: return long.TryParse(v, out _);
-                case ColumnKind.Real: return double.TryParse(v, out _);
-                case ColumnKind.Bool: return string.Equals(v, "TRUE", true) || string.Equals(v, "FALSE", true);
-                case ColumnKind.Json:
-                    try { Newtonsoft.Json.Linq.JToken.Parse(v); return true; } catch { return false; }
-                default: return true;
-            }
-        }
-#endif
     }
 }

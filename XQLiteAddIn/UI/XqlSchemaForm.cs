@@ -100,13 +100,13 @@ namespace XQLite.AddIn
             sp.Panel2.Controls.Add(lvCols);
             Controls.Add(sp);
 
-            lvTables.SelectedIndexChanged += async (_, __) => await LoadColumnsAsync();
-            Load += async (_, __) => await LoadTablesAsync();
-            auto.Tick += async (_, __) => await LoadTablesAsync();
+            lvTables.SelectedIndexChanged += async (_, __) => await LoadColumns();
+            Load += async (_, __) => await LoadTables();
+            auto.Tick += async (_, __) => await LoadTables();
             auto.Start();
         }
 
-        private async Task LoadTablesAsync()
+        private async Task LoadTables()
         {
             try
             {
@@ -161,7 +161,7 @@ namespace XQLite.AddIn
                 _tables = tables.ToArray();
 
                 // 2) row count 보강 (PullRows(0) 스냅샷으로 라이브 행수 계산)
-                await EnrichRowCountsAsync(_tables).ConfigureAwait(true);
+                await EnrichRowCounts(_tables).ConfigureAwait(true);
 
                 BindTables(_tables);
             }
@@ -171,7 +171,7 @@ namespace XQLite.AddIn
             }
         }
 
-        private async Task EnrichRowCountsAsync(TableItem[] tables)
+        private async Task EnrichRowCounts(TableItem[] tables)
         {
             try
             {
@@ -223,7 +223,7 @@ namespace XQLite.AddIn
             lvCols.Items.Clear();
         }
 
-        private async Task LoadColumnsAsync()
+        private async Task LoadColumns()
         {
             if (lvTables.SelectedItems.Count == 0) { lvCols.Items.Clear(); return; }
             if (lvTables.SelectedItems[0].Tag is not TableItem ti) { lvCols.Items.Clear(); return; }

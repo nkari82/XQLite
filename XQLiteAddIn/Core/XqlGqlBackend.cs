@@ -50,7 +50,7 @@ namespace XQLite.AddIn
 
 
         // 연결상태 하트비트(부작용 없음) — 호출할 때마다 상태 업데이트
-        Task<long> PingAsync(CancellationToken ct = default);
+        Task<long> Ping(CancellationToken ct = default);
 
         Task<List<ColumnInfo>> GetTableColumns(string table, CancellationToken ct = default);
 
@@ -206,7 +206,7 @@ namespace XQLite.AddIn
         }
 
         // ⬇️ 연결상태 하트비트 (호출 시 상태 업데이트)
-        public async Task<long> PingAsync(CancellationToken ct = default)
+        public async Task<long> Ping(CancellationToken ct = default)
         {
             try
             {
@@ -241,7 +241,7 @@ namespace XQLite.AddIn
             try
             {
                 // 연결상태 확인 (상태는 PingAsync 내부에서 갱신됨)
-                await PingAsync().ConfigureAwait(false);
+                await Ping().ConfigureAwait(false);
             }
             catch { /* 네트워크 일시 오류는 무시 */ }
         }
@@ -339,7 +339,13 @@ namespace XQLite.AddIn
 
         public async Task<JArray?> TryFetchAuditLog(long? since = null, CancellationToken ct = default)
         {
-            var resp = await _http.SendQueryAsync<JObject>(new GraphQLRequest { Query = Q_AUDIT, Variables = new { since } }, ct).ConfigureAwait(false);
+            int? s = null;
+            if (since.HasValue)
+            {
+                var clamped = Math.Max(int.MinValue, Math.Min(int.MaxValue, since.Value));
+                s = unchecked((int)clamped);
+            }
+            var resp = await _http.SendQueryAsync<JObject>(new GraphQLRequest { Query = Q_AUDIT, Variables = new { since = s } }, ct).ConfigureAwait(false);
             return resp.Data?["audit_log"] as JArray;
         }
 

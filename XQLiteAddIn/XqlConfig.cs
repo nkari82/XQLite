@@ -33,20 +33,27 @@ namespace XQLite.AddIn
         [JsonProperty]
         public static bool DropColumnsOnCommit { get; set; } = false;
 
+        [JsonProperty]
+        public static bool AlwaysFullPullOnStartup { get; set; } = true;
+        [JsonProperty]
+        public static bool FullPullWhenSchemaChanged { get; set; } = true;
+        [JsonProperty]
+        public static string StateDirName { get; set; } = ".xql";
+
         private static string? _resolvedPath;
 
 
         public static void Load()
         {
-            if (TryEnv("XQL_CONFIG")) 
+            if (TryEnv("XQL_CONFIG"))
                 return;
 
             var sidecar = TryWorkbookSidecar();
-            if (sidecar is not null && TryFile(sidecar)) 
+            if (sidecar is not null && TryFile(sidecar))
                 return;
 
             var roaming = RoamingPath();
-            if (TryFile(roaming)) 
+            if (TryFile(roaming))
                 return;
 
             _resolvedPath = sidecar ?? roaming;
@@ -73,6 +80,9 @@ namespace XQLite.AddIn
                 HeartbeatSec,
                 LockTtlSec,
                 DropColumnsOnCommit,
+                AlwaysFullPullOnStartup,
+                FullPullWhenSchemaChanged,
+                StateDirName,
             };
 
             var json = JsonConvert.SerializeObject(data, Formatting.Indented);
@@ -96,9 +106,9 @@ namespace XQLite.AddIn
 
         internal static bool TryFile(string path)
         {
-            try 
-            { 
-                return TryJson(File.ReadAllText(path)) && (_resolvedPath = path) == path; 
+            try
+            {
+                return TryJson(File.ReadAllText(path)) && (_resolvedPath = path) == path;
             }
             catch { return false; }
         }
@@ -120,6 +130,9 @@ namespace XQLite.AddIn
                 HeartbeatSec = (int?)x["HeartbeatSec"] ?? HeartbeatSec;
                 LockTtlSec = (int?)x["LockTtlSec"] ?? LockTtlSec;
                 DropColumnsOnCommit = (bool?)x["DropColumnsOnCommit"] ?? DropColumnsOnCommit;
+                AlwaysFullPullOnStartup = (bool?)x["AlwaysFullPullOnStartup"] ?? AlwaysFullPullOnStartup;
+                FullPullWhenSchemaChanged = (bool?)x["FullPullWhenSchemaChanged"] ?? FullPullWhenSchemaChanged;
+                StateDirName = (string?)x["StateDirName"] ?? StateDirName;
 
                 return true;
             }

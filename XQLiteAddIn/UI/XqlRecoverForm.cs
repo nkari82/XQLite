@@ -46,7 +46,7 @@ namespace XQLite.AddIn
 
             Controls.Add(bottom); Controls.Add(panel); Controls.Add(lbl); Controls.Add(pb);
 
-            btnRun.Click += async (_, __) => await RunAsync();
+            btnRun.Click += async (_, __) => await Run();
             btnCancel.Click += (_, __) => _cts?.Cancel();
         }
 
@@ -57,7 +57,7 @@ namespace XQLite.AddIn
             return Math.Min(max, 1500);
         }
 
-        private async Task RunAsync()
+        private async Task Run()
         {
             if (_cts != null) return;
 
