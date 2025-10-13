@@ -492,45 +492,19 @@ namespace XQLite.AddIn
         }
 
         // ───────────────────────── 기타 유틸
-        internal static int? FindRowByKey(Excel.Worksheet ws, int firstDataRow, int keyCol, object key)
+        public static int? FindRowByKey(Excel.Worksheet ws, int firstDataRow, int keyAbsCol, object rowKey)
         {
+            Excel.Range? col = null, hit = null;
             try
             {
-                var used = ws.UsedRange;
-                int lastRow = used.Row + used.Rows.Count - 1;
-                XqlCommon.ReleaseCom(used);
-
-                // 1) 빠른 경로: Range.Find (정확 일치)
-                Excel.Range? rg = null, hit = null;
-                try
-                {
-                    rg = ws.Range[ws.Cells[firstDataRow, keyCol], ws.Cells[lastRow, keyCol]];
-                    hit = rg.Find(What: key, After: Type.Missing,
-                                  LookIn: Excel.XlFindLookIn.xlValues,
-                                  LookAt: Excel.XlLookAt.xlWhole,
-                                  SearchOrder: Excel.XlSearchOrder.xlByRows,
-                                  SearchDirection: Excel.XlSearchDirection.xlNext,
-                                  MatchCase: false);
-                    if (hit != null) return hit.Row;
-                }
-                catch { /* fall through */ }
-                finally { XqlCommon.ReleaseCom(hit); XqlCommon.ReleaseCom(rg); }
-
-                // 2) 폴백: 선형 탐색 (기존 동작)
-                for (int r = firstDataRow; r <= lastRow; r++)
-                {
-                    Excel.Range? cell = null;
-                    try
-                    {
-                        cell = (Excel.Range)ws.Cells[r, keyCol];
-                        var v = cell.Value2;
-                        if (XqlCommon.EqualKey(v, key)) return r;
-                    }
-                    finally { XqlCommon.ReleaseCom(cell); }
-                }
+                col = ws.Range[ws.Cells[firstDataRow, keyAbsCol], ws.Cells[ws.Rows.Count, keyAbsCol]];
+                hit = col.Find(What: rowKey, LookIn: Excel.XlFindLookIn.xlValues,
+                               LookAt: Excel.XlLookAt.xlWhole, SearchOrder: Excel.XlSearchOrder.xlByRows,
+                               SearchDirection: Excel.XlSearchDirection.xlNext, MatchCase: false);
+                return hit?.Row;
             }
-            catch { }
-            return null;
+            catch { return null; }
+            finally { XqlCommon.ReleaseCom(hit); XqlCommon.ReleaseCom(col); }
         }
 
         /// <summary>

@@ -753,7 +753,7 @@ namespace XQLite.AddIn
                             header = lo?.HeaderRowRange ?? XqlSheet.GetHeaderRange(ws);
                             if (header == null) continue;
 
-                            var uidMap = XqlSheet.BuildColUidMap(ws, header);
+                            var uidMap = GetUidMapCached(ws, header);
 
                             foreach (var rp in grp)
                             {

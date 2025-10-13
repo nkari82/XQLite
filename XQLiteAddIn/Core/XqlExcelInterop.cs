@@ -138,6 +138,20 @@ namespace XQLite.AddIn
                 var header = XqlSheetView.ResolveHeader(sh, null, _sheet);      // 헤더 Range
                 if (header == null) return;
 
+                // ✅ 헤더가 수정된 경우: 캐시 무효화 & 데이터 큐잉은 하지 않음
+                try
+                {
+                    var hitHeader = sh.Application.Intersect(target, header) as Excel.Range;
+                    if (hitHeader != null)
+                    {
+                        XqlCommon.ReleaseCom(hitHeader);
+                        XqlSheetView.InvalidateHeaderCache(sh.Name);
+                        return;
+                    }
+                }
+                catch { /* ignore */ }
+
+
                 Excel.Range? data = null;
                 Excel.Range? intersect = null;
                 Excel.ListObject? lo = null;
@@ -237,6 +251,9 @@ namespace XQLite.AddIn
                 // ② 테이블 보장
                 await be.TryCreateTable(table, key);
 
+                // ✅ 새 테이블이 생겼거나 헤더 기본구성이 바뀌었을 수 있음 → 캐시 무효화
+                XqlSheetView.InvalidateHeaderCache(ws.Name);
+
                 // ③ 서버 컬럼 조회 → '없을 때만' 추가
                 var serverCols = await be.GetTableColumns(table);
                 var serverSet = new HashSet<string>(serverCols.Select(c => c.name), StringComparer.OrdinalIgnoreCase);
@@ -263,6 +280,9 @@ namespace XQLite.AddIn
                         };
                     });
                     await be.TryAddColumns(table, defs);
+
+                    // ✅ 헤더 컬럼이 늘어남 → 캐시 무효화
+                    XqlSheetView.InvalidateHeaderCache(ws.Name);
                 }
 
                 // ④ (옵션) 헤더에 없는 서버 컬럼 DROP
@@ -281,6 +301,11 @@ namespace XQLite.AddIn
                     {
                         try { await be.TryDropColumns(table, drop); }
                         catch (Exception ex) { XqlLog.Warn("DropColumns skipped: " + ex.Message); }
+                        finally
+                        {
+                            // ✅ 헤더 기준으로 불필요 컬럼 삭제됨 → 캐시 무효화
+                            XqlSheetView.InvalidateHeaderCache(ws.Name);
+                        }
                     }
                 }
             }
