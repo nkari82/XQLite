@@ -53,6 +53,13 @@ CREATE TABLE IF NOT EXISTS _audit (
   new_value TEXT,
   row_version INTEGER
 );
+CREATE TABLE IF NOT EXISTS _tombstones (
+  table_name TEXT NOT NULL,
+  row_key TEXT NOT NULL,
+  row_version INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (table_name, row_key)
+);
 CREATE TABLE IF NOT EXISTS _schema (
   table_name TEXT PRIMARY KEY,
   key_column TEXT NOT NULL
@@ -197,16 +204,52 @@ function ensureColumnsForSamples(table: string, sample: Record<string, any>, key
   if (defs.length) addColumns(table, defs);
 }
 
+type PatchRecord = {
+  table: string;
+  row_key: string;
+  row_version: number;
+  deleted: boolean;
+  cells: Record<string, any>;
+};
+
 function readSince(table: string, since: number) {
   const key = getKeyCol(table);
-  const rows = db.prepare<[number], any>(`SELECT * FROM "${table}" WHERE row_version > ?`).all(since);
-  return rows.map((r: any) => ({
+  const rows = db.prepare<[number], any>(
+    `SELECT * FROM "${table}" WHERE row_version > ? ORDER BY row_version`
+  ).all(since);
+  const patches: PatchRecord[] = rows.map((r: any) => ({
     table,
     row_key: String(r[key]),
-    row_version: r.row_version,
+    row_version: Number(r.row_version),
     deleted: !!r.deleted,
     cells: rowToCells(r, key),
   }));
+
+  const latestByRow = new Map<string, number>();
+  for (const p of patches) {
+    const current = latestByRow.get(p.row_key) ?? -Infinity;
+    if (p.row_version > current) latestByRow.set(p.row_key, p.row_version);
+  }
+
+  const tombstones = db.prepare<[string, number], { row_key: string; row_version: number }>(
+    `SELECT row_key, row_version FROM _tombstones WHERE table_name=? AND row_version > ? ORDER BY row_version`
+  ).all(table, since);
+  for (const t of tombstones) {
+    const rk = String(t.row_key);
+    const rv = Number(t.row_version);
+    const latest = latestByRow.get(rk);
+    if (latest !== undefined && latest >= rv) continue;
+    patches.push({
+      table,
+      row_key: rk,
+      row_version: rv,
+      deleted: true,
+      cells: {} as Record<string, any>,
+    });
+  }
+
+  patches.sort((a, b) => a.row_version - b.row_version);
+  return patches;
 }
 
 // ========================= GraphQL types =========================
@@ -348,6 +391,8 @@ function upsertCells(cells: CellEditInput[]) {
            ON CONFLICT("${keyCol}") DO NOTHING`
         ).run(rowKey, rv, now);
 
+        db.prepare(`DELETE FROM _tombstones WHERE table_name=? AND row_key=?`).run(table, rowKey);
+
         const cols = Object.keys(values);
         if (cols.length) {
           const sets = cols.map(c => `"${c}"=?`).join(", ");
@@ -420,14 +465,32 @@ function deleteRow(table: string, row_key: string) {
   const keyCol = getKeyCol(table);
   const rv = nextRowVersion();
   const now = Date.now();
-  db.prepare(`UPDATE "${table}" SET deleted=1, row_version=?, updated_at=? WHERE "${keyCol}"=?`)
-    .run(rv, now, row_key);
+  const updateRes = db.prepare(
+    `UPDATE "${table}" SET deleted=1, row_version=?, updated_at=? WHERE "${keyCol}"=?`
+  ).run(rv, now, row_key);
 
-  const rowFull = db.prepare(`SELECT * FROM "${table}" WHERE "${keyCol}"=?`).get(row_key) as any;
-  const patch = {
-    table, row_key: String(row_key), row_version: rowFull.row_version, deleted: true, cells: rowToCells(rowFull, keyCol)
+  let rowFull: any | undefined;
+  if ((updateRes.changes ?? 0) > 0) {
+    db.prepare(`DELETE FROM _tombstones WHERE table_name=? AND row_key=?`).run(table, row_key);
+    rowFull = db.prepare(`SELECT * FROM "${table}" WHERE "${keyCol}"=?`).get(row_key) as any | undefined;
+  } else {
+    db.prepare(
+      `INSERT INTO _tombstones(table_name,row_key,row_version,created_at)
+       VALUES(?,?,?,?)
+       ON CONFLICT(table_name,row_key) DO UPDATE SET row_version=excluded.row_version, created_at=excluded.created_at`
+    ).run(table, row_key, rv, now);
+  }
+
+  const patch: PatchRecord = {
+    table,
+    row_key: String(row_key),
+    row_version: rowFull ? Number(rowFull.row_version) : rv,
+    deleted: true,
+    cells: rowFull ? rowToCells(rowFull, keyCol) : {} as Record<string, any>,
   };
-  pubsub.publish("events", { max_row_version: rv, patches: [patch] });
+
+  const maxRowVersion = Number(getMaxRowVersion.get()?.v ?? rv);
+  pubsub.publish("events", { max_row_version: maxRowVersion, patches: [patch] });
   return true;
 }
 
