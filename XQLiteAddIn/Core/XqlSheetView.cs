@@ -7,6 +7,7 @@ using System.Linq;
 using System.Reflection;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using System.Collections.Concurrent;
 using Excel = Microsoft.Office.Interop.Excel;
 using MessageBox = System.Windows.Forms.MessageBox;
 
@@ -23,13 +24,12 @@ namespace XQLite.AddIn
         // ── [NEW] 지연 재적용(QueueAsMacro) + 시트별 중복 큐잉 제거
         private static readonly object _reapplyLock = new object();
         private static readonly HashSet<string> _reapplyPending = new HashSet<string>(StringComparer.Ordinal);
-
-
         private static readonly object _sumLock = new();
         private static HashSet<string> _sumTables = new(StringComparer.Ordinal);
         private static int _sumAffected, _sumConflicts, _sumErrors, _sumBatches;
         private static long _sumStartTicks;
-
+        private static readonly ConcurrentDictionary<string, string> _tableToSheet = new(StringComparer.Ordinal);
+        private static readonly ConcurrentDictionary<string, (string addr, Dictionary<string, string> map)> _hdrCache = new(StringComparer.Ordinal);
 
         // ───────────────────────── Public API (Ribbon에서 호출)
         public static bool InstallHeader()
@@ -86,7 +86,7 @@ namespace XQLite.AddIn
         }
 
         // 메타에 있으면 메타 기반, 없으면 폴백
-        private static string ColumnTooltipFor(SheetMeta sm, string colName)
+        private static string ColumnTooltipFor(XqlSheet.Meta sm, string colName)
         {
             try
             {
@@ -108,7 +108,7 @@ namespace XQLite.AddIn
         private static string ColumnTooltipFallback() => "TEXT • NULL OK";
 
         // 헤더 범위를 돌며 i열(1-based) → 툴팁 텍스트를 만든다.
-        internal static IReadOnlyDictionary<int, string> BuildHeaderTooltips(SheetMeta sm, Excel.Range header)
+        internal static IReadOnlyDictionary<int, string> BuildHeaderTooltips(XqlSheet.Meta sm, Excel.Range header)
         {
             var tips = new Dictionary<int, string>(capacity: Math.Max(1, header?.Columns.Count ?? 0));
             if (header == null) return tips;
@@ -411,7 +411,7 @@ namespace XQLite.AddIn
             }
         }
 
-        internal static void ApplyDataValidationForHeader(Excel.Worksheet ws, Excel.Range header, SheetMeta sm)
+        internal static void ApplyDataValidationForHeader(Excel.Worksheet ws, Excel.Range header, XqlSheet.Meta sm)
         {
             var lo = XqlSheet.FindListObjectContaining(ws, header);
             if (lo?.HeaderRowRange != null)
@@ -733,6 +733,53 @@ namespace XQLite.AddIn
                 using var scope = new XqlCommon.ExcelBatchScope(app); // 화면/이벤트/자동계산 OFF (짧게)
 
                 InternalApplyCore(app, patches); // ✅ 아래 (B)에 구현
+
+                // 서버 패치 적용 후: 지문 기록
+                try
+                {
+                    var wb = app.ActiveWorkbook;
+                    var items = new List<(string table, string rowKey, string colUid, string fp)>(1024);
+
+                    foreach (var grp in patches.GroupBy(p => p.Table, StringComparer.Ordinal))
+                    {
+                        Excel.Worksheet? ws = null; Excel.Range? header = null; Excel.ListObject? lo = null;
+                        try
+                        {
+                            var smeta = default(XqlSheet.Meta);
+                            ws = FindWorksheetByTable(app, grp.Key, out smeta);
+                            if (ws == null) continue;
+
+                            lo = XqlSheet.FindListObjectByTable(ws, grp.Key);
+                            header = lo?.HeaderRowRange ?? XqlSheet.GetHeaderRange(ws);
+                            if (header == null) continue;
+
+                            var uidMap = XqlSheet.BuildColUidMap(ws, header);
+
+                            foreach (var rp in grp)
+                            {
+                                if (rp.Deleted || rp.Cells == null || rp.Cells.Count == 0) continue;
+                                foreach (var kv in rp.Cells)
+                                {
+                                    var col = kv.Key;
+                                    if (!uidMap.TryGetValue(col, out var uid) || string.IsNullOrEmpty(uid)) continue;
+                                    var fp = XqlCommon.Fingerprint(kv.Value);
+                                    items.Add((grp.Key, Convert.ToString(rp.RowKey) ?? "", uid, fp));
+                                }
+                            }
+                        }
+                        finally
+                        {
+                            XqlCommon.ReleaseCom(lo);
+                            XqlCommon.ReleaseCom(header);
+                            XqlCommon.ReleaseCom(ws);
+                        }
+                    }
+
+                    if (items.Count > 0)
+                        XqlSheet.ShadowAppendFingerprints(wb, items);
+                }
+                catch { /* 섀도우 기록 실패 무시 */ }
+
             });
         }
 
@@ -747,7 +794,7 @@ namespace XQLite.AddIn
                 try
                 {
                     // 1) 테이블명 → 워크시트/SheetMeta 찾기
-                    var smeta = default(SheetMeta);
+                    var smeta = default(XqlSheet.Meta);
                     ws = FindWorksheetByTable(app, grp.Key, out smeta);
                     if (ws == null || smeta == null) continue;
 
@@ -805,23 +852,62 @@ namespace XQLite.AddIn
         }
 
         // === 보조 메서드들 ===
-        private static Excel.Worksheet? FindWorksheetByTable(Excel.Application app, string table, out SheetMeta? smeta)
+
+        // header가 같으면 캐시된 uid 맵 반환
+        private static Dictionary<string, string> GetUidMapCached(Excel.Worksheet ws, Excel.Range header)
         {
-            smeta = null; Excel.Worksheet? match = null;
+            string addr;
+            try { addr = header.Address[true, true, Excel.XlReferenceStyle.xlA1, Type.Missing, Type.Missing]; }
+            catch { addr = $"{ws.Name}:{header.Row}:{header.Column}:{header.Columns.Count}"; }
+
+            if (_hdrCache.TryGetValue(ws.Name, out var e) && e.addr == addr) return e.map;
+
+            var map = XqlSheet.BuildColUidMap(ws, header);
+            _hdrCache[ws.Name] = (addr, map);
+            return map;
+        }
+
+        // 헤더 변경 후 호출 (컬럼 추가/삭제/이동/이름변경 등)
+        public static void InvalidateHeaderCache(string sheetName)
+        {
+            _hdrCache.TryRemove(sheetName, out _);
+        }
+
+        // Commit/스키마 동기화 등에서 테이블과 실제 시트를 등록
+        public static void RegisterTableSheet(string table, string sheetName)
+        {
+            if (!string.IsNullOrWhiteSpace(table) && !string.IsNullOrWhiteSpace(sheetName))
+                _tableToSheet[table] = sheetName;
+        }
+
+        // 캐시 우선 조회 후, 실패하면 기존 스캔으로 폴백
+        private static Excel.Worksheet? FindWorksheetByTable(Excel.Application app, string table, out XqlSheet.Meta? smeta)
+        {
+            smeta = null;
+
+            if (_tableToSheet.TryGetValue(table, out var cached))
+            {
+                try
+                {
+                    var ws = app.Worksheets[cached] as Excel.Worksheet;
+                    if (ws != null && XqlAddIn.Sheet!.TryGetSheet(ws.Name, out var m)) { smeta = m; return ws; }
+                }
+                catch { /* 캐시 miss → 폴백 */ }
+            }
+
+            // 폴백: 기존 스캔
+            Excel.Worksheet? match = null;
             try
             {
                 foreach (Excel.Worksheet w in app.Worksheets)
                 {
                     try
                     {
-                        string name = w.Name;
-                        if (XqlAddIn.Sheet!.TryGetSheet(name, out var m))
+                        if (XqlAddIn.Sheet!.TryGetSheet(w.Name, out var m))
                         {
-                            if (string.Equals(m.TableName ?? name, table, StringComparison.Ordinal) ||
-                                string.Equals(name, table, StringComparison.Ordinal))
-                            {
-                                smeta = m; match = w; break;
-                            }
+                            var t = string.IsNullOrWhiteSpace(m.TableName) ? w.Name : m.TableName!;
+                            if (string.Equals(t, table, StringComparison.Ordinal))
+                            { smeta = m; match = w; _tableToSheet[table] = w.Name; break; }
                         }
                     }
                     finally { if (!ReferenceEquals(match, w)) XqlCommon.ReleaseCom(w); }
@@ -830,6 +916,7 @@ namespace XQLite.AddIn
             catch { }
             return match;
         }
+
 
         private static int AppendNewRow(Excel.Worksheet ws, int firstDataRow, Excel.ListObject? lo)
         {
@@ -855,7 +942,7 @@ namespace XQLite.AddIn
         }
 
         private static void ApplyCells(Excel.Worksheet ws, int row, Excel.Range header,
-                                       List<string> headers, SheetMeta meta, Dictionary<string, object?> cells)
+                                       List<string> headers, XqlSheet.Meta meta, Dictionary<string, object?> cells)
         {
             for (int c = 0; c < headers.Count; c++)
             {
@@ -1019,7 +1106,7 @@ namespace XQLite.AddIn
 
         // Excel의 DV는 일부 타입(TEXT/JSON 등)엔 굳이 깔지 않는다.
         // 아래 로직은 '규칙을 실제로 Add한 경우에만' 속성을 세팅하여 0x800A03EC를 방지한다.
-        private static void ApplyValidationForKind(Excel.Range rng, ColumnKind kind)
+        private static void ApplyValidationForKind(Excel.Range rng, XqlSheet.ColumnKind kind)
         {
             Excel.Validation? v = null;
             try
@@ -1052,7 +1139,7 @@ namespace XQLite.AddIn
 
                 switch (kind)
                 {
-                    case ColumnKind.Int:
+                    case XqlSheet.ColumnKind.Int:
                         // 안전한 32bit 정수 범위(문자열로 전달해도 OK)
                         v.Add(
                             Excel.XlDVType.xlValidateWholeNumber,
@@ -1065,7 +1152,7 @@ namespace XQLite.AddIn
                         added = true;
                         break;
 
-                    case ColumnKind.Real:
+                    case XqlSheet.ColumnKind.Real:
                         // Excel이 싫어하는 ±1.79e308 대신 ±1e307로 클램프 (안전)
                         // 문자열로 전달(=수식) 대신 상수로도 되지만 로캘 영향 줄이려 문자열 사용
                         v.Add(
@@ -1079,7 +1166,7 @@ namespace XQLite.AddIn
                         added = true;
                         break;
 
-                    case ColumnKind.Bool:
+                    case XqlSheet.ColumnKind.Bool:
                         // TRUE/FALSE 목록 — 로캘별 리스트 구분자 사용
                         v.Add(
                             Excel.XlDVType.xlValidateList,
@@ -1091,7 +1178,7 @@ namespace XQLite.AddIn
                         added = true;
                         break;
 
-                    case ColumnKind.Date:
+                    case XqlSheet.ColumnKind.Date:
                         // 지역화된 함수명 문제 회피: DateTime 값을 직접 전달
                         var dmin = new DateTime(1900, 1, 1);
                         var dmax = new DateTime(9999, 12, 31);
@@ -1157,7 +1244,7 @@ namespace XQLite.AddIn
         }
 
         // ── [NEW] 헤더 UI(툴팁+보더+검증) 한 번에 적용
-        private static void ApplyHeaderUi(Excel.Worksheet ws, Excel.Range header, SheetMeta sm, bool withValidation)
+        private static void ApplyHeaderUi(Excel.Worksheet ws, Excel.Range header, XqlSheet.Meta sm, bool withValidation)
         {
             if (ws == null || header == null || sm == null) return;
 

@@ -4,6 +4,7 @@ using Newtonsoft.Json;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Security.Policy;
@@ -55,7 +56,7 @@ namespace XQLite.AddIn
         private readonly ConcurrentQueue<Conflict> _conflicts = new();
         private readonly ConcurrentDictionary<string, string?> _lastPushed = new(StringComparer.Ordinal);
 
-        private string? _stateFile;
+        private string? _workbookFullName;
         private PersistentState _state = new();
         private volatile bool _forceFullPull = false;
         private volatile bool _pendingSchemaCheck = false;
@@ -138,53 +139,120 @@ namespace XQLite.AddIn
         // ⬇️ 초기화 진입점 (워크북이 열릴 때 한 번 호출)
         public void InitPersistentState(string workbookFullName, string? project = null)
         {
-            try
+            _workbookFullName = workbookFullName;
+
+            _state = new PersistentState
             {
-                var dir = XqlCommon.EnsureHiddenStateDir(workbookFullName);
-                var wbStem = XqlCommon.SanitizeFileStem(Path.GetFileNameWithoutExtension(workbookFullName) ?? "wb");
-                var prjStem = XqlCommon.SanitizeFileStem(project ?? XqlConfig.Project ?? "default");
-                _stateFile = Path.Combine(dir, $"state_{prjStem}_{wbStem}.json");
+                Project = project ?? XqlConfig.Project ?? "",
+                Workbook = Path.GetFileNameWithoutExtension(workbookFullName) ?? "wb",
+            };
 
-                _state = XqlCommon.LoadJsonFile<PersistentState>(_stateFile) ?? new PersistentState();
-                _state.Project = project ?? XqlConfig.Project ?? "";
-                _state.Workbook = wbStem;
-
-                // 새 세션 시작 → 이번 세션의 첫 Pull은 Full Pull 강제
-                _forceFullPull = XqlConfig.AlwaysFullPullOnStartup;
-                _state.LastSessionId = Guid.NewGuid().ToString("N");
-                Task.Run(() => { if (_stateFile != null) XqlCommon.SaveJsonFile(_stateFile, _state); });
-
-                // 선택: 서버 메타 확인 → 스키마 변경 시 Full Pull 강제
-                if (XqlConfig.FullPullWhenSchemaChanged)
+            // 워크북에서 K/V 읽기 (UI 스레드에서 안전하게)
+            var loaded = new Dictionary<string, string>(StringComparer.Ordinal);
+            var done = new System.Threading.ManualResetEventSlim(false);
+            ExcelAsyncUtil.QueueAsMacro(() =>
+            {
+                try
                 {
-                    _pendingSchemaCheck = true;
-                    _ = Task.Run(async () =>
-                     {
-                         try
-                         {
-                             var meta = await _backend.TryFetchServerMeta().ConfigureAwait(false);
-                             var hash = meta?["schema_hash"]?.ToString();
-                             if (!string.IsNullOrWhiteSpace(hash) && !string.Equals(hash, _state.LastSchemaHash, StringComparison.Ordinal))
-                                 _forceFullPull = true;
-                             _state.LastSchemaHash = hash;
-                             _state.LastMetaUtc = DateTime.UtcNow;
-                             PersistState();
-                         }
-                         catch { /* 메타 실패는 치명적 아님 */ }
-                         finally { _pendingSchemaCheck = false; }
-                     });
+                    var app = (Excel.Application)ExcelDnaUtil.Application;
+                    Excel.Workbook? wb = null;
+                    try
+                    {
+                        foreach (Excel.Workbook w in app.Workbooks)
+                        {
+                            try
+                            {
+                                if (string.Equals(w.FullName, workbookFullName, StringComparison.OrdinalIgnoreCase))
+                                { wb = w; break; }
+                            }
+                            finally { if (!ReferenceEquals(wb, w)) XqlCommon.ReleaseCom(w); }
+                        }
+                        wb ??= app.ActiveWorkbook;
+                        if (wb != null)
+                            loaded = XqlSheet.StateReadAll(wb);
+                    }
+                    finally { XqlCommon.ReleaseCom(wb); }
                 }
+                catch { }
+                finally { done.Set(); }
+            });
+            done.Wait(1000); // Excel 바쁘면 그냥 빈 상태로 진행
 
+            // 값 반영
+            if (loaded.TryGetValue("last_max_row_version", out var s) && long.TryParse(s, out var l))
+                _state.LastMaxRowVersion = l;
+            if (loaded.TryGetValue("last_schema_hash", out var h)) _state.LastSchemaHash = h;
+            if (loaded.TryGetValue("last_full_pull_utc", out var f) && DateTime.TryParse(f, out var dt))
+                _state.LastFullPullUtc = dt;
+
+            // 새 세션 시작
+            _forceFullPull = XqlConfig.AlwaysFullPullOnStartup;
+            _state.LastSessionId = Guid.NewGuid().ToString("N");
+            PersistState();
+
+            // (선택) 서버 메타 확인 → 스키마 변경 감지 시 Full Pull 예약
+            if (XqlConfig.FullPullWhenSchemaChanged)
+            {
+                _pendingSchemaCheck = true;
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        var meta = await _backend.TryFetchServerMeta().ConfigureAwait(false);
+                        var hash = meta?["schema_hash"]?.ToString();
+                        if (!string.IsNullOrWhiteSpace(hash) && !string.Equals(hash, _state.LastSchemaHash, StringComparison.Ordinal))
+                            _forceFullPull = true;
+                        _state.LastSchemaHash = hash;
+                        _state.LastMetaUtc = DateTime.UtcNow;
+                        PersistState();
+                    }
+                    catch { }
+                    finally { _pendingSchemaCheck = false; }
+                });
             }
-            catch { /* 무시 */ }
         }
 
         private void PersistState()
         {
             try
             {
-                if (_stateFile == null) return;
-                Task.Run(() => XqlCommon.SaveJsonFile(_stateFile!, _state));
+                if (_workbookFullName == null) return;
+                var kv = new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["last_session_id"] = _state.LastSessionId ?? "",
+                    ["project"] = _state.Project ?? "",
+                    ["workbook"] = _state.Workbook ?? "",
+                    ["last_max_row_version"] = _state.LastMaxRowVersion.ToString(CultureInfo.InvariantCulture),
+                    ["last_full_pull_utc"] = (_state.LastFullPullUtc == DateTime.MinValue ? "" : _state.LastFullPullUtc.ToString("o")),
+                    ["last_schema_hash"] = _state.LastSchemaHash ?? "",
+                    ["last_meta_utc"] = (_state.LastMetaUtc == DateTime.MinValue ? "" : _state.LastMetaUtc.ToString("o")),
+                };
+
+                ExcelAsyncUtil.QueueAsMacro(() =>
+                {
+                    try
+                    {
+                        var app = (Excel.Application)ExcelDnaUtil.Application;
+                        Excel.Workbook? wb = null;
+                        try
+                        {
+                            foreach (Excel.Workbook w in app.Workbooks)
+                            {
+                                try
+                                {
+                                    if (string.Equals(w.FullName, _workbookFullName, StringComparison.OrdinalIgnoreCase))
+                                    { wb = w; break; }
+                                }
+                                finally { if (!ReferenceEquals(wb, w)) XqlCommon.ReleaseCom(w); }
+                            }
+                            wb ??= app.ActiveWorkbook;
+                            if (wb != null)
+                                XqlSheet.StateSetMany(wb, kv);
+                        }
+                        finally { XqlCommon.ReleaseCom(wb); }
+                    }
+                    catch { }
+                });
             }
             catch { }
         }

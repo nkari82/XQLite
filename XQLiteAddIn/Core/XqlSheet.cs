@@ -14,16 +14,77 @@ namespace XQLite.AddIn
     /// </summary>
     internal sealed class XqlSheet
     {
-        private readonly Dictionary<string, SheetMeta> _sheets = new(StringComparer.Ordinal);
+        // ───────────────────────── Models (같은 파일에 유지)
+        internal sealed class Meta
+        {
+            public string TableName { get; set; } = "";
+            public string KeyColumn { get; set; } = "id";
+            public Dictionary<string, ColumnType> Columns { get; } = new(StringComparer.Ordinal);
+            public void SetColumn(string name, ColumnType t) => Columns[name] = t;
+        }
+
+        internal enum ColumnKind { Text, Int, Real, Bool, Date, Json, Any }
+
+        internal sealed class ColumnType
+        {
+            public ColumnKind Kind { get; set; } = ColumnKind.Text;
+            public bool Nullable { get; set; } = true;
+
+            public string ToTooltip()
+            {
+                var k = Kind switch
+                {
+                    ColumnKind.Int => "INT",
+                    ColumnKind.Real => "REAL",
+                    ColumnKind.Bool => "BOOL",
+                    ColumnKind.Date => "DATE",
+                    ColumnKind.Json => "JSON",
+                    _ => "TEXT"
+                };
+                var nul = Nullable ? "NULL OK" : "NOT NULL";
+                return $"{k} • {nul}";
+            }
+        }
+
+        internal enum ErrCode
+        {
+            None = 0,
+            E_TYPE_MISMATCH,
+            E_RANGE,
+            E_CHECK_FAIL,
+            E_JSON_PARSE,
+            E_NULL_NOT_ALLOWED,
+            E_UNSUPPORTED,
+        }
+
+        internal readonly struct ValidationResult
+        {
+            public bool IsOk { get; }
+            public ErrCode Code { get; }
+            public string Message { get; }
+
+            private ValidationResult(bool ok, ErrCode code, string msg)
+            {
+                IsOk = ok; Code = code; Message = msg;
+            }
+
+            public static ValidationResult Ok() => new(true, ErrCode.None, "");
+            public static ValidationResult Fail(ErrCode code, string msg) => new(false, code, msg);
+        }
+
+
+        private readonly Dictionary<string, Meta> _sheets = new(StringComparer.Ordinal);
+        private const string StateSheetName = ".xql_state";   // VeryHidden
+        private const string ShadowSheetName = ".xql_shadow"; // VeryHidden
 
         // ───────────────────────── Meta registry (흡수)
-        public bool TryGetSheet(string sheetName, out SheetMeta sm) => _sheets.TryGetValue(sheetName, out sm!);
+        public bool TryGetSheet(string sheetName, out Meta sm) => _sheets.TryGetValue(sheetName, out sm!);
 
-        public SheetMeta GetOrCreateSheet(string sheetName, string defaultKeyColumn = "id")
+        public Meta GetOrCreateSheet(string sheetName, string defaultKeyColumn = "id")
         {
             if (!_sheets.TryGetValue(sheetName, out var sm))
             {
-                sm = new SheetMeta { TableName = sheetName, KeyColumn = defaultKeyColumn };
+                sm = new Meta { TableName = sheetName, KeyColumn = defaultKeyColumn };
                 _sheets[sheetName] = sm;
             }
             return sm;
@@ -430,32 +491,6 @@ namespace XQLite.AddIn
             catch { return false; }
         }
 
-        // ── Back-compat static forwards (기존 호출부 보호)
-#if false
-        public static Excel.Worksheet? FindWorksheet(Excel.Application app, string sheetName)
-            => XqlAddIn.SheetSvc?.FindWorksheet(app, sheetName);
-
-        public static Excel.ListObject? FindListObject(Excel.Worksheet ws, string listObjectName)
-            => XqlAddIn.SheetSvc?.FindListObject(ws, listObjectName);
-
-        public static Excel.ListObject? FindListObjectContaining(Excel.Worksheet ws, Excel.Range rng)
-            => XqlAddIn.SheetSvc?.FindListObjectContaining(ws, rng);
-
-        public static Excel.ListObject? FindListObjectByTable(Excel.Worksheet ws, string tableNameOrQualified)
-            => XqlAddIn.SheetSvc?.FindListObjectByTable(ws, tableNameOrQualified);
-
-        public static string ColumnKey(string sheet, string table, int hRow, int hCol, int colOffset, string? hdrName = null)
-            => XqlAddIn.SheetSvc?.ColumnKey(sheet, table, hRow, hCol, colOffset, hdrName) ?? "";
-
-        public static string CellKey(string sheet, string table, int hRow, int hCol, int rowOffset, int colOffset)
-            => XqlAddIn.SheetSvc?.CellKey(sheet, table, hRow, hCol, rowOffset, colOffset) ?? "";
-
-        public static bool TryParse(string key, out RelDesc d)
-            => XqlAddIn.SheetSvc?.TryParse(key, out d) ?? (d = default, false).Item2;
-
-        internal static bool TryResolve(Excel.Application app, RelDesc d, out Excel.Range? target, out int? targetHeaderCol, out Excel.ListObject? lo)
-            => XqlAddIn.SheetSvc?.TryResolve(app, d, out target, out targetHeaderCol, out lo) ?? (target = null, targetHeaderCol = null, lo = null, false).Item4;
-#endif
         // ───────────────────────── 기타 유틸
         internal static int? FindRowByKey(Excel.Worksheet ws, int firstDataRow, int keyCol, object key)
         {
@@ -753,64 +788,181 @@ namespace XQLite.AddIn
             }
         }
 
-
-    }
-
-    // ───────────────────────── Models (같은 파일에 유지)
-    internal sealed class SheetMeta
-    {
-        public string TableName { get; set; } = "";
-        public string KeyColumn { get; set; } = "id";
-        public Dictionary<string, ColumnType> Columns { get; } = new(StringComparer.Ordinal);
-        public void SetColumn(string name, ColumnType t) => Columns[name] = t;
-    }
-
-    internal enum ColumnKind { Text, Int, Real, Bool, Date, Json, Any }
-
-    internal sealed class ColumnType
-    {
-        public ColumnKind Kind { get; set; } = ColumnKind.Text;
-        public bool Nullable { get; set; } = true;
-
-        public string ToTooltip()
+        // ── 상태 시트 보장 & 찾기
+        private static Excel.Worksheet EnsureStateSheet(Excel.Workbook wb)
         {
-            var k = Kind switch
+            Excel.Worksheet? sh = null;
+            try
             {
-                ColumnKind.Int => "INT",
-                ColumnKind.Real => "REAL",
-                ColumnKind.Bool => "BOOL",
-                ColumnKind.Date => "DATE",
-                ColumnKind.Json => "JSON",
-                _ => "TEXT"
-            };
-            var nul = Nullable ? "NULL OK" : "NOT NULL";
-            return $"{k} • {nul}";
+                foreach (Excel.Worksheet ws in wb.Worksheets)
+                {
+                    if (ws.Name == StateSheetName) { sh = ws; break; }
+                }
+            }
+            catch { }
+            if (sh == null)
+            {
+                sh = (Excel.Worksheet)wb.Worksheets.Add();
+                sh.Name = StateSheetName;
+                sh.Visible = Excel.XlSheetVisibility.xlSheetVeryHidden;
+                var hdr = sh.Range["A1", "B1"];
+                hdr.Value2 = new object[,] { { "key", "value" } };
+                XqlCommon.ReleaseCom(hdr);
+            }
+            return sh;
         }
-    }
 
-    internal enum ErrCode
-    {
-        None = 0,
-        E_TYPE_MISMATCH,
-        E_RANGE,
-        E_CHECK_FAIL,
-        E_JSON_PARSE,
-        E_NULL_NOT_ALLOWED,
-        E_UNSUPPORTED,
-    }
-
-    internal readonly struct ValidationResult
-    {
-        public bool IsOk { get; }
-        public ErrCode Code { get; }
-        public string Message { get; }
-
-        private ValidationResult(bool ok, ErrCode code, string msg)
+        // K/V 전체 읽기 (2행부터 끝까지)
+        internal static Dictionary<string, string> StateReadAll(Excel.Workbook wb)
         {
-            IsOk = ok; Code = code; Message = msg;
+            var map = new Dictionary<string, string>(StringComparer.Ordinal);
+            Excel.Worksheet? sh = null; Excel.Range? used = null;
+            try
+            {
+                sh = EnsureStateSheet(wb);
+                used = sh.UsedRange;
+                int last = used.Row + used.Rows.Count - 1;
+                for (int r = 2; r <= last; r++)
+                {
+                    var k = Convert.ToString((sh.Cells[r, 1] as Excel.Range)!.Value2) ?? "";
+                    var v = Convert.ToString((sh.Cells[r, 2] as Excel.Range)!.Value2) ?? "";
+                    if (!string.IsNullOrWhiteSpace(k))
+                        map[k] = v;
+                }
+            }
+            catch { }
+            finally { XqlCommon.ReleaseCom(used); XqlCommon.ReleaseCom(sh); }
+            return map;
         }
 
-        public static ValidationResult Ok() => new(true, ErrCode.None, "");
-        public static ValidationResult Fail(ErrCode code, string msg) => new(false, code, msg);
+        // 여러 K/V 한 번에 upsert
+        internal static void StateSetMany(Excel.Workbook wb, IReadOnlyDictionary<string, string> kv)
+        {
+            if (kv == null || kv.Count == 0) return;
+            var sh = EnsureStateSheet(wb);
+            try
+            {
+                // 빠른 경로: 기존 키 위치 해시
+                var exist = StateReadAll(wb); // 소규모라 재사용
+
+                // append 위치 계산
+                int lastRow;
+                try
+                {
+                    var used = sh.UsedRange;
+                    lastRow = used.Row + used.Rows.Count - 1;
+                    XqlCommon.ReleaseCom(used);
+                }
+                catch { lastRow = 1; }
+
+                int appendAt = Math.Max(2, lastRow + 1);
+                var batch = new List<(int row, string key, string val)>();
+
+                foreach (var p in kv)
+                {
+                    if (exist.ContainsKey(p.Key))
+                    {
+                        // 위치 재탐색(Find) — 데이터 적으므로 선형탐색도 OK
+                        int hitRow = -1;
+                        try
+                        {
+                            var rg = sh.Range["A2", sh.Cells[sh.Rows.Count, 1]];
+                            var hit = rg.Find(What: p.Key, LookIn: Excel.XlFindLookIn.xlValues,
+                                              LookAt: Excel.XlLookAt.xlWhole, SearchDirection: Excel.XlSearchDirection.xlNext);
+                            if (hit != null) hitRow = hit.Row;
+                            XqlCommon.ReleaseCom(hit);
+                            XqlCommon.ReleaseCom(rg);
+                        }
+                        catch { }
+                        if (hitRow > 0)
+                            batch.Add((hitRow, p.Key, p.Value ?? ""));
+                        else
+                            batch.Add((appendAt++, p.Key, p.Value ?? ""));
+                    }
+                    else
+                    {
+                        batch.Add((appendAt++, p.Key, p.Value ?? ""));
+                    }
+                }
+
+                // 배치 반영
+                foreach (var b in batch)
+                {
+                    (sh.Cells[b.row, 1] as Excel.Range)!.Value2 = b.key;
+                    (sh.Cells[b.row, 2] as Excel.Range)!.Value2 = b.val;
+                }
+            }
+            catch { }
+        }
+
+        // XqlSheet 내부 아무 위치에 추가
+
+        private static Excel.Worksheet EnsureShadowSheet(Excel.Workbook wb)
+        {
+            Excel.Worksheet? sh = null;
+            try
+            {
+                foreach (Excel.Worksheet ws in wb.Worksheets)
+                {
+                    if (ws.Name == ShadowSheetName) { sh = ws; break; }
+                }
+            }
+            catch { }
+            if (sh == null)
+            {
+                sh = (Excel.Worksheet)wb.Worksheets.Add();
+                sh.Name = ShadowSheetName;
+                sh.Visible = Excel.XlSheetVisibility.xlSheetVeryHidden;
+                var hdr = sh.Range["A1", "E1"];
+                hdr.Value2 = new object[,] { { "table", "row_key", "col_uid", "fp", "updated_utc" } };
+                XqlCommon.ReleaseCom(hdr);
+            }
+            return sh;
+        }
+
+        internal static void ShadowAppendFingerprints(Excel.Workbook wb, IReadOnlyList<(string table, string rowKey, string colUid, string fp)> items)
+        {
+            if (items == null || items.Count == 0) return;
+            var sh = EnsureShadowSheet(wb);
+            int lastRow;
+            try
+            {
+                var used = sh.UsedRange;
+                lastRow = used.Row + used.Rows.Count - 1;
+                XqlCommon.ReleaseCom(used);
+            }
+            catch { lastRow = 1; }
+
+            int start = Math.Max(2, lastRow + 1);
+            var data = new object[items.Count, 5];
+            var now = DateTime.UtcNow.ToString("o");
+            for (int i = 0; i < items.Count; i++)
+            {
+                data[i, 0] = items[i].table;
+                data[i, 1] = items[i].rowKey;
+                data[i, 2] = items[i].colUid;
+                data[i, 3] = items[i].fp;
+                data[i, 4] = now;
+            }
+            var r1 = sh.Cells[start, 1];
+            var r2 = sh.Cells[start + items.Count - 1, 5];
+            var rg = sh.Range[r1, r2];
+            rg.Value2 = data;
+            XqlCommon.ReleaseCom(rg); XqlCommon.ReleaseCom(r2); XqlCommon.ReleaseCom(r1);
+        }
+
+        // (옵션) 헤더에서 col_uid를 얻는 간단 맵 — 프로젝트 메타가 이미 col_uid를 갖고 있으면 그걸 사용
+        internal static Dictionary<string, string> BuildColUidMap(Excel.Worksheet ws, Excel.Range header)
+        {
+            var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 1; i <= header.Columns.Count; i++)
+            {
+                var name = (string?)((Excel.Range)header.Cells[1, i]).Value2 ?? "";
+                if (!string.IsNullOrWhiteSpace(name))
+                    map[name] = name; // 최소 구현: 이름 자체를 uid로 사용(필요시 프로젝트 고유 UID로 변경)
+            }
+            return map;
+        }
+
     }
 }

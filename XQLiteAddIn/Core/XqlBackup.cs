@@ -177,7 +177,7 @@ namespace XQLite.AddIn
         // ============================================================
         // 내부: 스키마/행/셀 변환 유틸
         // ============================================================
-        private async Task EnsureTableSchema(SheetMeta sm)
+        private async Task EnsureTableSchema(XqlSheet.Meta sm)
         {
             await _backend.TryCreateTable(sm.TableName, sm.KeyColumn);
             var defs = sm.Columns.Select(kv => new ColumnDef
@@ -190,7 +190,7 @@ namespace XQLite.AddIn
             await _backend.TryAddColumns(sm.TableName, defs);
         }
 
-        private static List<Dictionary<string, object?>> ReadSheetRows(Excel.Application app, string sheetName, SheetMeta sm)
+        private static List<Dictionary<string, object?>> ReadSheetRows(Excel.Application app, string sheetName, XqlSheet.Meta sm)
         {
             var list = new List<Dictionary<string, object?>>();
             Excel.Worksheet? ws = null; Excel.Range? used = null; Excel.Range? header = null; Excel.ListObject? lo = null;
@@ -277,7 +277,7 @@ namespace XQLite.AddIn
             return list;
         }
 
-        private static List<EditCell> RowsToCellEdits(string table, SheetMeta sm, List<Dictionary<string, object?>> rows)
+        private static List<EditCell> RowsToCellEdits(string table, XqlSheet.Meta sm, List<Dictionary<string, object?>> rows)
         {
             var cells = new List<EditCell>(rows.Count * 4);
             for (int i = 0; i < rows.Count; i++)

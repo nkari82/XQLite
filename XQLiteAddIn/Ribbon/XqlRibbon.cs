@@ -1,6 +1,8 @@
 ﻿using ExcelDna.Integration; // ExcelDnaUtil.Application
 using ExcelDna.Integration.CustomUI;
 using System;
+using System.Collections.Concurrent;
+using System.Reflection;
 using System.Windows.Forms;
 using Excel = Microsoft.Office.Interop.Excel;
 
@@ -231,7 +233,8 @@ namespace XQLite.AddIn
                     IXqlBackend.ConnState.Degraded => "PersonaStatusBusy",
                     _ => "PersonaStatusOffline"
                 };
-                return (stdole.IPictureDisp)app.CommandBars.GetImageMso(msoId, 32, 32);
+                
+                return MsoImageHelper.Get(msoId, 32);
             }
             catch { return null; }
         }
@@ -326,14 +329,14 @@ namespace XQLite.AddIn
                 var tag = (c?.Tag as string ?? "").Trim().ToUpperInvariant();
                 if (string.IsNullOrEmpty(tag)) return;
 
-                ColumnKind kind = tag switch
+                XqlSheet.ColumnKind kind = tag switch
                 {
-                    "INT" or "INTEGER" => ColumnKind.Int,
-                    "REAL" => ColumnKind.Real,
-                    "TEXT" => ColumnKind.Text,
-                    "BOOL" or "BOOLEAN" => ColumnKind.Bool,
-                    "DATE" => ColumnKind.Date,
-                    _ => ColumnKind.Text,
+                    "INT" or "INTEGER" => XqlSheet.ColumnKind.Int,
+                    "REAL" => XqlSheet.ColumnKind.Real,
+                    "TEXT" => XqlSheet.ColumnKind.Text,
+                    "BOOL" or "BOOLEAN" => XqlSheet.ColumnKind.Bool,
+                    "DATE" => XqlSheet.ColumnKind.Date,
+                    _ => XqlSheet.ColumnKind.Text,
                 };
 
                 var app = (Excel.Application)ExcelDnaUtil.Application;
@@ -363,7 +366,7 @@ namespace XQLite.AddIn
                     }
 
                     var sm = sheet.GetOrCreateSheet(ws.Name);
-                    var ct = sm.Columns.TryGetValue(colName!, out var cur) ? cur : new ColumnType();
+                    var ct = sm.Columns.TryGetValue(colName!, out var cur) ? cur : new XqlSheet.ColumnType();
                     ct.Kind = kind;
                     sm.SetColumn(colName!, ct);
 
@@ -381,6 +384,54 @@ namespace XQLite.AddIn
             catch (Exception ex)
             {
                 MessageBox.Show("Set Type failed: " + ex.Message, "XQLite");
+            }
+        }
+
+        internal static class MsoImageHelper
+        {
+            private static readonly ConcurrentDictionary<string, stdole.IPictureDisp> _cache =
+                new(StringComparer.OrdinalIgnoreCase);
+
+            /// <summary>
+            /// Office 버전/PIA 차이를 피하기 위해 리플렉션으로 GetImageMso 호출.
+            /// 실패 시 null 반환(Excel이 기본 아이콘 처리 가능).
+            /// </summary>
+            public static stdole.IPictureDisp? Get(string idMso, int size = 32)
+            {
+                if (string.IsNullOrWhiteSpace(idMso)) return null;
+
+                if (_cache.TryGetValue(idMso, out var pic))
+                    return pic;
+
+                try
+                {
+                    object app = ExcelDnaUtil.Application;                // Excel.Application (COM)
+                    var appType = app.GetType();
+
+                    // Application.CommandBars
+                    object commandBars = appType.InvokeMember(
+                        "CommandBars",
+                        BindingFlags.GetProperty,
+                        binder: null, target: app, args: null);
+
+                    // CommandBars.GetImageMso(string idMso, int width, int height) : IPictureDisp
+                    object? ret = commandBars.GetType().InvokeMember(
+                        "GetImageMso",
+                        BindingFlags.InvokeMethod,
+                        binder: null, target: commandBars,
+                        args: new object[] { idMso, size, size });
+
+                    pic = ret as stdole.IPictureDisp;
+                    if (pic != null)
+                        _cache[idMso] = pic;
+
+                    return pic;
+                }
+                catch
+                {
+                    // 여기서 예외를 삼키고 null 반환 → UI는 기본 아이콘/텍스트로 진행
+                    return null;
+                }
             }
         }
     }

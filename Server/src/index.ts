@@ -530,11 +530,6 @@ const Mutation = new GraphQLObjectType({
         return { ok: true };
       }
     },
-    deleteRow: {
-      args: { table: { type: new GraphQLNonNull(GraphQLString) }, row_key: { type: new GraphQLNonNull(GraphQLString) } },
-      type: new GraphQLNonNull(GqlOk),
-      resolve: (_src, { table, row_key }: { table: string; row_key: string }) => ({ ok: deleteRow(table, row_key) })
-    },
     presenceTouch: {
       args: {
         nickname: { type: new GraphQLNonNull(GraphQLString) },

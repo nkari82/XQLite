@@ -252,10 +252,10 @@ namespace XQLite.AddIn
                             Name = name,
                             Kind = ct.Kind switch
                             {
-                                ColumnKind.Int => "integer",
-                                ColumnKind.Real => "real",
-                                ColumnKind.Bool => "boolean",
-                                ColumnKind.Date => "integer",
+                                XqlSheet.ColumnKind.Int => "integer",
+                                XqlSheet.ColumnKind.Real => "real",
+                                XqlSheet.ColumnKind.Bool => "boolean",
+                                XqlSheet.ColumnKind.Date => "integer",
                                 _ => "text"
                             },
                             NotNull = !ct.Nullable,

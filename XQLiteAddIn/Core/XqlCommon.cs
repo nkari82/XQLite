@@ -6,10 +6,11 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.IO.Compression;
+using System.Security.Cryptography;
+using System.Text;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
-using System.Text;
 using Excel = Microsoft.Office.Interop.Excel;
 
 
@@ -66,6 +67,36 @@ namespace XQLite.AddIn
                 }
                 catch { /* ignore */ }
             }
+        }
+
+        // 값 정규화 → 문자열 (null/불린/숫자/날짜 일관 표현)
+        internal static string Canonicalize(object? v)
+        {
+            if (v is null) return "<null>";
+            switch (v)
+            {
+                case bool b: return b ? "1" : "0";
+                case double d: return d.ToString("R", CultureInfo.InvariantCulture);
+                case float f: return ((double)f).ToString("R", CultureInfo.InvariantCulture);
+                case int i: return i.ToString(CultureInfo.InvariantCulture);
+                case long l: return l.ToString(CultureInfo.InvariantCulture);
+                case decimal m: return ((double)m).ToString("R", CultureInfo.InvariantCulture);
+                case DateTime dt: return dt.ToUniversalTime().ToString("o");
+                default:
+                    var s = v.ToString();
+                    return string.IsNullOrWhiteSpace(s) ? "" : s!;
+            }
+        }
+
+        // SHA-1 64비트 축약 지문(16 hex)
+        internal static string Fingerprint(object? v)
+        {
+            var s = Canonicalize(v);
+            using var sha1 = SHA1.Create();
+            var bytes = sha1.ComputeHash(Encoding.UTF8.GetBytes(s));
+            ulong u = ((ulong)bytes[0] << 56) | ((ulong)bytes[1] << 48) | ((ulong)bytes[2] << 40) | ((ulong)bytes[3] << 32)
+                    | ((ulong)bytes[4] << 24) | ((ulong)bytes[5] << 16) | ((ulong)bytes[6] << 8) | bytes[7];
+            return u.ToString("x16");
         }
 
         // Excel Column Index -> "A, B, ..., Z, AA ..." 폴백 헤더명
@@ -299,49 +330,6 @@ namespace XQLite.AddIn
                 _ => Convert.ToString(v, CultureInfo.InvariantCulture) ?? string.Empty,
             };
             return s.Normalize(NormalizationForm.FormC);
-        }
-
-        // ── 파일/상태 보조 ──────────────────────────────────────────────
-        /// <summary>워크북 경로 옆에 숨김 상태폴더 생성/보장 (기본 ".xql")</summary>
-        public static string EnsureHiddenStateDir(string workbookFullName, string? dirName = null)
-        {
-            string baseDir = Path.GetDirectoryName(workbookFullName)
-                             ?? Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-            var leaf = string.IsNullOrWhiteSpace(dirName) ? XqlConfig.StateDirName : dirName!;
-            if (string.IsNullOrWhiteSpace(leaf)) leaf = ".xql";
-            string dir = Path.Combine(baseDir, leaf);
-            try
-            {
-                if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
-                var di = new DirectoryInfo(dir);
-                di.Attributes |= FileAttributes.Hidden; // 윈도우 숨김
-            }
-            catch { /* 무시 */ }
-            return dir;
-        }
-
-        public static T? LoadJsonFile<T>(string path)
-        {
-            try { if (!File.Exists(path)) return default; return JsonConvert.DeserializeObject<T>(File.ReadAllText(path)); }
-            catch { return default; }
-        }
-
-        public static void SaveJsonFile<T>(string path, T data)
-        {
-            try
-            {
-                var json = JsonConvert.SerializeObject(data, Formatting.Indented);
-                File.WriteAllText(path, json);
-            }
-            catch { /* 조용히 무시 */ }
-        }
-
-        public static string SanitizeFileStem(string s)
-        {
-            if (string.IsNullOrWhiteSpace(s)) return "default";
-            var bad = Path.GetInvalidFileNameChars();
-            var arr = s.Select(ch => bad.Contains(ch) ? '_' : ch).ToArray();
-            return new string(arr);
         }
     }
 }
