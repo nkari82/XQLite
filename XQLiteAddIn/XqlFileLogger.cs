@@ -19,7 +19,7 @@ namespace XQLite.AddIn
             public string[]? Details { get; init; }
         }
 
-        private static readonly BlockingCollection<string> _q = new(new ConcurrentQueue<string>());
+        private static BlockingCollection<string> _q = CreateQueue();
         private static Thread? _worker;
         private static volatile bool _running;
         private static readonly object _fileGate = new();
@@ -31,11 +31,16 @@ namespace XQLite.AddIn
         private static readonly ConcurrentQueue<LogItem> _recent = new();
         private static int _recentCapacity = 2000;
 
+        private static BlockingCollection<string> CreateQueue()
+            => new(new ConcurrentQueue<string>());
+
         internal static void Start(string? dir = null, int recentCapacity = 2000)
         {
             if (dir != null) { _logDir = dir; _logPath = Path.Combine(_logDir, "xqlite.log"); }
             _recentCapacity = Math.Max(100, recentCapacity);
             Directory.CreateDirectory(_logDir);
+            if (_q.IsAddingCompleted)
+                _q = CreateQueue();
             _running = true;
             _worker ??= new Thread(WriterLoop) { IsBackground = true, Name = "XqlFileLogger" };
             if (!_worker.IsAlive) _worker.Start();
@@ -44,7 +49,8 @@ namespace XQLite.AddIn
         internal static void Stop()
         {
             _running = false;
-            _q.CompleteAdding();
+            if (!_q.IsAddingCompleted)
+                _q.CompleteAdding();
             try { _worker?.Join(1500); } catch { }
             _worker = null;
         }
@@ -54,7 +60,11 @@ namespace XQLite.AddIn
             var now = DateTime.Now;
             var detailStr = (details != null && details.Length > 0) ? (" | " + string.Join(" | ", details)) : "";
             var line = $"{now:yyyy-MM-dd HH:mm:ss.fff}\t{level}\t{table}\t{message}{detailStr}";
-            _q.Add(line);
+            if (_running && !_q.IsAddingCompleted)
+            {
+                try { _q.Add(line); }
+                catch (InvalidOperationException) { /* queue closed - ignore */ }
+            }
 
             // 메모리 버퍼에도 동일 아이템 적재
             _recent.Enqueue(new LogItem
@@ -90,10 +100,7 @@ namespace XQLite.AddIn
                 using var fs = new FileStream(_logPath, FileMode.Append, FileAccess.Write, FileShare.Read);
                 using var sw = new StreamWriter(fs, Encoding.UTF8) { AutoFlush = true };
                 foreach (var line in _q.GetConsumingEnumerable())
-                {
-                    if (!_running) break;
                     lock (_fileGate) { sw.WriteLine(line); }
-                }
             }
             catch { /* 파일 쓰기 실패는 무시(버퍼에만 남음) */ }
         }
