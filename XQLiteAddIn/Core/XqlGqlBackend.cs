@@ -150,12 +150,14 @@ namespace XQLite.AddIn
         private int _subRetry = 0;
 
         private readonly Timer _heartbeat;
+        private Timer? _resubTimer;
         public ConnState State { get; private set; } = ConnState.Connecting;
         public string? StateDetail { get; private set; }
         public DateTime LastOkUtc { get; private set; } = DateTime.MinValue;
         public event Action<ConnState, string?>? StateChanged;
 
         private const int HB_TTL_MS = 10_000; // 마지막 성공 이후 이 시간 넘도록 성공 없으면 Disconnected
+
 
         // ── 생성자 ───────────────────────────────────────────────────────────
         internal XqlGqlBackend(string httpEndpoint, string? apiKey, int heartbeatSec = 3)
@@ -185,6 +187,7 @@ namespace XQLite.AddIn
         public void Dispose()
         {
             try { StopSubscription(); } catch { }
+            try { _resubTimer?.Dispose(); _resubTimer = null; } catch { }
             try { _http.Dispose(); } catch { }
             try { _ws.Dispose(); } catch { }
             try
@@ -258,7 +261,6 @@ namespace XQLite.AddIn
             return ParsePull(resp.Data);
         }
 
-
         public void StartSubscription(Action<ServerEvent> onEvent, long since)
         {
             StopSubscription();
@@ -277,7 +279,12 @@ namespace XQLite.AddIn
         {
             StopSubscription();
             var delayMs = (int)Math.Min(30_000, 500 * Math.Pow(2, Math.Min(_subRetry++, 10)));
-            _ = new Timer(_ => StartSubscription(onEvent, since), null, delayMs, Timeout.Infinite);
+            _resubTimer?.Dispose();
+            _resubTimer = new System.Threading.Timer(_ =>
+            {
+                try { StartSubscription(onEvent, since); }
+                finally { _resubTimer?.Dispose(); _resubTimer = null; }
+            }, null, delayMs, Timeout.Infinite);
         }
 
         public void StopSubscription()
@@ -290,11 +297,7 @@ namespace XQLite.AddIn
         // ⬇️ 프레즌스 갱신 (연결상태와 무관)
         public async Task PresenceTouch(string nickname, string? sheet, string? cell, CancellationToken ct = default)
         {
-            var req = new GraphQLHttpRequest
-            {
-                Query = MUT_PRESENCE,
-                Variables = new { n = nickname, s = sheet, c = cell }
-            };
+            var req = new GraphQLRequest { Query = MUT_PRESENCE, Variables = new { n = nickname, s = sheet, c = cell } };
             var resp = await _http.SendMutationAsync<PresenceTouchMutation>(req, ct).ConfigureAwait(false);
             if (resp.Errors != null && resp.Errors.Length > 0)
                 throw new Exception("presenceTouch failed: " + resp.Errors[0].Message);
@@ -334,7 +337,13 @@ namespace XQLite.AddIn
         public async Task<JObject?> TryFetchServerMeta(CancellationToken ct = default)
         {
             var resp = await _http.SendQueryAsync<JObject>(new GraphQLRequest { Query = Q_META }, ct).ConfigureAwait(false);
-            return resp.Data?["meta"] as JObject; // 서버가 JSON 스칼라를 반환
+            var raw = resp.Data?["meta"];
+            if (raw is JObject jo) return jo;
+            if (raw is JValue jv && jv.Type == JTokenType.String)
+            {
+                try { return JObject.Parse((string)jv!); } catch { }
+            }
+            return null;
         }
 
         public async Task<JArray?> TryFetchAuditLog(long? since = null, CancellationToken ct = default)
@@ -386,8 +395,8 @@ namespace XQLite.AddIn
             var req = new GraphQLRequest { Query = MUT_UPSERT_CELLS, Variables = new { cells } };
             var resp = await _http.SendMutationAsync<JObject>(req, ct).ConfigureAwait(false);
 
-            var root = resp.Data?["upsertCells"] as JObject
-                       ?? throw new Exception("upsertCells: empty response");
+            var root = resp.Data?["upsertCells"] as JObject;
+            if (root == null) throw new Exception("upsertCells: empty response");
 
             return new UpsertResult
             {
@@ -581,25 +590,6 @@ namespace XQLite.AddIn
     {
         public PresenceItem[]? presence { get; set; }
     }
-
-    internal sealed class UpsertResp
-    {
-        public UpsertRowsPayload? upsertRows { get; set; }
-    }
-
-    internal sealed class UpsertRowsPayload
-    {
-        public int affected { get; set; }
-        public GqlErr[]? errors { get; set; }
-        public long max_row_version { get; set; }
-    }
-
-    internal sealed class GqlErr
-    {
-        public string? code { get; set; }
-        public string? message { get; set; }
-    }
-
 
     // Parser 결과 DTO
 

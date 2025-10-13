@@ -270,9 +270,7 @@ namespace XQLite.AddIn
             catch { }
             finally
             {
-                XqlCommon.ReleaseCom(header);
-                XqlCommon.ReleaseCom(lo);
-                XqlCommon.ReleaseCom(ws);
+                XqlCommon.ReleaseCom(header, lo, ws);
             }
             return list;
         }

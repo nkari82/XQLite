@@ -1,4 +1,5 @@
 ﻿// XqlSheet.cs
+using Microsoft.Office.Interop.Excel;
 using Newtonsoft.Json.Linq;
 using System;
 using System.Collections.Generic;
@@ -283,10 +284,7 @@ namespace XQLite.AddIn
                 }
                 finally
                 {
-                    XqlCommon.ReleaseCom(inter2);
-                    XqlCommon.ReleaseCom(inter1);
-                    XqlCommon.ReleaseCom(body);
-                    XqlCommon.ReleaseCom(header);
+                    XqlCommon.ReleaseCom(inter2, inter1, body, header);
                     if (!keep) XqlCommon.ReleaseCom(lo); // 매치 실패건만 해제
                 }
             }
@@ -615,10 +613,7 @@ namespace XQLite.AddIn
             catch { return false; }
             finally
             {
-                XqlCommon.ReleaseCom(nm);
-                XqlCommon.ReleaseCom(wsNames);
-                XqlCommon.ReleaseCom(wbNames);
-                XqlCommon.ReleaseCom(wb);
+                XqlCommon.ReleaseCom(nm, wsNames, wbNames, wb);
             }
         }
 
@@ -649,10 +644,7 @@ namespace XQLite.AddIn
             }
             finally
             {
-                XqlCommon.ReleaseCom(nm);
-                XqlCommon.ReleaseCom(wsNames);
-                XqlCommon.ReleaseCom(wbNames);
-                XqlCommon.ReleaseCom(wb);
+                XqlCommon.ReleaseCom(nm, wsNames, wbNames, wb);
             }
         }
 
@@ -798,10 +790,21 @@ namespace XQLite.AddIn
                 int last = used.Row + used.Rows.Count - 1;
                 for (int r = 2; r <= last; r++)
                 {
-                    var k = Convert.ToString((sh.Cells[r, 1] as Excel.Range)!.Value2) ?? "";
-                    var v = Convert.ToString((sh.Cells[r, 2] as Excel.Range)!.Value2) ?? "";
-                    if (!string.IsNullOrWhiteSpace(k))
-                        map[k] = v;
+                    Excel.Range? kCell = null, vCell = null;
+                    try
+                    {
+                        kCell = sh.Cells[r, 1] as Excel.Range;
+                        vCell = sh.Cells[r, 2] as Excel.Range;
+                        var k = Convert.ToString(kCell?.Value2) ?? "";
+                        var v = Convert.ToString(vCell?.Value2) ?? "";
+                        if (!string.IsNullOrWhiteSpace(k))
+                            map[k] = v;
+                    }
+                    finally
+                    {
+                        XqlCommon.ReleaseCom(vCell);
+                        XqlCommon.ReleaseCom(kCell);
+                    }
                 }
             }
             catch { }
@@ -862,8 +865,18 @@ namespace XQLite.AddIn
                 // 배치 반영
                 foreach (var b in batch)
                 {
-                    (sh.Cells[b.row, 1] as Excel.Range)!.Value2 = b.key;
-                    (sh.Cells[b.row, 2] as Excel.Range)!.Value2 = b.val;
+                    Excel.Range? c1 = null, c2 = null;
+                    try
+                    {
+                        c1 = sh.Cells[b.row, 1] as Excel.Range;
+                        c2 = sh.Cells[b.row, 2] as Excel.Range;
+                        if (c1 != null) c1.Value2 = b.key;
+                        if (c2 != null) c2.Value2 = b.val;
+                    }
+                    finally
+                    {
+                        XqlCommon.ReleaseCom(c2, c1);
+                    }
                 }
             }
             catch { }
@@ -931,12 +944,17 @@ namespace XQLite.AddIn
             var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             for (int i = 1; i <= header.Columns.Count; i++)
             {
-                var name = (string?)((Excel.Range)header.Cells[1, i]).Value2 ?? "";
-                if (!string.IsNullOrWhiteSpace(name))
-                    map[name] = name; // 최소 구현: 이름 자체를 uid로 사용(필요시 프로젝트 고유 UID로 변경)
+                Excel.Range? hc = null;
+                try
+                {
+                    hc = (Excel.Range)header.Cells[1, i];
+                    var name = (string?)hc.Value2 ?? "";
+                    if (!string.IsNullOrWhiteSpace(name))
+                        map[name] = name; // 최소 구현: 이름 자체를 uid로 사용
+                }
+                finally { XqlCommon.ReleaseCom(hc); }
             }
             return map;
         }
-
     }
 }

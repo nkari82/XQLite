@@ -15,6 +15,10 @@ namespace XQLite.AddIn
         private readonly string _nickname;
         private readonly Timer _refresh;
 
+        private long _lastPresenceMs;
+        private string? _lastPresenceSig;
+
+
         public XqlCollab(IXqlBackend backend, string nickname, int refreshSec = 3)
         {
             _backend = backend ?? throw new ArgumentNullException(nameof(backend));
@@ -32,6 +36,30 @@ namespace XQLite.AddIn
                 _refresh.Dispose();
             }
             catch { }
+        }
+
+
+        public void SelectionChanged(string sheet, string cellAddr)
+        {
+            try
+            {
+                var now = XqlCommon.Monotonic.NowMs();
+                if (now - _lastPresenceMs < 800) return; // 0.8s 디바운스
+
+                var sig = $"{sheet}|{cellAddr}";
+                if (sig == _lastPresenceSig) return;
+
+                _lastPresenceSig = sig;
+                _lastPresenceMs = now;
+
+                var be = XqlAddIn.Backend;
+                var nick = XqlConfig.Nickname ?? Environment.UserName;
+                if (be == null || string.IsNullOrWhiteSpace(nick)) return;
+
+                // 비차단 fire-and-forget
+                _ = be.PresenceTouch(nick, sheet, cellAddr);
+            }
+            catch { /* non-fatal */ }
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -99,7 +127,7 @@ namespace XQLite.AddIn
                     int colOffset = colIndex;
                     return XqlSheet.ColumnKey(ws.Name, tableName, hRow, hCol, colOffset, headerName!);
                 }
-                finally { XqlCommon.ReleaseCom(headerCell); XqlCommon.ReleaseCom(lo); XqlCommon.ReleaseCom(ws); XqlCommon.ReleaseCom(rng); }
+                finally { XqlCommon.ReleaseCom(headerCell, lo, ws, rng); }
             });
             if (string.IsNullOrEmpty(key)) return false;
             try { await _backend.AcquireLock(key!, _nickname).ConfigureAwait(false); return true; }
@@ -130,9 +158,7 @@ namespace XQLite.AddIn
             }
             finally
             {
-                XqlCommon.ReleaseCom(lo);
-                XqlCommon.ReleaseCom(ws);
-                XqlCommon.ReleaseCom(rng);
+                XqlCommon.ReleaseCom(lo, ws, rng);
             }
         }
 
@@ -157,7 +183,7 @@ namespace XQLite.AddIn
                     int colOffset = rng.Column - hCol;
                     return (ws.Name, XqlSheet.CellKey(ws.Name, tableName, hRow, hCol, rowOffset, colOffset));
                 }
-                finally { XqlCommon.ReleaseCom(lo); XqlCommon.ReleaseCom(ws); XqlCommon.ReleaseCom(rng); }
+                finally { XqlCommon.ReleaseCom(lo, ws, rng); }
             })!;
         }
 

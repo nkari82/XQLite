@@ -51,10 +51,14 @@ namespace XQLite.AddIn
 
         private const int UPSERT_CHUNK = 512;   // 1회 전송 셀 수
         private const int UPSERT_SLICE_MS = 250; // 한번에 잡는 시간
-        private const int LAST_PUSHED_MAX = 200_000; // 필요 시 설정화
+        private const int LAST_PUSHED_MAX = 100_000;
+        private readonly LinkedList<string> _lruKeys = new();
+        private readonly Dictionary<string, (string? val, LinkedListNode<string> node)> _lastPushedLru
+            = new(StringComparer.Ordinal);
+
+        private const int CONFLICT_MAX = 5000;
 
         private readonly ConcurrentQueue<Conflict> _conflicts = new();
-        private readonly ConcurrentDictionary<string, string?> _lastPushed = new(StringComparer.Ordinal);
 
         private string? _workbookFullName;
         private PersistentState _state = new();
@@ -113,24 +117,12 @@ namespace XQLite.AddIn
 
         private static string Key(EditCell e) => $"{e.Table}\n{XqlCommon.ValueToString(e.RowKey)}\n{e.Column}";
 
-        // Excel 값 정규화: null/빈문자/숫자/불린/date를 문자열로 안정 변환
-        private static string? Canon(object? v)
-        {
-            if (v is null) return null;
-            if (v is bool b) return b ? "1" : "0";
-            if (v is double d) return d.ToString("R", System.Globalization.CultureInfo.InvariantCulture); // Value2 숫자
-            if (v is DateTime dt) return dt.ToUniversalTime().Ticks.ToString(); // 필요 시 epoch ms로 변경
-            var s = v.ToString();
-            return string.IsNullOrWhiteSpace(s) ? null : s;
-        }
-
         public void EnqueueIfChanged(string table, string rowKey, string column, object? value)
         {
             var e = new EditCell(Table: table, RowKey: rowKey, Column: column, Value: value);
             var k = Key(e);
-            var norm = Canon(value);
-            if (_lastPushed.TryGetValue(k, out var prev) && prev == norm)
-                return; // 동일값 → 전송 생략
+            var norm = XqlCommon.Canonicalize(value);
+            if (IsSameAsLast(k, norm)) return;
             _outbox.Enqueue(e);
         }
 
@@ -149,7 +141,7 @@ namespace XQLite.AddIn
 
             // 워크북에서 K/V 읽기 (UI 스레드에서 안전하게)
             var loaded = new Dictionary<string, string>(StringComparer.Ordinal);
-            var done = new System.Threading.ManualResetEventSlim(false);
+            var done = new ManualResetEventSlim(false);
             ExcelAsyncUtil.QueueAsMacro(() =>
             {
                 try
@@ -210,51 +202,6 @@ namespace XQLite.AddIn
                     finally { _pendingSchemaCheck = false; }
                 });
             }
-        }
-
-        private void PersistState()
-        {
-            try
-            {
-                if (_workbookFullName == null) return;
-                var kv = new Dictionary<string, string>(StringComparer.Ordinal)
-                {
-                    ["last_session_id"] = _state.LastSessionId ?? "",
-                    ["project"] = _state.Project ?? "",
-                    ["workbook"] = _state.Workbook ?? "",
-                    ["last_max_row_version"] = _state.LastMaxRowVersion.ToString(CultureInfo.InvariantCulture),
-                    ["last_full_pull_utc"] = (_state.LastFullPullUtc == DateTime.MinValue ? "" : _state.LastFullPullUtc.ToString("o")),
-                    ["last_schema_hash"] = _state.LastSchemaHash ?? "",
-                    ["last_meta_utc"] = (_state.LastMetaUtc == DateTime.MinValue ? "" : _state.LastMetaUtc.ToString("o")),
-                };
-
-                ExcelAsyncUtil.QueueAsMacro(() =>
-                {
-                    try
-                    {
-                        var app = (Excel.Application)ExcelDnaUtil.Application;
-                        Excel.Workbook? wb = null;
-                        try
-                        {
-                            foreach (Excel.Workbook w in app.Workbooks)
-                            {
-                                try
-                                {
-                                    if (string.Equals(w.FullName, _workbookFullName, StringComparison.OrdinalIgnoreCase))
-                                    { wb = w; break; }
-                                }
-                                finally { if (!ReferenceEquals(wb, w)) XqlCommon.ReleaseCom(w); }
-                            }
-                            wb ??= app.ActiveWorkbook;
-                            if (wb != null)
-                                XqlSheet.StateSetMany(wb, kv);
-                        }
-                        finally { XqlCommon.ReleaseCom(wb); }
-                    }
-                    catch { }
-                });
-            }
-            catch { }
         }
 
         public void FlushUpsertsNow() => _ = FlushUpsertsNow(false);
@@ -352,6 +299,81 @@ namespace XQLite.AddIn
             finally { _pushSem.Release(); }
         }
 
+        private void RememberPushed(string k, string? v)
+        {
+            if (_lastPushedLru.TryGetValue(k, out var ent))
+            {
+                ent.val = v;
+                _lruKeys.Remove(ent.node);
+                _lruKeys.AddFirst(ent.node);
+                _lastPushedLru[k] = (v, ent.node);
+                return;
+            }
+            var node = new LinkedListNode<string>(k);
+            _lruKeys.AddFirst(node);
+            _lastPushedLru[k] = (v, node);
+
+            if (_lastPushedLru.Count > LAST_PUSHED_MAX)
+            {
+                var tail = _lruKeys.Last;
+                if (tail != null)
+                {
+                    _lastPushedLru.Remove(tail.Value);
+                    _lruKeys.RemoveLast();
+                }
+            }
+        }
+
+        private bool IsSameAsLast(string k, string? v)
+        {
+            return _lastPushedLru.TryGetValue(k, out var ent) && ent.val == v;
+        }
+
+        private void PersistState()
+        {
+            try
+            {
+                if (_workbookFullName == null) return;
+                var kv = new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["last_session_id"] = _state.LastSessionId ?? "",
+                    ["project"] = _state.Project ?? "",
+                    ["workbook"] = _state.Workbook ?? "",
+                    ["last_max_row_version"] = _state.LastMaxRowVersion.ToString(CultureInfo.InvariantCulture),
+                    ["last_full_pull_utc"] = (_state.LastFullPullUtc == DateTime.MinValue ? "" : _state.LastFullPullUtc.ToString("o")),
+                    ["last_schema_hash"] = _state.LastSchemaHash ?? "",
+                    ["last_meta_utc"] = (_state.LastMetaUtc == DateTime.MinValue ? "" : _state.LastMetaUtc.ToString("o")),
+                };
+
+                ExcelAsyncUtil.QueueAsMacro(() =>
+                {
+                    try
+                    {
+                        var app = (Excel.Application)ExcelDnaUtil.Application;
+                        Excel.Workbook? wb = null;
+                        try
+                        {
+                            foreach (Excel.Workbook w in app.Workbooks)
+                            {
+                                try
+                                {
+                                    if (string.Equals(w.FullName, _workbookFullName, StringComparison.OrdinalIgnoreCase))
+                                    { wb = w; break; }
+                                }
+                                finally { if (!ReferenceEquals(wb, w)) XqlCommon.ReleaseCom(w); }
+                            }
+                            wb ??= app.ActiveWorkbook;
+                            if (wb != null)
+                                XqlSheet.StateSetMany(wb, kv);
+                        }
+                        finally { XqlCommon.ReleaseCom(wb); }
+                    }
+                    catch { }
+                });
+            }
+            catch { }
+        }
+
         private void SafeFlushUpserts()
         {
             if (!_started || _disposed) return;
@@ -363,14 +385,20 @@ namespace XQLite.AddIn
                 _ = Task.Run(async () =>
                 {
                     try { await FlushUpsertsCore(); }
-                    catch (Exception ex) { _conflicts.Enqueue(Conflict.System("upsert.core", ex.Message)); }
+                    catch (Exception ex) { PushConflict(Conflict.System("upsert.core", ex.Message)); }
                     finally { _pushSem.Release(); }
                 });
             }
             catch (Exception ex)
             {
-                _conflicts.Enqueue(Conflict.System("flush", ex.Message));
+                PushConflict(Conflict.System("flush", ex.Message));
             }
+        }
+
+        private void PushConflict(Conflict c)
+        {
+            _conflicts.Enqueue(c);
+            while (_conflicts.Count > CONFLICT_MAX) _conflicts.TryDequeue(out _);
         }
 
         private async Task<PullResult?> SafePull(long? sinceOverride = null)
@@ -379,7 +407,7 @@ namespace XQLite.AddIn
             if (!_pullSem.Wait(0)) return null;
             var task = PullCore(sinceOverride ?? MaxRowVersion);
             try { return await task.ConfigureAwait(false); }
-            catch (Exception ex) { _conflicts.Enqueue(Conflict.System("pull", ex.Message)); return null; }
+            catch (Exception ex) { PushConflict(Conflict.System("pull", ex.Message)); return null; }
             finally { _pullSem.Release(); }
         }
 
@@ -398,30 +426,27 @@ namespace XQLite.AddIn
 
                     var resp = await _backend.UpsertCells(batch, _cts.Token).ConfigureAwait(false);
 
-                    // ✅ 성공 반영값을 스냅샷에 기록(이후 동일값 재전송 방지)
-                    foreach (var e in batch)
-                        _lastPushed[Key(e)] = Canon(e.Value);
-
-                    if (_lastPushed.Count > LAST_PUSHED_MAX)
-                        _lastPushed.Clear(); // 단순하지만 빠름(Full Pull 등 이후 자동 회복)
-
                     if (resp.Errors is { Count: > 0 })
                         foreach (var e in resp.Errors)
-                            _conflicts.Enqueue(Conflict.System("upsert", e));
+                            PushConflict(Conflict.System("upsert", e));
 
                     if (resp.MaxRowVersion > 0)
                         XqlCommon.InterlockedMax(ref _maxRowVersion, resp.MaxRowVersion);
 
                     if (resp.Conflicts is { Count: > 0 })
-                        foreach (var c in resp.Conflicts) _conflicts.Enqueue(c);
+                        foreach (var c in resp.Conflicts) PushConflict(c);
+
+                    // FlushUpsertsCore 내 성공 후 기록 교체
+                    foreach (var e in batch) RememberPushed(Key(e), XqlCommon.Canonicalize(e.Value));
                 }
-                while (XqlCommon.Monotonic.NowMs() < deadline && !_outbox.IsEmpty);
+                while (!_outbox.IsEmpty && XqlCommon.Monotonic.NowMs() < deadline);
             }
             catch (Exception ex)
             {
-                _conflicts.Enqueue(Conflict.System("upsert.core", ex.Message));
+                PushConflict(Conflict.System("upsert.core", ex.Message));
             }
         }
+
         private async Task<PullResult> PullCore(long sinceVersion)
         {
             var resp = await _backend.PullRows(sinceVersion, _cts.Token).ConfigureAwait(false);
@@ -453,10 +478,9 @@ namespace XQLite.AddIn
             }
             catch (Exception ex)
             {
-                _conflicts.Enqueue(Conflict.System("subscription", ex.Message));
+                PushConflict(Conflict.System("subscription", ex.Message));
             }
         }
-
 
         private static List<EditCell> DrainDedupCells(ConcurrentQueue<EditCell> q, int max)
         {

@@ -69,10 +69,11 @@ namespace XQLite.AddIn
             }
         }
 
-        // 값 정규화 → 문자열 (null/불린/숫자/날짜 일관 표현)
-        internal static string Canonicalize(object? v)
+
+        /// <summary>값 정규화(전송/비교용) – 모든 모듈에서 이 함수만 사용.</summary>
+        public static string? Canonicalize(object? v)
         {
-            if (v is null) return "<null>";
+            if (v is null) return null;
             switch (v)
             {
                 case bool b: return b ? "1" : "0";
@@ -81,7 +82,9 @@ namespace XQLite.AddIn
                 case int i: return i.ToString(CultureInfo.InvariantCulture);
                 case long l: return l.ToString(CultureInfo.InvariantCulture);
                 case decimal m: return ((double)m).ToString("R", CultureInfo.InvariantCulture);
-                case DateTime dt: return dt.ToUniversalTime().ToString("o");
+                case DateTime dt:
+                    var ms = (long)(dt.ToUniversalTime() - new DateTime(1970, 1, 1)).TotalMilliseconds;
+                    return ms.ToString(CultureInfo.InvariantCulture);
                 default:
                     var s = v.ToString();
                     return string.IsNullOrWhiteSpace(s) ? "" : s!;
@@ -112,9 +115,16 @@ namespace XQLite.AddIn
             return s;
         }
 
-        internal static void ReleaseCom(object? o)
+        internal static void ReleaseCom(params object?[] objs)
         {
-            try { if (o != null && Marshal.IsComObject(o)) Marshal.FinalReleaseComObject(o); } catch { }
+            foreach (var o in objs)
+            {
+                try
+                {
+                    if (o != null && Marshal.IsComObject(o)) Marshal.FinalReleaseComObject(o);
+                }
+                catch { /* ignore */ }
+            }
         }
 
         internal static string CreateTempDir(string prefix)

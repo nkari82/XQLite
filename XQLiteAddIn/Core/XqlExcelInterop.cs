@@ -1,5 +1,7 @@
 ﻿// XqlExcelInterop.cs
+using EnvDTE;
 using ExcelDna.Integration;
+using Microsoft.Office.Interop.Excel;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -57,6 +59,7 @@ namespace XQLite.AddIn
             catch { /* 무시 */ }
 
             _app.SheetChange += App_SheetChange;
+            _app.SheetSelectionChange += App_SheetSelectionChange;
             _app.WorkbookOpen += App_WorkbookOpen;
             _app.WorkbookBeforeClose += App_WorkbookBeforeClose;
         }
@@ -67,6 +70,7 @@ namespace XQLite.AddIn
             _started = false;
 
             _app.SheetChange -= App_SheetChange;
+            _app.SheetSelectionChange -= App_SheetSelectionChange;
             _app.WorkbookOpen -= App_WorkbookOpen;
             _app.WorkbookBeforeClose -= App_WorkbookBeforeClose;
         }
@@ -88,19 +92,13 @@ namespace XQLite.AddIn
             catch (Exception ex)
             {
                 XqlLog.Warn("CommitSmart failed: " + ex.Message);
-                throw;
             }
         }
-
 
         public async void Cmd_PullOnly()
         {
             try { await _sync.PullSince(); }
-            catch (Exception ex)
-            {
-                XqlLog.Warn("PullOnly failed: " + ex.Message);
-                throw;
-            }
+            catch (Exception ex) { XqlLog.Warn("PullOnly failed: " + ex.Message); }
         }
 
         public void Cmd_RecoverFromExcel()
@@ -113,111 +111,143 @@ namespace XQLite.AddIn
 
         private void App_WorkbookOpen(Excel.Workbook wb)
         {
-            // 필요 시 통합문서 메타 초기화 등
-            XqlCommon.ReleaseCom(wb);
+            try
+            {
+                if (wb != null)
+                    _sync.InitPersistentState(wb.FullName, XqlConfig.Project);
+            }
+            catch { /* ignore */ }
+            finally { XqlCommon.ReleaseCom(wb); }
         }
+
 
         private void App_WorkbookBeforeClose(Excel.Workbook wb, ref bool Cancel)
         {
-            // 락 해제, 프레즌스 정리 등
+            // 락 해제, 프레즌스 정리, 타이머 정지(중복 안전)
             var _ = _collab.ReleaseByMe();
+            try { _sync.Stop(); } catch { }
             XqlCommon.ReleaseCom(wb);
+        }
+
+        /// <summary>시트에서 헤더와 데이터 범위를 일관되게 구한다.</summary>
+        private static (Excel.Range? header, Excel.Range? data, Excel.ListObject? lo) ResolveHeaderAndData(Excel.Worksheet sh)
+        {
+            Excel.Range? header = XqlSheetView.ResolveHeader(sh, null, XqlAddIn.Sheet!)
+                          ?? (XqlSheet.TryGetHeaderMarker(sh, out var mk) ? mk : XqlSheet.GetHeaderRange(sh));
+            if (header == null) return (null, null, null);
+            var lo = XqlSheet.FindListObjectContaining(sh, header);
+            if (lo?.DataBodyRange != null) return (header, lo.DataBodyRange, lo);
+            var first = (Excel.Range)header.Offset[1, 0];
+            var last = sh.Cells[sh.Rows.Count, header.Column + header.Columns.Count - 1];
+            var data = sh.Range[first, last];
+            XqlCommon.ReleaseCom(first, last);
+            return (header, data, lo);
         }
 
         // 변경 이벤트에서 호출
         private void App_SheetChange(object Sh, Excel.Range target)
         {
             Excel.Worksheet? sh = null;
+            Excel.Range? header = null;
+            Excel.Range? data = null;
+            Excel.Range? intersect = null;
+            Excel.ListObject? lo = null;
+
             try
             {
                 sh = Sh as Excel.Worksheet;
-                if (sh == null)
-                    return;
+                if (sh == null) return;
 
                 var sm = _sheet.GetOrCreateSheet(sh.Name);
-                var header = XqlSheetView.ResolveHeader(sh, null, _sheet);      // 헤더 Range
-                if (header == null) return;
+                (header, data, lo) = ResolveHeaderAndData(sh);
+                if (header == null || data == null) return;
 
-                // ✅ 헤더가 수정된 경우: 캐시 무효화 & 데이터 큐잉은 하지 않음
-                try
+                // 헤더 편집이면 캐시 무효화만
+                var hitHeader = sh.Application.Intersect(target, header) as Excel.Range;
+                if (hitHeader != null)
                 {
-                    var hitHeader = sh.Application.Intersect(target, header) as Excel.Range;
-                    if (hitHeader != null)
-                    {
-                        XqlCommon.ReleaseCom(hitHeader);
-                        XqlSheetView.InvalidateHeaderCache(sh.Name);
-                        return;
-                    }
-                }
-                catch { /* ignore */ }
-
-
-                Excel.Range? data = null;
-                Excel.Range? intersect = null;
-                Excel.ListObject? lo = null;
-                try
-                {
-                    // 표가 있으면 DataBodyRange, 없으면 헤더 폭만큼 시트 끝까지
-                    lo = XqlSheet.FindListObjectContaining(sh, header);
-                    if (lo?.DataBodyRange != null)
-                        data = lo.DataBodyRange;
-                    else
-                    {
-                        var first = (Excel.Range)header.Offset[1, 0];
-                        var last = sh.Cells[sh.Rows.Count, header.Column + header.Columns.Count - 1];
-                        data = sh.Range[first, last];
-                        XqlCommon.ReleaseCom(first);
-                        XqlCommon.ReleaseCom(last);
-                    }
-                    intersect = sh.Application.Intersect(target, data) as Excel.Range;
-                }
-                finally
-                {
-                    // intersect는 아래에서 사용하므로 여기서 해제하지 않음
+                    XqlSheetView.InvalidateHeaderCache(sh.Name);
+                    XqlCommon.ReleaseCom(hitHeader);
+                    return;
                 }
 
-                if (intersect == null) return;                    // 헤더/외곽은 무시
+                intersect = sh.Application.Intersect(target, data) as Excel.Range;
+                if (intersect == null) return;
 
                 var table = string.IsNullOrWhiteSpace(sm.TableName) ? sh.Name : sm.TableName!;
                 var keyColName = string.IsNullOrWhiteSpace(sm.KeyColumn) ? "id" : sm.KeyColumn!;
 
-                foreach (Excel.Range cell in intersect.Cells)
+                var areas = intersect.Areas;
+                try
                 {
-                    var colName = (string?)((header.Cells[1, cell.Column - header.Column + 1] as Excel.Range)!.Value2) ?? "";
-                    if (string.IsNullOrWhiteSpace(colName)) colName = XqlCommon.ColumnIndexToLetter(cell.Column);
-
-                    // key 셀 위치
-                    int keyAbsCol = XqlSheet.FindKeyColumnAbsolute(header, sm.KeyColumn);
-                    var keyCell = sh.Cells[cell.Row, keyAbsCol] as Excel.Range;
-                    var rowKeyObj = keyCell?.Value2;
-                    string? rowKey = rowKeyObj?.ToString();
-
-                    // 새 행이면 id 생성 (텍스트 키 가정) — 프로젝트 정책에 맞게 교체 가능
-                    if (string.IsNullOrWhiteSpace(rowKey))
+                    for (int ai = 1; ai <= areas.Count; ai++)
                     {
-                        if (!string.Equals(colName, keyColName, StringComparison.OrdinalIgnoreCase))
-                            continue; // 키가 없고 key가 아닌 셀 수정이면 보류
+                        Range? area = null;
+                        try
+                        {
+                            area = (Excel.Range)areas[ai];
+                            foreach (Excel.Range cell in area.Cells)
+                            {
+                                Excel.Range? hdrCell = null;
+                                Excel.Range? keyCell = null;
+                                try
+                                {
+                                    int hdrIdx = cell.Column - header.Column + 1;
+                                    if (hdrIdx < 1 || hdrIdx > header.Columns.Count) continue;
 
-                        rowKey = Guid.NewGuid().ToString("N").Substring(0, 12);
-                        keyCell!.Value2 = rowKey; // 시트에 즉시 반영
+                                    hdrCell = (Excel.Range)header.Cells[1, hdrIdx];
+                                    var colName = (hdrCell.Value2 as string)?.Trim();
+                                    if (string.IsNullOrWhiteSpace(colName))
+                                        colName = XqlCommon.ColumnIndexToLetter(cell.Column);
+
+                                    int keyAbsCol = XqlSheet.FindKeyColumnAbsolute(header, sm.KeyColumn);
+                                    keyCell = sh.Cells[cell.Row, keyAbsCol] as Excel.Range;
+
+                                    var rowKeyObj = keyCell?.Value2;
+                                    string? rowKey = rowKeyObj?.ToString();
+
+                                    if (string.IsNullOrWhiteSpace(rowKey))
+                                    {
+                                        if (!string.Equals(colName, keyColName, StringComparison.OrdinalIgnoreCase))
+                                            continue;
+
+                                        rowKey = Guid.NewGuid().ToString("N").Substring(0, 12);
+                                        if (keyCell != null) keyCell.Value2 = rowKey;
+                                    }
+
+                                    object? value = cell.Value2;
+                                    _sync.EnqueueIfChanged(table, rowKey!, colName!, value);
+                                }
+                                finally
+                                {
+                                    XqlCommon.ReleaseCom(keyCell, hdrCell, cell);
+                                }
+                            }
+                        }
+                        finally { XqlCommon.ReleaseCom(area); }
                     }
-
-                    // 값 뽑기 (JSON/날짜/불린 변환은 기존 유틸 사용 가능)
-                    object? value = cell.Value2;
-
-                    // ⬇️ 딱 이 셀만 큐잉
-                    _sync.EnqueueIfChanged(table, rowKey!, colName, value);
-                    XqlCommon.ReleaseCom(keyCell);
                 }
-
-                XqlCommon.ReleaseCom(intersect);
-                XqlCommon.ReleaseCom(data);
-                XqlCommon.ReleaseCom(lo);
+                finally { XqlCommon.ReleaseCom(areas); }
             }
             catch (Exception ex)
             {
                 XqlLog.Warn("OnWorksheetChange: " + ex.Message);
             }
+            finally { XqlCommon.ReleaseCom(intersect, data, lo, header, sh); }
+        }
+
+        private void App_SheetSelectionChange(object Sh, Excel.Range Target)
+        {
+            try
+            {
+                var ws = Sh as Excel.Worksheet; if (ws == null) return;
+                string sheet = ws.Name;
+                string cell = Target?.Address[false, false] ?? "";
+
+                XqlAddIn.Collab?.SelectionChanged(sheet, cell);
+            }
+            catch { /* non-fatal */ }
+            finally { XqlCommon.ReleaseCom(Target); }
         }
 
         /// <summary>
@@ -271,8 +301,9 @@ namespace XQLite.AddIn
                             {
                                 XqlSheet.ColumnKind.Int => "integer",
                                 XqlSheet.ColumnKind.Real => "real",
-                                XqlSheet.ColumnKind.Bool => "boolean",
-                                XqlSheet.ColumnKind.Date => "integer",
+                                XqlSheet.ColumnKind.Bool => "bool",     // ✅ 서버 규격
+                                XqlSheet.ColumnKind.Date => "integer",  // (epoch ms를 int로 저장)
+                                XqlSheet.ColumnKind.Json => "json",
                                 _ => "text"
                             },
                             NotNull = !ct.Nullable,
@@ -308,9 +339,11 @@ namespace XQLite.AddIn
                         }
                     }
                 }
+
+                try { XqlSheetView.RegisterTableSheet(table, ws.Name); } catch { /* ignore */ }
             }
             catch (Exception ex) { XqlLog.Warn("EnsureActiveSheetSchema: " + ex.Message); }
-            finally { XqlCommon.ReleaseCom(header); XqlCommon.ReleaseCom(ws); }
+            finally { XqlCommon.ReleaseCom(header, ws); }
         }
     }
 }

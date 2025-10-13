@@ -75,6 +75,8 @@ namespace XQLite.AddIn
 
                 // Excel 내부 후처리 이후 유실 방지(지연 재적용·중복 큐잉 방지)
                 EnqueueReapplyHeaderUi(ws.Name, withValidation: true);
+
+                InvalidateHeaderCache(ws.Name);
                 return true;
             }
             catch (Exception ex)
@@ -82,7 +84,7 @@ namespace XQLite.AddIn
                 MessageBox.Show("InstallHeader failed: " + ex.Message, "XQLite");
                 return false;
             }
-            finally { XqlCommon.ReleaseCom(candidate); XqlCommon.ReleaseCom(ws); }
+            finally { XqlCommon.ReleaseCom(candidate, ws); }
         }
 
         // 메타에 있으면 메타 기반, 없으면 폴백
@@ -149,9 +151,11 @@ namespace XQLite.AddIn
                 ApplyHeaderUi(ws, header, sm, withValidation: true);
 
                 EnqueueReapplyHeaderUi(ws.Name, withValidation: true);
+
+                InvalidateHeaderCache(ws.Name);
             }
             catch (Exception ex) { MessageBox.Show("RefreshMetaHeader failed: " + ex.Message, "XQLite"); }
-            finally { XqlCommon.ReleaseCom(header); XqlCommon.ReleaseCom(ws); }
+            finally { XqlCommon.ReleaseCom(header, ws); }
         }
 
         public static void RemoveHeader()
@@ -173,7 +177,7 @@ namespace XQLite.AddIn
             {
                 MessageBox.Show("RemoveMetaHeader failed: " + ex.Message, Caption);
             }
-            finally { XqlCommon.ReleaseCom(sel); XqlCommon.ReleaseCom(hdr); XqlCommon.ReleaseCom(ws); }
+            finally { XqlCommon.ReleaseCom(sel, hdr, ws); }
         }
 
         public static void ShowHeaderInfo()
@@ -217,7 +221,7 @@ namespace XQLite.AddIn
                 MessageBox.Show(sb.ToString().TrimEnd(), "XQLite");
             }
             catch (Exception ex) { MessageBox.Show("ShowMetaHeaderInfo failed: " + ex.Message, "XQLite"); }
-            finally { XqlCommon.ReleaseCom(header); XqlCommon.ReleaseCom(ws); }
+            finally { XqlCommon.ReleaseCom(header, ws); }
         }
 
         // ───────────────────────── Header Resolve / Marker
@@ -334,7 +338,7 @@ namespace XQLite.AddIn
                             try { cell.AddComment(text); } catch { /* ignore */ }
                         }
                     }
-                    finally { XqlCommon.ReleaseCom(cmt); XqlCommon.ReleaseCom(cell); }
+                    finally { XqlCommon.ReleaseCom(cmt, cell); }
                 }
             }
             finally
@@ -405,9 +409,7 @@ namespace XQLite.AddIn
             }
             finally
             {
-                XqlCommon.ReleaseCom(inter);
-                XqlCommon.ReleaseCom(marker);
-                XqlCommon.ReleaseCom(lo);
+                XqlCommon.ReleaseCom(inter, marker, lo);
             }
         }
 
@@ -455,7 +457,7 @@ namespace XQLite.AddIn
                     else
                         try { col.Validation.Delete(); } catch { /* clean only */ }
                 }
-                finally { XqlCommon.ReleaseCom(h); XqlCommon.ReleaseCom(col); }
+                finally { XqlCommon.ReleaseCom(h, col); }
             }
         }
 
@@ -769,9 +771,7 @@ namespace XQLite.AddIn
                         }
                         finally
                         {
-                            XqlCommon.ReleaseCom(lo);
-                            XqlCommon.ReleaseCom(header);
-                            XqlCommon.ReleaseCom(ws);
+                            XqlCommon.ReleaseCom(lo, header, ws);
                         }
                     }
 
@@ -844,9 +844,7 @@ namespace XQLite.AddIn
                 }
                 finally
                 {
-                    XqlCommon.ReleaseCom(lo);
-                    XqlCommon.ReleaseCom(header);
-                    XqlCommon.ReleaseCom(ws);
+                    XqlCommon.ReleaseCom(lo, header, ws);
                 }
             }
         }
@@ -1051,11 +1049,12 @@ namespace XQLite.AddIn
             {
                 var bs = header.Borders;
                 var idxs = new[]
-                       {
-           Excel.XlBordersIndex.xlEdgeLeft, Excel.XlBordersIndex.xlEdgeTop,
-           Excel.XlBordersIndex.xlEdgeRight, Excel.XlBordersIndex.xlEdgeBottom,
-           Excel.XlBordersIndex.xlInsideHorizontal, Excel.XlBordersIndex.xlInsideVertical
-       };
+                    {
+                        Excel.XlBordersIndex.xlEdgeLeft, Excel.XlBordersIndex.xlEdgeTop,
+                        Excel.XlBordersIndex.xlEdgeRight, Excel.XlBordersIndex.xlEdgeBottom,
+                        Excel.XlBordersIndex.xlInsideHorizontal, Excel.XlBordersIndex.xlInsideVertical
+                    };
+
                 foreach (var idx in idxs)
                 {
                     var b = bs[idx]; try { b.LineStyle = Excel.XlLineStyle.xlLineStyleNone; } finally { XqlCommon.ReleaseCom(b); }
@@ -1084,9 +1083,9 @@ namespace XQLite.AddIn
                             finally { XqlCommon.ReleaseCom(c); }
                         }
 
-                        XqlCommon.ReleaseCom(first); XqlCommon.ReleaseCom(last);
+                        XqlCommon.ReleaseCom(first, last);
                     }
-                    finally { XqlCommon.ReleaseCom(col); XqlCommon.ReleaseCom(h); }
+                    finally { XqlCommon.ReleaseCom(col, h); }
                 }
             }
             catch { }
@@ -1099,8 +1098,7 @@ namespace XQLite.AddIn
             var first = (Excel.Range)h.Offset[1, 0];
             var last = ws.Cells[ws.Rows.Count, h.Column];
             var rng = ws.Range[first, last];
-            XqlCommon.ReleaseCom(first);
-            XqlCommon.ReleaseCom(last);
+            XqlCommon.ReleaseCom(first, last);
             return rng;
         }
 
@@ -1115,8 +1113,8 @@ namespace XQLite.AddIn
                 try
                 {
                     if (rng == null) return;
-                    if ((long)rng.CountLarge == 0) return;
                     if (rng.Areas != null && rng.Areas.Count > 1) return;
+                    if ((long)rng.CountLarge == 0) return;
                 }
                 catch { /* ignore */ }
 
@@ -1290,8 +1288,7 @@ namespace XQLite.AddIn
                     }
                     finally
                     {
-                        XqlCommon.ReleaseCom(h2);
-                        XqlCommon.ReleaseCom(ws2);
+                        XqlCommon.ReleaseCom(h2, ws2);
                         lock (_reapplyLock) { _reapplyPending.Remove(key); }
                     }
                 });
