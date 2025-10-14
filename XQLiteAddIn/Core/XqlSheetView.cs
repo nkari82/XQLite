@@ -948,7 +948,7 @@ namespace XQLite.AddIn
 
         // 캐시 우선 조회 후, 실패하면 기존 스캔으로 폴백
         // XqlSheetView.cs 내
-        private static Excel.Worksheet? FindWorksheetByTable(Excel.Application app, string table, out XqlSheet.Meta? smeta)
+        internal static Excel.Worksheet? FindWorksheetByTable(Excel.Application app, string table, out XqlSheet.Meta? smeta)
         {
             smeta = null;
 
@@ -1348,7 +1348,7 @@ namespace XQLite.AddIn
         }
 
         // ── [NEW] 헤더 UI(툴팁+보더+검증) 한 번에 적용
-        private static void ApplyHeaderUi(Excel.Worksheet ws, Excel.Range header, XqlSheet.Meta sm, bool withValidation)
+        internal static void ApplyHeaderUi(Excel.Worksheet ws, Excel.Range header, XqlSheet.Meta sm, bool withValidation)
         {
             if (ws == null || header == null || sm == null) return;
 

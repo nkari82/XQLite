@@ -246,7 +246,7 @@ namespace XQLite.AddIn
             return match;
         }
 
-        internal static Excel.ListObject? FindListObjectContaining(Excel.Worksheet ws, Excel.Range rng)
+        internal static Excel.ListObject? FindListObjectContaining(Excel.Worksheet ws, Excel.Range? rng)
         {
             if (ws is null || rng is null) return null;
 
