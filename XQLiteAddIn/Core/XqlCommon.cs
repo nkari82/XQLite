@@ -71,27 +71,6 @@ namespace XQLite.AddIn
             }
         }
 
-#if false
-        public static T OnUi<T>(Func<T> fn)
-        {
-            T result = default!;
-            Exception? err = null;
-            using var done = new System.Threading.ManualResetEvent(false);
-            ExcelDna.Integration.ExcelAsyncUtil.QueueAsMacro(() =>
-            {
-                try
-                {
-                    result = fn();
-                }
-                catch (Exception ex) { err = ex; }
-                finally { done.Set(); }
-            });
-            done.WaitOne();
-            if (err != null) throw err;
-            return result;
-        }
-#endif
-
         /// <summary>값 정규화(전송/비교용) – 모든 모듈에서 이 함수만 사용.</summary>
         public static string? Canonicalize(object? v)
         {

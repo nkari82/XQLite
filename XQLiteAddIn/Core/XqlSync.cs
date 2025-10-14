@@ -68,7 +68,6 @@ namespace XQLite.AddIn
         private string? _workbookFullName;
         private PersistentState _state = new();
         private volatile bool _forceFullPull = false;
-        private volatile bool _pendingSchemaCheck = false;
 
         private CancellationTokenSource _cts = new();
 
@@ -190,8 +189,7 @@ namespace XQLite.AddIn
             // (선택) 서버 메타 확인 → 스키마 변경 감지 시 Full Pull 예약
             if (XqlConfig.FullPullWhenSchemaChanged)
             {
-                _pendingSchemaCheck = true;
-                _ = Task.Run(async () =>
+                Task.Run(async () =>
                 {
                     try
                     {
@@ -204,16 +202,13 @@ namespace XQLite.AddIn
                         PersistState();
                     }
                     catch { }
-                    finally { _pendingSchemaCheck = false; }
+                    finally {  }
                 });
             }
         }
 
         public void FlushUpsertsNow() => _ = FlushUpsertsNow(false);
 
-        // XqlSync.cs
-
-        // ✅ 기존 PullSince를 아래로 완전히 교체
         public async Task PullSince(long? sinceOverride = null)
         {
             // 백오프 윈도우면 스킵
@@ -224,6 +219,7 @@ namespace XQLite.AddIn
             // 이미 실행 중이면 무시
             if (System.Threading.Interlocked.Exchange(ref _pulling, 1) == 1)
                 return;
+
             PullStateChanged?.Invoke(true);
             if (!await _pullSem.WaitAsync(0).ConfigureAwait(false))
             {
@@ -233,86 +229,51 @@ namespace XQLite.AddIn
                 return;
             }
 
+
             try
             {
+                var since = sinceOverride ?? (_forceFullPull ? 0 : MaxRowVersion);
+                var pr = await _backend.PullRows(since, _cts.Token).ConfigureAwait(false);
 
-                try
+                // ① FULL(=0) + 패치 있음 → 부트스트랩 적용(헤더 생성 + 채우기)
+                if (since == 0 && pr.Patches is { Count: > 0 })
                 {
-                    // 1) 기본은 증분, 강제 풀이면 0
-                    var since = sinceOverride ?? (_forceFullPull ? 0 : MaxRowVersion);
-                    var pr = await _backend.PullRows(since, _cts.Token).ConfigureAwait(false);
-
-                    // ⬇️ ① FULL(=0) 이고, 패치가 있으면 "부트스트랩 적용" 시도
-                    if (since == 0 && pr.Patches != null && pr.Patches.Count > 0)
-                    {
-                        await ApplyBootstrapSnapshot(pr).ConfigureAwait(false);
-                        _pullErr = 0; // 성공으로 간주
-                        Interlocked.Exchange(ref _maxRowVersion, pr.MaxRowVersion);
-                        PersistState();
-                        return; // 부트스트랩 경로 종료
-                    }
-
-                    // (기존) 증분 적용 경로 …
-                    await ApplyIncrementalPatches(pr).ConfigureAwait(false);
-
-                    // 2) 패치가 0건이고, 아직 로컬 버전이 0(=초기 워크북)이라면 → 서버에서 Full Pull 재시도
-                    if ((pr.Patches == null || pr.Patches.Count == 0) &&
-                        since != 0 &&
-                        MaxRowVersion == 0 &&
-                        _state.LastMaxRowVersion == 0)
-                    {
-                        pr = await _backend.PullRows(0, _cts.Token).ConfigureAwait(false);
-
-                        // 3) 패치가 있으면 UI 반영
-                        await ApplyIncrementalPatches(pr).ConfigureAwait(false);
-                    }
-
-                    // 4) 버전 반영
-                    if (pr.MaxRowVersion > 0)
-                        XqlCommon.InterlockedMax(ref _maxRowVersion, pr.MaxRowVersion);
-
-                    if (_forceFullPull)
-                    {
-                        _forceFullPull = false;
-                        _state.LastFullPullUtc = DateTime.UtcNow;
-                    }
+                    await ApplyBootstrapSnapshot(pr).ConfigureAwait(false);
+                    _pullErr = 0;
+                    Interlocked.Exchange(ref _maxRowVersion, pr.MaxRowVersion);
                     _state.LastMaxRowVersion = MaxRowVersion;
                     PersistState();
-
-                    // (옵션) 스키마 변경 감지 작업은 기존 로직 유지
-                    if (XqlConfig.FullPullWhenSchemaChanged && !_pendingSchemaCheck && string.IsNullOrEmpty(_state.LastSchemaHash))
-                    {
-                        _pendingSchemaCheck = true;
-                        _ = Task.Run(async () =>
-                        {
-                            try
-                            {
-                                var meta = await _backend.TryFetchServerMeta().ConfigureAwait(false);
-                                var hash = meta?["schema_hash"]?.ToString();
-                                if (!string.IsNullOrWhiteSpace(hash))
-                                {
-                                    if (!string.Equals(hash, _state.LastSchemaHash, StringComparison.Ordinal))
-                                        _forceFullPull = true;
-                                    _state.LastSchemaHash = hash;
-                                    _state.LastMetaUtc = DateTime.UtcNow;
-                                    PersistState();
-                                }
-                            }
-                            catch { }
-                            finally { _pendingSchemaCheck = false; }
-                        });
-                    }
-
-                    // 성공 → 백오프 초기화
-                    _pullErr = 0;
-                    _pullBackoffUntilMs = 0;
+                    return;
                 }
-                catch
+
+                // ② 증분 적용
+                await ApplyIncrementalPatches(pr).ConfigureAwait(false);
+
+                // ③ 초기 워크북 보정: 증분 0이고 로컬 버전도 0이면 rows(0) 한 번 더
+                if ((pr.Patches == null || pr.Patches.Count == 0) &&
+                    since != 0 &&
+                    MaxRowVersion == 0 &&
+                    _state.LastMaxRowVersion == 0)
                 {
-                    // 실패 → 지수 백오프(최대 8초)
-                    _pullErr = Math.Min(_pullErr + 1, 4);
-                    _pullBackoffUntilMs = XqlCommon.Monotonic.NowMs() + _pullErr * 2000L;
+                    pr = await _backend.PullRows(0, _cts.Token).ConfigureAwait(false);
+                    await ApplyIncrementalPatches(pr).ConfigureAwait(false);
                 }
+
+                // ④ 버전/상태 갱신
+                if (pr.MaxRowVersion > 0)
+                    XqlCommon.InterlockedMax(ref _maxRowVersion, pr.MaxRowVersion);
+                if (_forceFullPull) { _forceFullPull = false; _state.LastFullPullUtc = DateTime.UtcNow; }
+                _state.LastMaxRowVersion = MaxRowVersion;
+                PersistState();
+
+                // 성공 → 백오프 초기화
+                _pullErr = 0;
+                _pullBackoffUntilMs = 0;
+            }
+            catch
+            {
+                _pullErr = Math.Min(_pullErr + 1, 4);
+                _pullBackoffUntilMs = XqlCommon.Monotonic.NowMs() + _pullErr * 2000L;
             }
             finally
             {
@@ -408,357 +369,12 @@ namespace XQLite.AddIn
             }
         }
 
-        // 기존 증분 적용기 호출만 남긴 껍데기(가독성용)
+        // 증분 패치를 UI 스레드에서 적용 (항상 한 경로)
         private Task ApplyIncrementalPatches(PullResult pr)
         {
             if (pr?.Patches is { Count: > 0 })
-                XqlSheetView.ApplyOnUiThread(pr.Patches);
+                XqlSheetView.ApplyOnUiThread(pr.Patches); // ← 내부에서 InternalApplyCore 호출
             return Task.CompletedTask;
-        }
-
-        // using Excel = Microsoft.Office.Interop.Excel;
-        // using System.Linq;
-        // using System.Collections.Generic;
-
-        internal static void InternalApplyCore(Excel.Application app, IEnumerable<RowPatch> patches)
-        {
-            if (patches == null) return;
-
-            var byTable = patches
-                .Where(p => !string.IsNullOrWhiteSpace(p.Table))
-                .GroupBy(p => p.Table!, StringComparer.OrdinalIgnoreCase);
-
-            foreach (var grp in byTable)
-            {
-                Excel.Worksheet? ws = null;
-                Excel.Range? header = null;
-                Excel.Range? data = null;
-
-                try
-                {
-                    // ── 1) 테이블→시트 매핑 확보(대소문자 무시, 메타 없으면 즉시 생성)
-                    XqlSheet.Meta? smeta;
-                    ws = XqlSheetView.FindWorksheetByTable(app, grp.Key, out smeta);
-                    if (ws == null)
-                    {
-                        // 시트가 없으면 생성(부트스트랩 시나리오)
-                        ws = (Excel.Worksheet)app.Worksheets.Add();
-                        ws.Name = grp.Key.Length > 31 ? grp.Key.Substring(0, 31) : grp.Key;
-                        smeta = XqlAddIn.Sheet!.GetOrCreateSheet(ws.Name);
-                        XqlSheetView.RegisterTableSheet(grp.Key, ws.Name);
-                    }
-                    if (smeta == null)
-                        smeta = XqlAddIn.Sheet!.GetOrCreateSheet(ws.Name);
-
-                    // ── 2) 헤더/테이블 범위 확보(표가 있으면 HeaderRowRange, 없으면 1행 추정)
-                    var lo = XqlSheet.FindListObjectContaining(ws, null);
-                    header = lo?.HeaderRowRange ?? XqlSheet.GetHeaderRange(ws);
-                    if (header == null)
-                    {
-                        // 1행 전체를 헤더 후보로
-                        header = ws.Range[ws.Cells[1, 1], ws.Cells[1, Math.Max(1, GuessMaxColumnFromUsedRange(ws))]];
-                    }
-
-                    // ── 3) 서버 패치에서 등장한 컬럼 수집(+키 보장)
-                    var serverCols = new HashSet<string>(StringComparer.Ordinal);
-                    foreach (var p in grp)
-                    {
-                        if (p.Deleted || p.Cells == null) continue;
-                        foreach (var k in p.Cells.Keys)
-                            if (!string.IsNullOrWhiteSpace(k)) serverCols.Add(k);
-                    }
-                    var keyName = string.IsNullOrWhiteSpace(smeta.KeyColumn) ? "id" : smeta.KeyColumn!;
-                    serverCols.Add(keyName);
-
-                    // ── 4) 현재 헤더 이름 수집
-                    var headers = new List<string>(header.Columns.Count);
-                    for (int i = 1; i <= header.Columns.Count; i++)
-                    {
-                        Excel.Range? hc = null;
-                        try
-                        {
-                            hc = (Excel.Range)header.Cells[1, i];
-                            var nm = (hc.Value2 as string)?.Trim();
-                            headers.Add(string.IsNullOrEmpty(nm)
-                                ? XqlCommon.ColumnIndexToLetter(header.Column + i - 1)
-                                : nm!);
-                        }
-                        finally { XqlCommon.ReleaseCom(hc); }
-                    }
-
-                    // ── 5) 헤더 자동 생성 필요 여부 판정
-                    bool LooksDefaultLetters()
-                    {
-                        if (headers.Count == 0) return true;
-                        for (int i = 0; i < headers.Count; i++)
-                        {
-                            var expect = XqlCommon.ColumnIndexToLetter(header.Column + i);
-                            if (!string.Equals(headers[i], expect, StringComparison.Ordinal)) return false;
-                        }
-                        return true;
-                    }
-
-                    bool needCreateHeader =
-                        headers.Count == 0 ||
-                        LooksDefaultLetters() ||
-                        !headers.Any(h => serverCols.Contains(h));
-
-                    if (needCreateHeader && serverCols.Count > 0)
-                    {
-                        // 키 우선, 나머지는 알파벳 정렬(안정적 재현)
-                        var ordered = new List<string>(serverCols.Count);
-                        if (serverCols.Contains(keyName)) ordered.Add(keyName);
-                        ordered.AddRange(serverCols.Where(c => !string.Equals(c, keyName, StringComparison.Ordinal))
-                                                   .OrderBy(c => c, StringComparer.Ordinal));
-
-                        // 1행에 헤더 텍스트 배치
-                        var start = (Excel.Range)header.Cells[1, 1];
-                        var end = (Excel.Range)ws.Cells[header.Row, header.Column + ordered.Count - 1];
-                        var newHeader = ws.Range[start, end];
-                        XqlCommon.ReleaseCom(start, end);
-
-                        var arr = new object[1, ordered.Count];
-                        for (int i = 0; i < ordered.Count; i++) arr[0, i] = ordered[i];
-
-                        newHeader.Value2 = arr;
-
-                        // 메타/마커/UI 동기화
-                        XqlAddIn.Sheet!.EnsureColumns(ws.Name, ordered);
-                        XqlSheet.SetHeaderMarker(ws, newHeader);
-                        XqlSheetView.ApplyHeaderUi(ws, newHeader, smeta, withValidation: true);
-                        XqlSheetView.InvalidateHeaderCache(ws.Name);
-                        XqlSheetView.RegisterTableSheet(grp.Key, ws.Name);
-
-                        // 로컬 변수 교체
-                        XqlCommon.ReleaseCom(header);
-                        header = newHeader;
-                        headers = ordered;
-                    }
-
-                    // (헤더를 새로 만들지 않은 경로에서도) 서버 컬럼을 메타에 보장 — 스킵 방지
-                    try { XqlAddIn.Sheet!.EnsureColumns(ws.Name, serverCols.ToArray()); } catch { }
-
-                    if (headers.Count == 0) continue;
-
-                    // ── 6) 데이터 영역 계산(표가 있으면 DataBodyRange, 없으면 헤더 아래 ~ 마지막)
-                    data = ResolveDataRange(ws, header);
-
-                    // ── 7) 키 절대열 계산
-                    int keyIdx1 = XqlSheet.FindKeyColumnIndex(headers, smeta.KeyColumn); // 1-based
-                    if (keyIdx1 <= 0) keyIdx1 = 1; // 폴백: 1열
-                    int keyAbsCol = header.Column + keyIdx1 - 1;
-
-                    // ── 8) 적용(성능: 화면/계산/이벤트 잠시 off)
-                    var prevCalc = app.Calculation;
-                    var prevScreen = app.ScreenUpdating;
-                    var prevEvt = app.EnableEvents;
-                    try
-                    {
-                        app.Calculation = Excel.XlCalculation.xlCalculationManual;
-                        app.ScreenUpdating = false;
-                        app.EnableEvents = false;
-
-                        foreach (var p in grp)
-                        {
-                            if (p.Deleted)
-                            {
-                                // 삭제: 키로 행 찾고 삭제
-                                var rowIx = FindRowByKey(ws, data, keyAbsCol, p.RowKey?.ToString() ?? string.Empty);
-                                if (rowIx > 0)
-                                {
-                                    var delRng = (Excel.Range)ws.Rows[rowIx];
-                                    delRng.Delete(Excel.XlDeleteShiftDirection.xlShiftUp);
-                                    XqlCommon.ReleaseCom(delRng);
-                                }
-                                continue;
-                            }
-
-                            // 업서트: 키행 찾기 또는 append
-                            var r = FindRowByKey(ws, data, keyAbsCol, p.RowKey?.ToString() ?? string.Empty);
-                            if (r <= 0)
-                            {
-                                // 맨 아래 Append
-                                r = Math.Max(data.Row, LastUsedRow(ws) + 1);
-                                var keyCell = (Excel.Range)ws.Cells[r, keyAbsCol];
-                                keyCell.Value2 = p.RowKey;
-                                XqlCommon.ReleaseCom(keyCell);
-                            }
-
-                            if (p.Cells != null)
-                            {
-                                foreach (var kv in p.Cells)
-                                {
-                                    var colName = kv.Key;
-                                    var val = kv.Value;
-
-                                    var cIdx = headers.FindIndex(h => string.Equals(h, colName, StringComparison.Ordinal));
-                                    if (cIdx < 0)
-                                    {
-                                        // 새 컬럼이 패치에 등장 → 우측 확장
-                                        cIdx = headers.Count;
-                                        headers.Add(colName);
-
-                                        // 헤더 확장
-                                        var hCell = (Excel.Range)header.Cells[1, cIdx + 1];
-                                        hCell.Value2 = colName;
-                                        XqlCommon.ReleaseCom(hCell);
-
-                                        // 메타/검증 갱신
-                                        try { XqlAddIn.Sheet!.EnsureColumns(ws.Name, headers); } catch { }
-                                        XqlSheetView.ApplyHeaderUi(ws, header, smeta, withValidation: true);
-                                        XqlSheetView.InvalidateHeaderCache(ws.Name);
-                                    }
-
-                                    var absCol = header.Column + cIdx;
-                                    Excel.Range? cell = null;
-                                    try
-                                    {
-                                        cell = (Excel.Range)ws.Cells[r, absCol];
-                                        cell.Value2 = CoerceForExcel(val);
-                                        XqlSheetView.MarkTouchedCell(cell); // 선택: 시각 피드백
-                                    }
-                                    finally { XqlCommon.ReleaseCom(cell); }
-                                }
-                            }
-                        }
-                    }
-                    finally
-                    {
-                        app.EnableEvents = prevEvt;
-                        app.ScreenUpdating = prevScreen;
-                        app.Calculation = prevCalc;
-                    }
-                }
-                catch
-                {
-                    // swallow and continue next table
-                }
-                finally
-                {
-                    XqlCommon.ReleaseCom(data, header, ws);
-                }
-            }
-
-            // ────────────────────── 지역 헬퍼들 ──────────────────────
-
-            static int GuessMaxColumnFromUsedRange(Excel.Worksheet ws)
-            {
-                try { return ws.UsedRange?.Columns?.Count ?? 1; } catch { return 1; }
-            }
-
-            static Excel.Range ResolveDataRange(Excel.Worksheet ws, Excel.Range header)
-            {
-                var lo = XqlSheet.FindListObjectContaining(ws, header);
-                if (lo?.DataBodyRange != null) return lo.DataBodyRange;
-
-                var first = (Excel.Range)header.Offset[1, 0];
-                var last = ws.Cells[ws.Rows.Count, header.Column + header.Columns.Count - 1];
-                var data = ws.Range[first, last];
-                XqlCommon.ReleaseCom(first, last, lo);
-                return data;
-            }
-
-            static int LastUsedRow(Excel.Worksheet ws)
-            {
-                try
-                {
-                    var ur = ws.UsedRange;
-                    var r = ur.Row + ur.Rows.Count - 1;
-                    XqlCommon.ReleaseCom(ur);
-                    return Math.Max(1, r);
-                }
-                catch { return 1; }
-            }
-
-            static int FindRowByKey(Excel.Worksheet ws, Excel.Range data, int keyAbsCol, string rowKey)
-            {
-                var start = data.Row;
-                var end = Math.Max(start, LastUsedRow(ws));
-                for (int r = start; r <= end; r++)
-                {
-                    Excel.Range? c = null;
-                    try
-                    {
-                        c = (Excel.Range)ws.Cells[r, keyAbsCol];
-                        var v = (c.Value2 as string) ?? c.Value2?.ToString();
-                        if (string.Equals(v, rowKey, StringComparison.Ordinal)) return r;
-                    }
-                    finally { XqlCommon.ReleaseCom(c); }
-                }
-                return -1;
-            }
-
-            static object? CoerceForExcel(object? v)
-            {
-                if (v is null) return null;
-                return v switch
-                {
-                    bool b => b,
-                    double d => d,
-                    float f => (double)f,
-                    decimal m => (double)m,
-                    long l => (double)l,
-                    int i => (double)i,
-                    DateTime dt => dt.ToOADate(),
-                    _ => v.ToString()
-                };
-            }
-        }
-
-        // ⬇️ [ADD] 초기 부트스트랩 판단: 메타 마커 없음, 거의 비어있음, 혹은 A/B/C… 폴백 헤더
-        private bool IsInitialBootstrapContext()
-        {
-            try
-            {
-                var app = (Excel.Application)ExcelDnaUtil.Application;
-                if (app.ActiveSheet is not Excel.Worksheet ws) return false;
-                if (XqlSheet.TryGetHeaderMarker(ws, out var hdr)) { XqlCommon.ReleaseCom(hdr); return false; }
-
-                Excel.Range? used = null;
-                try
-                {
-                    used = ws.UsedRange;
-                    if ((long)(used?.CountLarge ?? 0L) <= 1) return true;
-                }
-                finally { XqlCommon.ReleaseCom(used); }
-
-                var header = XqlSheet.GetHeaderRange(ws);
-                try
-                {
-                    int cols = header.Columns.Count;
-                    if (cols <= 0) return true;
-                    for (int i = 1; i <= cols; i++)
-                    {
-                        Excel.Range? c = null;
-                        try
-                        {
-                            c = (Excel.Range)header.Cells[1, i];
-                            var name = (c.Value2 as string)?.Trim() ?? "";
-                            var exp = XqlCommon.ColumnIndexToLetter(header.Column + i - 1);
-                            if (!string.Equals(name, exp, StringComparison.Ordinal))
-                                return false;
-                        }
-                        finally { XqlCommon.ReleaseCom(c); }
-                    }
-                    return true; // 전부 폴백
-                }
-                finally { XqlCommon.ReleaseCom(header); }
-            }
-            catch { return false; }
-        }
-
-        // ⬇️ [ADD] 현재 시트의 테이블명 계산(메타 없으면 시트명 사용)
-        private (string table, string wsName) ResolveActiveTable()
-        {
-            try
-            {
-                var app = (Excel.Application)ExcelDnaUtil.Application;
-                if (app.ActiveSheet is not Excel.Worksheet ws) return ("", "");
-                var sm = XqlAddIn.Sheet?.GetOrCreateSheet(ws.Name);
-                var table = string.IsNullOrWhiteSpace(sm?.TableName) ? ws.Name : sm!.TableName!;
-                return (table, ws.Name);
-            }
-            catch { return ("", ""); }
         }
 
         private void RememberPushed(string k, string? v)
