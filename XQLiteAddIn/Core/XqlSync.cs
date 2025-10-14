@@ -1,5 +1,7 @@
 ﻿// XqlSync.cs  (ExcelPatchApplier 포함 버전)
+using EnvDTE;
 using ExcelDna.Integration;
+using Microsoft.Office.Interop.Excel;
 using Newtonsoft.Json;
 using System;
 using System.Collections.Concurrent;
@@ -10,6 +12,7 @@ using System.Linq;
 using System.Security.Policy;
 using System.Threading;
 using System.Threading.Tasks;
+using XQLite.AddIn;
 using Excel = Microsoft.Office.Interop.Excel;
 
 namespace XQLite.AddIn
@@ -36,7 +39,9 @@ namespace XQLite.AddIn
         private readonly ConcurrentQueue<EditCell> _outbox = new();
         private readonly SemaphoreSlim _pushSem = new(1, 1);
         private readonly SemaphoreSlim _pullSem = new(1, 1);
-        private volatile bool _pullAgain;
+        private int _pulling; // 0/1 (Interlocked)
+        public bool IsPulling => System.Threading.Volatile.Read(ref _pulling) == 1;
+        public event Action<bool>? PullStateChanged; // true=시작, false=종료
         private long _pullBackoffUntilMs;
         private int _pullErr; // 연속 오류 횟수
 
@@ -206,85 +211,103 @@ namespace XQLite.AddIn
 
         public void FlushUpsertsNow() => _ = FlushUpsertsNow(false);
 
+        // XqlSync.cs
+
+        // ✅ 기존 PullSince를 아래로 완전히 교체
         public async Task PullSince(long? sinceOverride = null)
         {
-            // 백오프 윈도우엔 스킵
+            // 백오프 윈도우면 스킵
             if (XqlCommon.Monotonic.NowMs() < _pullBackoffUntilMs)
                 return;
 
+
+            // 이미 실행 중이면 무시
+            if (System.Threading.Interlocked.Exchange(ref _pulling, 1) == 1)
+                return;
+            PullStateChanged?.Invoke(true);
             if (!await _pullSem.WaitAsync(0).ConfigureAwait(false))
             {
-                _pullAgain = true;
+                // 세마포어도 잡혔으면 바로 종료 처리
+                System.Threading.Interlocked.Exchange(ref _pulling, 0);
+                PullStateChanged?.Invoke(false);
                 return;
             }
+
             try
             {
-                do
+
+                try
                 {
-                    _pullAgain = false;
-                    try
+                    // 1) 기본은 증분, 강제 풀이면 0
+                    var since = sinceOverride ?? (_forceFullPull ? 0 : MaxRowVersion);
+                    var pr = await _backend.PullRows(since, _cts.Token).ConfigureAwait(false);
+
+                    // 2) 패치가 0건이고, 아직 로컬 버전이 0(=초기 워크북)이라면 → 서버에서 Full Pull 재시도
+                    if ((pr.Patches == null || pr.Patches.Count == 0) &&
+                        since != 0 &&
+                        MaxRowVersion == 0 &&
+                        _state.LastMaxRowVersion == 0)
                     {
-                        var since = sinceOverride ?? (_forceFullPull ? 0 : MaxRowVersion);
-                        var pr = await _backend.PullRows(since, _cts.Token).ConfigureAwait(false);
+                        pr = await _backend.PullRows(0, _cts.Token).ConfigureAwait(false);
+                    }
 
-                        if (pr.Patches is { Count: > 0 })
-                            XqlSheetView.ApplyOnUiThread(pr.Patches);
+                    // 3) 패치가 있으면 UI 반영
+                    if (pr.Patches is { Count: > 0 })
+                        XqlSheetView.ApplyOnUiThread(pr.Patches);
 
-                        if (pr.MaxRowVersion > 0)
-                            XqlCommon.InterlockedMax(ref _maxRowVersion, pr.MaxRowVersion);
+                    // 4) 버전 반영
+                    if (pr.MaxRowVersion > 0)
+                        XqlCommon.InterlockedMax(ref _maxRowVersion, pr.MaxRowVersion);
 
-                        if (_forceFullPull)
+                    if (_forceFullPull)
+                    {
+                        _forceFullPull = false;
+                        _state.LastFullPullUtc = DateTime.UtcNow;
+                    }
+                    _state.LastMaxRowVersion = MaxRowVersion;
+                    PersistState();
+
+                    // (옵션) 스키마 변경 감지 작업은 기존 로직 유지
+                    if (XqlConfig.FullPullWhenSchemaChanged && !_pendingSchemaCheck && string.IsNullOrEmpty(_state.LastSchemaHash))
+                    {
+                        _pendingSchemaCheck = true;
+                        _ = Task.Run(async () =>
                         {
-                            _forceFullPull = false;
-                            _state.LastFullPullUtc = DateTime.UtcNow;
-                        }
-                        _state.LastMaxRowVersion = MaxRowVersion;
-                        PersistState();
-
-
-                        // 스키마 자동 감지(메타가 아직 확인 안 됐으면 1회 더 확인)
-                        if (XqlConfig.FullPullWhenSchemaChanged && !_pendingSchemaCheck && string.IsNullOrEmpty(_state.LastSchemaHash))
-                        {
-                            _pendingSchemaCheck = true;
-                            _ = Task.Run(async () =>
+                            try
                             {
-                                try
+                                var meta = await _backend.TryFetchServerMeta().ConfigureAwait(false);
+                                var hash = meta?["schema_hash"]?.ToString();
+                                if (!string.IsNullOrWhiteSpace(hash))
                                 {
-                                    var meta = await _backend.TryFetchServerMeta().ConfigureAwait(false);
-                                    var hash = meta?["schema_hash"]?.ToString();
-                                    if (!string.IsNullOrWhiteSpace(hash))
-                                    {
-                                        if (!string.Equals(hash, _state.LastSchemaHash, StringComparison.Ordinal))
-                                        {
-                                            // 다음 사이클에서 보정 Full Pull
-                                            _forceFullPull = true;
-                                        }
-                                        _state.LastSchemaHash = hash;
-                                        _state.LastMetaUtc = DateTime.UtcNow;
-                                        PersistState();
-                                    }
+                                    if (!string.Equals(hash, _state.LastSchemaHash, StringComparison.Ordinal))
+                                        _forceFullPull = true;
+                                    _state.LastSchemaHash = hash;
+                                    _state.LastMetaUtc = DateTime.UtcNow;
+                                    PersistState();
                                 }
-                                catch { }
-                                finally { _pendingSchemaCheck = false; }
-                            });
-                        }
+                            }
+                            catch { }
+                            finally { _pendingSchemaCheck = false; }
+                        });
+                    }
 
-                        // 성공 → 백오프 해제
-                        _pullErr = 0;
-                        _pullBackoffUntilMs = 0;
-                    }
-                    catch (Exception)
-                    {
-                        // 실패 → 지수 백오프 (최대 8초)
-                        _pullErr = Math.Min(_pullErr + 1, 4);
-                        _pullBackoffUntilMs = XqlCommon.Monotonic.NowMs() + _pullErr * 2000L;
-                        // 실패 시 루프 종료
-                        break;
-                    }
+                    // 성공 → 백오프 초기화
+                    _pullErr = 0;
+                    _pullBackoffUntilMs = 0;
                 }
-                while (_pullAgain);
+                catch
+                {
+                    // 실패 → 지수 백오프(최대 8초)
+                    _pullErr = Math.Min(_pullErr + 1, 4);
+                    _pullBackoffUntilMs = XqlCommon.Monotonic.NowMs() + _pullErr * 2000L;
+                }
             }
-            finally { _pullSem.Release(); }
+            finally
+            {
+                _pullSem.Release();
+                System.Threading.Interlocked.Exchange(ref _pulling, 0);
+                PullStateChanged?.Invoke(false);
+            }
         }
 
         public async Task FlushUpsertsNow(bool force = false)
@@ -297,6 +320,64 @@ namespace XQLite.AddIn
             if (!_pushSem.Wait(0)) return;
             try { await FlushUpsertsCore().ConfigureAwait(false); }
             finally { _pushSem.Release(); }
+        }
+
+        // Private
+
+        // ⬇️ [ADD] 초기 부트스트랩 판단: 메타 마커 없음, 거의 비어있음, 혹은 A/B/C… 폴백 헤더
+        private bool IsInitialBootstrapContext()
+        {
+            try
+            {
+                var app = (Excel.Application)ExcelDnaUtil.Application;
+                if (app.ActiveSheet is not Excel.Worksheet ws) return false;
+                if (XqlSheet.TryGetHeaderMarker(ws, out var hdr)) { XqlCommon.ReleaseCom(hdr); return false; }
+
+                Excel.Range? used = null;
+                try
+                {
+                    used = ws.UsedRange;
+                    if ((long)(used?.CountLarge ?? 0L) <= 1) return true;
+                }
+                finally { XqlCommon.ReleaseCom(used); }
+
+                var header = XqlSheet.GetHeaderRange(ws);
+                try
+                {
+                    int cols = header.Columns.Count;
+                    if (cols <= 0) return true;
+                    for (int i = 1; i <= cols; i++)
+                    {
+                        Excel.Range? c = null;
+                        try
+                        {
+                            c = (Excel.Range)header.Cells[1, i];
+                            var name = (c.Value2 as string)?.Trim() ?? "";
+                            var exp = XqlCommon.ColumnIndexToLetter(header.Column + i - 1);
+                            if (!string.Equals(name, exp, StringComparison.Ordinal))
+                                return false;
+                        }
+                        finally { XqlCommon.ReleaseCom(c); }
+                    }
+                    return true; // 전부 폴백
+                }
+                finally { XqlCommon.ReleaseCom(header); }
+            }
+            catch { return false; }
+        }
+
+        // ⬇️ [ADD] 현재 시트의 테이블명 계산(메타 없으면 시트명 사용)
+        private (string table, string wsName) ResolveActiveTable()
+        {
+            try
+            {
+                var app = (Excel.Application)ExcelDnaUtil.Application;
+                if (app.ActiveSheet is not Excel.Worksheet ws) return ("", "");
+                var sm = XqlAddIn.Sheet?.GetOrCreateSheet(ws.Name);
+                var table = string.IsNullOrWhiteSpace(sm?.TableName) ? ws.Name : sm!.TableName!;
+                return (table, ws.Name);
+            }
+            catch { return ("", ""); }
         }
 
         private void RememberPushed(string k, string? v)
@@ -474,7 +555,11 @@ namespace XQLite.AddIn
                     XqlCommon.InterlockedMax(ref _maxRowVersion, ev.MaxRowVersion);
 
                 if (ev.MaxRowVersion > before + 1)
-                    _ = PullSince(before); // 갭 보정
+                {
+#pragma warning disable CS4014 // 이 호출을 대기하지 않으므로 호출이 완료되기 전에 현재 메서드가 계속 실행됩니다.
+                    PullSince(before); // 갭 보정
+#pragma warning restore CS4014 // 이 호출을 대기하지 않으므로 호출이 완료되기 전에 현재 메서드가 계속 실행됩니다.
+                }
             }
             catch (Exception ex)
             {

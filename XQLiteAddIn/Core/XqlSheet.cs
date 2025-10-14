@@ -755,7 +755,7 @@ namespace XQLite.AddIn
         }
 
         // ── 상태 시트 보장 & 찾기
-        private static Excel.Worksheet EnsureStateSheet(Excel.Workbook wb)
+        internal static Excel.Worksheet EnsureStateSheet(Excel.Workbook wb)
         {
             Excel.Worksheet? sh = null;
             try

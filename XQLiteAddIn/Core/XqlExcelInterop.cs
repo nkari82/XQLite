@@ -20,24 +20,15 @@ namespace XQLite.AddIn
     /// - Presence/락 하트비트 전송(선택 변경 시)
     /// - 셀 편집 → 2초 디바운스 업서트 큐 적재(XqlSync)
     /// </summary>
-    internal sealed class XqlExcelInterop : IDisposable
+    internal sealed class XqlExcelInterop(Excel.Application app, XqlSync sync, XqlCollab collab, XqlSheet sheet, XqlBackup backup) : IDisposable
     {
-        private readonly Excel.Application _app;
-        private readonly XqlSync _sync;
-        private readonly XqlCollab _collab;
-        private readonly XqlSheet _sheet;
-        private readonly XqlBackup _backup;
+        private readonly Excel.Application _app = app ?? throw new ArgumentNullException(nameof(app));
+        private readonly XqlSync _sync = sync ?? throw new ArgumentNullException(nameof(sync));
+        private readonly XqlCollab _collab = collab ?? throw new ArgumentNullException(nameof(collab));
+        private readonly XqlSheet _sheet = sheet ?? throw new ArgumentNullException(nameof(sheet));
+        private readonly XqlBackup _backup = backup ?? throw new ArgumentNullException(nameof(backup));
 
         private bool _started;
-
-        public XqlExcelInterop(Excel.Application app, XqlSync sync, XqlCollab collab, XqlSheet sheet, XqlBackup backup)
-        {
-            _app = app ?? throw new ArgumentNullException(nameof(app));
-            _sync = sync ?? throw new ArgumentNullException(nameof(sync));
-            _collab = collab ?? throw new ArgumentNullException(nameof(collab));
-            _sheet = sheet ?? throw new ArgumentNullException(nameof(sheet));
-            _backup = backup ?? throw new ArgumentNullException(nameof(backup));
-        }
 
         // ========= 수명 주기 =========
 
@@ -81,7 +72,7 @@ namespace XQLite.AddIn
         }
 
         // ========= 명령(리본/메뉴) =========
-        public async void Cmd_CommitSmart()
+        public async void Cmd_CommitSync()
         {
             try
             {
@@ -95,11 +86,80 @@ namespace XQLite.AddIn
             }
         }
 
+        // XqlExcelInterop.cs
+
         public async void Cmd_PullOnly()
         {
-            try { await _sync.PullSince(); }
-            catch (Exception ex) { XqlLog.Warn("PullOnly failed: " + ex.Message); }
+            try
+            {
+                var app = ExcelDnaUtil.Application as Excel.Application;
+                if (app == null) { await _sync.PullSince(); return; }
+
+                var ws = app.ActiveSheet as Excel.Worksheet;
+                if (ws == null) { await _sync.PullSince(); return; }
+
+                // ✅ 부트스트랩 필요 판단: 마커 없음 OR 유효 데이터 거의 없음 OR 1행이 A/B/C… 폴백 헤더
+                bool needsBootstrap = NeedsBootstrap(ws);
+
+                // 강제 Full Pull(since=0) 또는 증분 Pull
+                await _sync.PullSince(needsBootstrap ? 0 : (long?)null);
+            }
+            catch (Exception ex)
+            {
+                XqlLog.Warn("PullOnly failed: " + ex.Message);
+            }
         }
+
+        // 아래 헬퍼 추가 (클래스 내부)
+        private static bool NeedsBootstrap(Excel.Worksheet ws)
+        {
+            try
+            {
+                // 1) 마커가 있으면 일단 부트스트랩 아님
+                if (XqlSheet.TryGetHeaderMarker(ws, out var hdr))
+                {
+                    XqlCommon.ReleaseCom(hdr);
+                    return false;
+                }
+
+                // 2) 데이터가 사실상 비어 있다면 부트스트랩
+                Excel.Range? used = null;
+                try
+                {
+                    used = ws.UsedRange;
+                    var cellCount = (long)used.CountLarge;
+                    if (cellCount <= 1) return true;
+                }
+                finally { XqlCommon.ReleaseCom(used); }
+
+                // 3) 1행 헤더가 A/B/C… 폴백이면 부트스트랩
+                Excel.Range header = XqlSheet.GetHeaderRange(ws);
+                try
+                {
+                    int cols = header.Columns.Count;
+                    if (cols <= 0) return true;
+
+                    for (int i = 1; i <= cols; i++)
+                    {
+                        Excel.Range? c = null;
+                        try
+                        {
+                            c = (Excel.Range)header.Cells[1, i];
+                            var name = (c.Value2 as string)?.Trim() ?? "";
+                            var expected = XqlCommon.ColumnIndexToLetter(header.Column + i - 1);
+                            if (!string.Equals(name, expected, StringComparison.Ordinal))
+                                return false; // 폴백 아님 → 부트스트랩 불필요
+                        }
+                        finally { XqlCommon.ReleaseCom(c); }
+                    }
+                    // 전부 폴백이면 부트스트랩
+                    return true;
+                }
+                finally { XqlCommon.ReleaseCom(header); }
+            }
+            catch { return false; }
+        }
+
 
         public void Cmd_RecoverFromExcel()
         {
@@ -206,6 +266,7 @@ namespace XQLite.AddIn
                                     var rowKeyObj = keyCell?.Value2;
                                     string? rowKey = rowKeyObj?.ToString();
 
+#if false
                                     if (string.IsNullOrWhiteSpace(rowKey))
                                     {
                                         if (!string.Equals(colName, keyColName, StringComparison.OrdinalIgnoreCase))
@@ -214,6 +275,14 @@ namespace XQLite.AddIn
                                         rowKey = Guid.NewGuid().ToString("N").Substring(0, 12);
                                         if (keyCell != null) keyCell.Value2 = rowKey;
                                     }
+#else
+                                    // ✅ 키가 비어 있으면, 수정한 컬럼이 무엇이든 키를 자동 생성해 채운다.
+                                    if (string.IsNullOrWhiteSpace(rowKey))
+                                    {
+                                        rowKey = Guid.NewGuid().ToString("N").Substring(0, 12);
+                                        if (keyCell != null) keyCell.Value2 = rowKey;
+                                    }
+#endif
 
                                     object? value = cell.Value2;
                                     _sync.EnqueueIfChanged(table, rowKey!, colName!, value);

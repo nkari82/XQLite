@@ -1,25 +1,33 @@
-﻿using ExcelDna.Integration; // ExcelDnaUtil.Application
+﻿using ExcelDna.Integration;
 using ExcelDna.Integration.CustomUI;
 using System;
 using System.Collections.Concurrent;
 using System.Reflection;
+using System.Threading; // Interlocked / Volatile
+using System.Threading.Tasks;
 using System.Windows.Forms;
+using static XQLite.AddIn.IXqlBackend;
 using Excel = Microsoft.Office.Interop.Excel;
 
 namespace XQLite.AddIn
 {
-    // https://bert-toolkit.com/imagemso-list.html
     public sealed class XqlRibbon : ExcelRibbon
     {
         private IRibbonUI? _ribbon;
+        private Excel.Application? _app; // Excel 이벤트 구독용
 
-        // ───────────────────────── Ribbon XML (그룹화/툴팁/동적활성화) ─────────────────────────
+        // Commit 가드 상태 (서버에 동일 테이블 존재 && 이 워크북이 '처음'이면 Commit 잠금)
+        private volatile bool _blockCommit;     // true면 Commit 비활성화
+        private long _blockCheckedMs;           // 마지막 점검 시각(ms) - Interlocked로 접근
+        private readonly object _blockSync = new();
+
+        // ───────────────────────── Ribbon XML ─────────────────────────
         public override string GetCustomUI(string ribbonId) => @"
 <customUI xmlns='http://schemas.microsoft.com/office/2009/07/customui' onLoad='OnRibbonLoad'>
   <ribbon>
     <tabs>
       <tab id='tabXQL' label='XQLite' insertAfterMso='TabHome'>
-        
+
         <!-- 설정 -->
         <group id='grpConfig' label='설정'>
           <button id='btnConfig' label='환경설정' size='large'
@@ -30,14 +38,16 @@ namespace XQLite.AddIn
 
         <!-- 동기화 -->
         <group id='grpSync' label='동기화'>
-          <button id='btnCommit' label='커밋'
-                  onAction='OnCommit' imageMso='SaveAll'
-                  screentip='커밋'
-                  supertip='필요하면 테이블/컬럼을 생성하고, 변경된 셀만 효율적으로 업서트합니다.'/>
           <button id='btnPull' label='풀'
                   onAction='OnPull' imageMso='Refresh'
+                  getEnabled='Pull_GetEnabled'
                   screentip='풀'
                   supertip='서버의 최신 증분만 내려받아 반영합니다.'/>
+          <button id='btnCommit' label='커밋'
+                  onAction='OnCommit' imageMso='SaveAll'
+                  getEnabled='Commit_GetEnabled'
+                  screentip='커밋'
+                  supertip='필요하면 테이블/컬럼을 생성하고, 변경된 셀만 효율적으로 업서트합니다.'/>
           <toggleButton id='tglDropCols' label='헤더 외 컬럼 DROP'
                         getPressed='DropCols_GetPressed'
                         onAction='DropCols_OnToggle'
@@ -129,31 +139,155 @@ namespace XQLite.AddIn
   </ribbon>
 </customUI>";
 
-        // ───────────────────────── Ribbon lifecycle / dynamic enable ─────────────────────────
+        // ───────────────────── Ribbon lifecycle / dynamic enable ─────────────────────
         public void OnRibbonLoad(IRibbonUI ribbon)
         {
             _ribbon = ribbon;
+
+            // Excel Application 이벤트 구독: 새 시트 생성 / 시트 전환 시 즉시 재평가
+            _app = ExcelDnaUtil.Application as Excel.Application;
             try
             {
-                if (XqlAddIn.Backend is XqlGqlBackend be)
+                if (_app != null)
                 {
-                    be.StateChanged += (_, __) =>
-                        ExcelAsyncUtil.QueueAsMacro(() =>
-                        {
-                            try { _ribbon?.InvalidateControl("btnStatus"); } catch { }
-                            try
-                            {
-                                var app = ExcelDnaUtil.Application as Excel.Application;
-                                if (app != null) app.StatusBar = XqlStatus_GetLabel(null!);
-                            }
-                            catch { }
-                        });
+                    _app.SheetActivate += App_SheetActivate;
+                    _app.WorkbookNewSheet += App_WorkbookNewSheet; // (Excel.Workbook, object)
                 }
             }
-            catch { }
+            catch { /* ignore */ }
+
+            // ⬇️ Pull 진행 상태 변경 시 버튼 갱신
+            try
+            {
+                XqlAddIn.Sync?.PullStateChanged += pulling =>
+                ExcelAsyncUtil.QueueAsMacro(() =>
+                            {
+                                try { _ribbon?.InvalidateControl("btnPull"); } catch { }
+                            });
+            }
+            catch { /* ignore */ }
+
+            // 백엔드 상태 변화 시 버튼 재평가
+            if (XqlAddIn.Backend is XqlGqlBackend be)
+            {
+                be.StateChanged += (_, __) =>
+                    ExcelAsyncUtil.QueueAsMacro(() =>
+                    {
+                        try { _ribbon?.InvalidateControl("btnStatus"); } catch { }
+                        try { _ribbon?.InvalidateControl("btnCommit"); } catch { }
+#pragma warning disable CS4014 // 이 호출을 대기하지 않으므로 호출이 완료되기 전에 현재 메서드가 계속 실행됩니다.
+                        RefreshCommitEnabled(); // 반환값 사용 안 함
+#pragma warning restore CS4014 // 이 호출을 대기하지 않으므로 호출이 완료되기 전에 현재 메서드가 계속 실행됩니다.
+                        try
+                        {
+                            var app = (Excel.Application)ExcelDnaUtil.Application;
+                            app.StatusBar = XqlStatus_GetLabel(null!);
+                        }
+                        catch { }
+                    });
+            }
         }
 
-        // ───────────────────────── General ─────────────────────────
+        private void App_WorkbookNewSheet(Excel.Workbook wb, object sh)
+        {
+            ExcelAsyncUtil.QueueAsMacro(SafeReevalCommit);
+        }
+        private void App_SheetActivate(object Sh)
+        {
+            ExcelAsyncUtil.QueueAsMacro(SafeReevalCommit);
+        }
+        private void SafeReevalCommit()
+        {
+            try { _ribbon?.InvalidateControl("btnCommit"); } catch { }
+#pragma warning disable CS4014 // 이 호출을 대기하지 않으므로 호출이 완료되기 전에 현재 메서드가 계속 실행됩니다.
+            RefreshCommitEnabled(); // 반환값 무시
+#pragma warning restore CS4014 // 이 호출을 대기하지 않으므로 호출이 완료되기 전에 현재 메서드가 계속 실행됩니다.
+        }
+
+        // 1초에 한 번만 재평가(스레드 안전)
+        private static long NowMs() => XqlCommon.Monotonic.NowMs();
+        private bool ShouldRecheck()
+        {
+            var now = NowMs();
+            var last = Interlocked.Read(ref _blockCheckedMs);
+            if (now - last <= 1000) return false;
+            Interlocked.Exchange(ref _blockCheckedMs, now);
+            return true;
+        }
+
+        // Commit 활성/비활성 동적 제어
+        public bool Commit_GetEnabled(IRibbonControl _)
+        {
+            if (ShouldRecheck())
+#pragma warning disable CS4014 // 이 호출을 대기하지 않으므로 호출이 완료되기 전에 현재 메서드가 계속 실행됩니다.
+                RefreshCommitEnabled(); // 비동기 재평가
+#pragma warning restore CS4014 // 이 호출을 대기하지 않으므로 호출이 완료되기 전에 현재 메서드가 계속 실행됩니다.
+            return !_blockCommit;
+        }
+
+        // Pull 버튼 활성/비활성
+        public bool Pull_GetEnabled(IRibbonControl _)
+        {
+            var pulling = XqlAddIn.Sync?.IsPulling ?? false;
+            return !pulling;
+        }
+
+        private async Task RefreshCommitEnabled()
+        {
+            try
+            {
+                var be = XqlAddIn.Backend as XqlGqlBackend;
+                var sheet = XqlAddIn.Sheet;
+                var app = ExcelDnaUtil.Application as Excel.Application;
+                if (be == null || sheet == null || app == null) { SetBlock(false); return; }
+
+                if (app.ActiveSheet is not Excel.Worksheet ws) { SetBlock(false); return; }
+                var wb = ws.Parent as Excel.Workbook;
+                if (wb == null) { SetBlock(false); return; }
+
+                // 로컬 상태: .xql_state에 KV가 1줄 이상 있으면 '이미 연결된 워크북'
+                bool hasLocal = false;
+                try
+                {
+                    var st = XqlSheet.EnsureStateSheet(wb);
+                    var ur = st.UsedRange;
+                    int rows = ur.Row + ur.Rows.Count - 1;
+                    hasLocal = rows > 1;
+                    XqlCommon.ReleaseCom(ur, st);
+                }
+                catch { hasLocal = false; } // 실패해도 '처음' 취급
+
+                // 테이블명: SheetMeta.TableName 없으면 시트명
+                var sm = sheet.GetOrCreateSheet(ws.Name);
+                var table = string.IsNullOrWhiteSpace(sm.TableName) ? ws.Name : sm.TableName!;
+
+                // 서버에 동일 테이블 존재 여부. 오류/미확정 = 보수적으로 활성(Commit 허용).
+                bool hasServer = false;
+                try
+                {
+                    var cols = await be.GetTableColumns(table).ConfigureAwait(false);
+                    hasServer = cols != null && cols.Count > 0;
+                }
+                catch { hasServer = false; }
+
+                // 서버엔 있는데 로컬은 '처음'일 때만 Commit 잠금
+                SetBlock(hasServer && !hasLocal);
+            }
+            catch { SetBlock(false); } // 실패/미확정이면 활성
+        }
+
+        private void SetBlock(bool block)
+        {
+            bool changed;
+            lock (_blockSync)
+            {
+                changed = (_blockCommit != block);
+                _blockCommit = block;
+            }
+            if (changed) _ribbon?.InvalidateControl("btnCommit");
+        }
+
+        // ───────────────────────── 동작(Commands) ─────────────────────────
         public void OnConfig(IRibbonControl _)
         {
             try { XqlConfigForm.ShowSingleton(); }
@@ -164,59 +298,32 @@ namespace XQLite.AddIn
         {
             try { XqlAddIn.ExcelInterop?.Cmd_PullOnly(); }
             catch (Exception ex) { MessageBox.Show("Pull 실패: " + ex.Message, "XQLite"); }
+            finally
+            {
+                SafeReevalCommit();
+                try { _ribbon?.InvalidateControl("btnPull"); } catch { }
+            }
         }
 
-        // 기존 커밋 핸들러는 “스키마 보강 + 푸시 + 필요시 풀”
+        // 커밋은 “스키마 보강 → 업서트 → 필요 시 Pull”
         public void OnCommit(IRibbonControl _)
         {
-            try { XqlAddIn.ExcelInterop?.Cmd_CommitSmart(); }
+            try { XqlAddIn.ExcelInterop?.Cmd_CommitSync(); }
             catch (Exception ex) { MessageBox.Show("Commit 실패: " + ex.Message, "XQLite"); }
+            finally { SafeReevalCommit(); }
         }
 
-        // 리본 토글 상태 반환
-        public bool DropCols_GetPressed(IRibbonControl _)
-        {
-            try { return XqlConfig.DropColumnsOnCommit; }  // 설정 값 그대로 반영
-            catch { return false; }
-        }
-
-        // 토글 변경 시 저장
-        public void DropCols_OnToggle(IRibbonControl _, bool pressed)
-        {
-            try
-            {
-                XqlConfig.DropColumnsOnCommit = pressed; // 설정 반영
-                XqlConfig.Save();                        // 영구 저장
-                                                         // 즉시 UI 반영(선택): 상태바에 잠깐 안내
-                var app = ExcelDnaUtil.Application as Excel.Application;
-                if (app != null) app.StatusBar = pressed ? "DROP Columns on Commit: ON" : "DROP Columns on Commit: OFF";
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show("설정 저장 실패: " + ex.Message, "XQLite");
-            }
-        }
-
-        // ───────────────────────── Connection Status (Label / Icon / Tip / Click) ─────────────────────────
+        // ───────────────────────── 상태 표시(라벨/아이콘/툴팁) ─────────────────────────
         public string XqlStatus_GetLabel(IRibbonControl _)
         {
             var be = XqlAddIn.Backend as XqlGqlBackend;
-            if (be == null) return "오프라인";
-
-            string since = "";
-            if (be.LastOkUtc != DateTime.MinValue)
-            {
-                var diff = DateTime.UtcNow - be.LastOkUtc;
-                since = diff.TotalSeconds < 60 ? $"{(int)diff.TotalSeconds}초" : $"{(int)(diff.TotalSeconds / 60)}분";
-                since = " · " + since;
-            }
-
+            if (be == null) return "연결: 알 수 없음";
             return be.State switch
             {
-                IXqlBackend.ConnState.Online => "온라인" + since,
-                IXqlBackend.ConnState.Connecting => "연결 중…",
-                IXqlBackend.ConnState.Degraded => "품질 저하" + since,
-                _ => "오프라인"
+                ConnState.Online => "연결: 정상",
+                ConnState.Connecting => "연결 중…",
+                ConnState.Degraded => "연결: 지연",
+                _ => "연결: 끊김"
             };
         }
 
@@ -224,17 +331,14 @@ namespace XQLite.AddIn
         {
             try
             {
-                var app = ExcelDnaUtil.Application as Excel.Application;
-                if (app == null) return null;
-                var msoId = (XqlAddIn.Backend as XqlGqlBackend)?.State switch
+                string idMso = (XqlAddIn.Backend as XqlGqlBackend)?.State switch
                 {
-                    IXqlBackend.ConnState.Online => "PersonaStatusOnline",
-                    IXqlBackend.ConnState.Connecting => "PersonaStatusAway",
-                    IXqlBackend.ConnState.Degraded => "PersonaStatusBusy",
+                    ConnState.Online => "PersonaStatusOnline",
+                    ConnState.Connecting => "PersonaStatusAway",
+                    ConnState.Degraded => "PersonaStatusBusy",
                     _ => "PersonaStatusOffline"
-                };
-                
-                return MsoImageHelper.Get(msoId, 32);
+                } ?? "PersonaStatusOffline";
+                return MsoImageHelper.Get(idMso, 32);
             }
             catch { return null; }
         }
@@ -243,8 +347,13 @@ namespace XQLite.AddIn
         {
             var be = XqlAddIn.Backend as XqlGqlBackend;
             if (be == null) return "백엔드가 초기화되지 않았습니다.";
-            var detail = string.IsNullOrWhiteSpace(be.StateDetail) ? "" : $"\r\n{be.StateDetail}";
-            return $"서버 상태: {be.State}{detail}";
+            return be.State switch
+            {
+                ConnState.Online => "서버 상태가 정상입니다.",
+                ConnState.Connecting => "서버에 연결 중입니다.",
+                ConnState.Degraded => "지연이 감지되었습니다.",
+                _ => "서버 연결이 끊겼습니다."
+            };
         }
 
         public async void XqlStatus_OnClick(IRibbonControl _)
@@ -252,7 +361,7 @@ namespace XQLite.AddIn
             var be = XqlAddIn.Backend as XqlGqlBackend;
             if (be == null) return;
             try { await be.Ping(); }
-            catch { /* 실패해도 상태는 이벤트로 갱신됨 */ }
+            catch { /* 실패해도 상태 이벤트로 갱신됨 */ }
         }
 
         // ───────────────────────── Backup / Recover / Diagnostics ─────────────────────────
@@ -370,15 +479,14 @@ namespace XQLite.AddIn
                     ct.Kind = kind;
                     sm.SetColumn(colName!, ct);
 
-                    // 주석/툴팁 갱신: 이름 우선 + 위치(@1,@2..) 폴백으로 일관
+                    // 툴팁/검증 갱신
                     var tips = XqlSheetView.BuildHeaderTooltips(sm, header);
                     XqlSheetView.SetHeaderTooltips(header, tips);
                     XqlSheetView.ApplyDataValidationForHeader(ws, header, sm);
                 }
                 finally
                 {
-                    XqlCommon.ReleaseCom(cell);
-                    XqlCommon.ReleaseCom(hit);
+                    XqlCommon.ReleaseCom(cell, hit);
                 }
             }
             catch (Exception ex)
@@ -387,15 +495,13 @@ namespace XQLite.AddIn
             }
         }
 
+        // ───────────────────────── Mso Image Helper ─────────────────────────
         internal static class MsoImageHelper
         {
             private static readonly ConcurrentDictionary<string, stdole.IPictureDisp> _cache =
                 new(StringComparer.OrdinalIgnoreCase);
 
-            /// <summary>
-            /// Office 버전/PIA 차이를 피하기 위해 리플렉션으로 GetImageMso 호출.
-            /// 실패 시 null 반환(Excel이 기본 아이콘 처리 가능).
-            /// </summary>
+            /// <summary>Office 버전/PIA 차이를 피하기 위해 리플렉션으로 GetImageMso 호출.</summary>
             public static stdole.IPictureDisp? Get(string idMso, int size = 32)
             {
                 if (string.IsNullOrWhiteSpace(idMso)) return null;
@@ -429,10 +535,14 @@ namespace XQLite.AddIn
                 }
                 catch
                 {
-                    // 여기서 예외를 삼키고 null 반환 → UI는 기본 아이콘/텍스트로 진행
+                    // 실패 시 null 반환 → UI는 기본 아이콘/텍스트로 진행
                     return null;
                 }
             }
         }
+
+        // ───────────────────────── Drop Columns 토글 (설정 위임) ─────────────────────────
+        public bool DropCols_GetPressed(IRibbonControl _) => XqlConfig.DropColumnsOnCommit;
+        public void DropCols_OnToggle(IRibbonControl _, bool pressed) => XqlConfig.DropColumnsOnCommit = pressed;
     }
 }

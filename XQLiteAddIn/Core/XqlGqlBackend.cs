@@ -3,13 +3,16 @@
 using GraphQL;
 using GraphQL.Client.Http;
 using GraphQL.Client.Serializer.Newtonsoft;
+using Microsoft.Office.Interop.Excel;
 using Newtonsoft.Json.Linq;
 using System;
 using System.Collections.Generic;
+using System.Data.Common;
 using System.Linq;
 using System.Reactive.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using static System.Net.WebRequestMethods;
 using static XQLite.AddIn.IXqlBackend;
 
 namespace XQLite.AddIn
@@ -76,6 +79,16 @@ namespace XQLite.AddIn
                 max_row_version
                 patches { table row_key row_version deleted cells }
             }
+        }";
+
+
+        // #TODO 없어도 되나보다?? ⬇️ [ADD] 테이블 전체 스냅샷(rows) — 초기 부트스트랩 시 사용
+        private const string Q_ROWS_SNAPSHOT = @"
+        query($t:String!){
+          rows(table:$t){
+            row_key
+            cells
+          }
         }";
 
         // 2) Subscription: rowsChanged → events, 변수 제거
@@ -370,7 +383,7 @@ namespace XQLite.AddIn
         // ── Presence / Recover ───────────────────────────────────────────────
         public async Task<PresenceItem[]?> FetchPresence(CancellationToken ct = default)
         {
-            var req = new GraphQLHttpRequest
+            var req = new GraphQLRequest
             {
                 Query = Q_PRESENCE
             };
@@ -390,9 +403,50 @@ namespace XQLite.AddIn
             return parsed.Errors == null || parsed.Errors.Count == 0;
         }
 
+        // ⬇️ [ADD] 테이블 전체 스냅샷을 RowPatch 리스트로 변환
+        public async Task<List<RowPatch>> FetchRowsSnapshot(string table, CancellationToken ct = default)
+        {
+            try
+            {
+                var req = new GraphQLRequest { Query = Q_ROWS_SNAPSHOT, Variables = new { t = table } };
+                var resp = await _http.SendQueryAsync<JObject>(req, ct).ConfigureAwait(false);
+                var arr = resp.Data?["rows"] as JArray;
+                var list = new List<RowPatch>();
+                if (arr == null) return list;
+                foreach (var it in arr.OfType<JObject>())
+                {
+                    var rk = it["row_key"]?.ToString() ?? "";
+                    var cells = new Dictionary<string, object?>(StringComparer.Ordinal);
+                    if (it["cells"] is JObject jo)
+                    {
+                        foreach (var p in jo.Properties())
+                            cells[p.Name] = p.Value.Type == JTokenType.Null ? null : (p.Value as JValue)?.Value;
+                    }
+                    list.Add(new RowPatch
+                    {
+                        Table = table,
+                        RowKey = rk,
+                        Deleted = false,
+                        Cells = cells
+                    });
+                }
+                return list;
+            }
+            catch { return new List<RowPatch>(); }
+        }
+
         public async Task<UpsertResult> UpsertCells(IEnumerable<EditCell> cells, CancellationToken ct = default)
         {
-            var req = new GraphQLRequest { Query = MUT_UPSERT_CELLS, Variables = new { cells } };
+            // ✅ 서버 스키마(CellEditInput): table,row_key,column,value 로 맞춰 변환
+            var payload = cells.Select(c => new
+            {
+                table = c.Table,
+                row_key = c.RowKey,
+                column = c.Column,
+                value = c.Value
+            }).ToArray();
+
+            var req = new GraphQLRequest { Query = MUT_UPSERT_CELLS, Variables = new { cells = payload } };
             var resp = await _http.SendMutationAsync<JObject>(req, ct).ConfigureAwait(false);
 
             var root = resp.Data?["upsertCells"] as JObject;

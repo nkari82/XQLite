@@ -1,13 +1,15 @@
 ﻿// XqlSheetView.cs
 using ExcelDna.Integration;
+using Microsoft.VisualStudio.OLE.Interop;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.ComponentModel.Composition.Primitives;
 using System.Globalization;
 using System.Linq;
 using System.Reflection;
 using System.Threading.Tasks;
 using System.Windows.Forms;
-using System.Collections.Concurrent;
 using Excel = Microsoft.Office.Interop.Excel;
 using MessageBox = System.Windows.Forms.MessageBox;
 
@@ -803,6 +805,17 @@ namespace XQLite.AddIn
                     header = lo?.HeaderRowRange ?? XqlSheet.GetHeaderRange(ws);
                     if (header == null) continue;
 
+                    // 서버 패치에서 등장하는 컬럼 수집 (+키 컬럼 보장)
+                    var serverCols = new HashSet<string>(StringComparer.Ordinal);
+                    foreach (var p in grp)
+                    {
+                        if (p.Deleted || p.Cells == null) continue;
+                        foreach (var k in p.Cells.Keys) if (!string.IsNullOrWhiteSpace(k)) serverCols.Add(k);
+                    }
+                    var keyName = string.IsNullOrWhiteSpace(smeta.KeyColumn) ? "id" : smeta.KeyColumn!;
+                    serverCols.Add(keyName);
+
+                    // 현재 헤더 이름 수집
                     var headers = new List<string>(header.Columns.Count);
                     for (int i = 1; i <= header.Columns.Count; i++)
                     {
@@ -812,14 +825,69 @@ namespace XQLite.AddIn
                             hc = (Excel.Range)header.Cells[1, i];
                             var nm = (hc.Value2 as string)?.Trim();
                             headers.Add(string.IsNullOrEmpty(nm)
-                                ? XqlCommon.ColumnIndexToLetter(header.Column + i - 1)
-                                : nm!);
+                                                    ? XqlCommon.ColumnIndexToLetter(header.Column + i - 1)
+                                                    : nm!);
                         }
                         finally { XqlCommon.ReleaseCom(hc); }
+                    }
+
+                    // 헤더가 비었거나, A/B/C… 폴백이거나, 서버 컬럼과 교집합이 없으면 → 서버 컬럼(+키)로 자동 생성
+                    bool LooksDefaultLetters()
+                    {
+                        if (headers.Count == 0) return true;
+                        for (int i = 0; i < headers.Count; i++)
+                        {
+                            var expect = XqlCommon.ColumnIndexToLetter(header.Column + i);
+                            if (!string.Equals(headers[i], expect, StringComparison.Ordinal)) return false;
+                        }
+                        return true;
+                    }
+                    bool needCreateHeader =
+                    headers.Count == 0 ||
+                    LooksDefaultLetters() ||
+                    !headers.Any(h => serverCols.Contains(h));
+
+                    if (needCreateHeader && serverCols.Count > 0)
+                    {
+                        // 키 우선, 나머지는 알파벳 정렬(안정적)
+                        var ordered = new List<string>(serverCols.Count);
+                        if (serverCols.Contains(keyName)) ordered.Add(keyName);
+                        ordered.AddRange(serverCols.Where(c => !string.Equals(c, keyName, StringComparison.Ordinal))
+                                                                   .OrderBy(c => c, StringComparer.Ordinal));
+
+                        // 1행에 헤더 텍스트 배치
+                        var start = (Excel.Range)header.Cells[1, 1];
+                        var end = (Excel.Range)ws.Cells[header.Row, header.Column + ordered.Count - 1];
+                        var newHeader = ws.Range[start, end];
+                        XqlCommon.ReleaseCom(start, end);
+
+                        var arr = new object[1, ordered.Count];
+                        for (int i = 0; i < ordered.Count; i++) arr[0, i] = ordered[i];
+                        newHeader.Value2 = arr;
+
+                        // 메타/마커/UI 동기화
+                        XqlAddIn.Sheet!.EnsureColumns(ws.Name, ordered);
+                        XqlSheet.SetHeaderMarker(ws, newHeader);
+                        ApplyHeaderUi(ws, newHeader, smeta, withValidation: true);
+                        InvalidateHeaderCache(ws.Name);
+                        RegisterTableSheet(grp.Key, ws.Name);
+
+                        // 로컬 변수 교체
+                        XqlCommon.ReleaseCom(header);
+                        header = newHeader;
+                        headers = ordered;
                     }
                     if (headers.Count == 0) continue;
 
                     // 3) 키 컬럼(절대열) 계산
+
+                    try
+                    {
+                        var ensureCols = serverCols.ToArray(); // HashSet -> 배열
+                        XqlAddIn.Sheet!.EnsureColumns(ws.Name, ensureCols);
+                    }
+                    catch { /* 메타 업데이트 실패는 무시 */ }
+
                     int keyIdx1 = XqlSheet.FindKeyColumnIndex(headers, smeta.KeyColumn); // 1-based
                     int keyAbsCol = header.Column + keyIdx1 - 1;
                     int firstDataRow = header.Row + 1;
@@ -879,6 +947,7 @@ namespace XQLite.AddIn
         }
 
         // 캐시 우선 조회 후, 실패하면 기존 스캔으로 폴백
+        // XqlSheetView.cs 내
         private static Excel.Worksheet? FindWorksheetByTable(Excel.Application app, string table, out XqlSheet.Meta? smeta)
         {
             smeta = null;
@@ -888,12 +957,19 @@ namespace XQLite.AddIn
                 try
                 {
                     var ws = app.Worksheets[cached] as Excel.Worksheet;
-                    if (ws != null && XqlAddIn.Sheet!.TryGetSheet(ws.Name, out var m)) { smeta = m; return ws; }
+                    if (ws != null)
+                    {
+                        // 메타가 없어도 즉시 생성해서 반환
+                        if (!XqlAddIn.Sheet!.TryGetSheet(ws.Name, out var m))
+                            m = XqlAddIn.Sheet!.GetOrCreateSheet(ws.Name);
+                        smeta = m;
+                        return ws;
+                    }
                 }
                 catch { /* 캐시 miss → 폴백 */ }
             }
 
-            // 폴백: 기존 스캔
+            // 폴백: 통합문서 스캔
             Excel.Worksheet? match = null;
             try
             {
@@ -901,11 +977,23 @@ namespace XQLite.AddIn
                 {
                     try
                     {
+                        // ① 메타가 있으면 기존 로직
                         if (XqlAddIn.Sheet!.TryGetSheet(w.Name, out var m))
                         {
                             var t = string.IsNullOrWhiteSpace(m.TableName) ? w.Name : m.TableName!;
-                            if (string.Equals(t, table, StringComparison.Ordinal))
-                            { smeta = m; match = w; _tableToSheet[table] = w.Name; break; }
+                            if (string.Equals(t, table, StringComparison.OrdinalIgnoreCase))
+                            {
+                                smeta = m; match = w; _tableToSheet[table] = w.Name; break;
+                            }
+                        }
+                        else
+                        {
+                            // ② 메타가 없지만, 시트명이 테이블명과 같다면 즉시 메타 생성(최초 워크북 지원)
+                            if (string.Equals(w.Name, table, StringComparison.OrdinalIgnoreCase))
+                            {
+                                smeta = XqlAddIn.Sheet!.GetOrCreateSheet(w.Name);
+                                match = w; _tableToSheet[table] = w.Name; break;
+                            }
                         }
                     }
                     finally { if (!ReferenceEquals(match, w)) XqlCommon.ReleaseCom(w); }
@@ -914,7 +1002,6 @@ namespace XQLite.AddIn
             catch { }
             return match;
         }
-
 
         private static int AppendNewRow(Excel.Worksheet ws, int firstDataRow, Excel.ListObject? lo)
         {
@@ -946,7 +1033,22 @@ namespace XQLite.AddIn
             {
                 var colName = headers[c];
                 if (string.IsNullOrWhiteSpace(colName)) continue;
-                if (!meta.Columns.ContainsKey(colName)) continue;      // 메타에 없는 컬럼 Skip
+
+                // 🔧 기존: 메타에 없으면 continue → 값이 안 써짐
+                // 🔁 변경: 메타에 없으면 기본 타입(TEXT/NULL OK)으로 즉시 등록하고 진행
+                if (!meta.Columns.ContainsKey(colName))
+                {
+                    try
+                    {
+                        meta.SetColumn(colName, new XqlSheet.ColumnType
+                        {
+                            Kind = XqlSheet.ColumnKind.Text,
+                            Nullable = true
+                        });
+                    }
+                    catch { /* 무시하고 계속 씀 */ }
+                }
+
                 if (!cells.TryGetValue(colName, out var val)) continue;
 
                 Excel.Range? rg = null;
@@ -964,8 +1066,12 @@ namespace XQLite.AddIn
                         case float f: rg.Value2 = (double)f; break;
                         case decimal m: rg.Value2 = (double)m; break;
                         case DateTime dt: rg.Value2 = dt.ToOADate(); break;
-                        default: rg.Value2 = Convert.ToString(val, System.Globalization.CultureInfo.InvariantCulture); break;
+                        default:
+                            rg.Value2 = Convert.ToString(val, System.Globalization.CultureInfo.InvariantCulture);
+                            break;
                     }
+
+                    // 시각적 피드백(연녹색)
                     MarkTouchedCell(rg);
                 }
                 catch (Exception ex)
