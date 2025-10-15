@@ -1,18 +1,15 @@
 ﻿// XqlSync.cs  (ExcelPatchApplier 포함 버전)
 using EnvDTE;
 using ExcelDna.Integration;
-using Microsoft.Office.Interop.Excel;
-using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
-using System.Security.Policy;
 using System.Threading;
 using System.Threading.Tasks;
-using XQLite.AddIn;
 using Excel = Microsoft.Office.Interop.Excel;
 
 namespace XQLite.AddIn
@@ -202,7 +199,7 @@ namespace XQLite.AddIn
                         PersistState();
                     }
                     catch { }
-                    finally {  }
+                    finally { }
                 });
             }
         }
@@ -211,64 +208,41 @@ namespace XQLite.AddIn
 
         public async Task PullSince(long? sinceOverride = null)
         {
-            // 백오프 윈도우면 스킵
-            if (XqlCommon.Monotonic.NowMs() < _pullBackoffUntilMs)
-                return;
-
-
-            // 이미 실행 중이면 무시
-            if (System.Threading.Interlocked.Exchange(ref _pulling, 1) == 1)
-                return;
+            if (XqlCommon.Monotonic.NowMs() < _pullBackoffUntilMs) return;
+            if (Interlocked.Exchange(ref _pulling, 1) == 1) return;
 
             PullStateChanged?.Invoke(true);
             if (!await _pullSem.WaitAsync(0).ConfigureAwait(false))
             {
-                // 세마포어도 잡혔으면 바로 종료 처리
-                System.Threading.Interlocked.Exchange(ref _pulling, 0);
+                Interlocked.Exchange(ref _pulling, 0);
                 PullStateChanged?.Invoke(false);
                 return;
             }
-
 
             try
             {
                 var since = sinceOverride ?? (_forceFullPull ? 0 : MaxRowVersion);
                 var pr = await _backend.PullRows(since, _cts.Token).ConfigureAwait(false);
 
-                // ① FULL(=0) + 패치 있음 → 부트스트랩 적용(헤더 생성 + 채우기)
-                if (since == 0 && pr.Patches is { Count: > 0 })
+                // ★ 초기 상태: 패치가 없고 로컬 max==0 이면 헤더만이라도 부트스트랩
+                if ((pr.Patches == null || pr.Patches.Count == 0) && (since == 0 || MaxRowVersion == 0))
                 {
-                    await ApplyBootstrapSnapshot(pr).ConfigureAwait(false);
+                    await ApplyBootstrapAsync(pr).ConfigureAwait(false);
                     _pullErr = 0;
-                    Interlocked.Exchange(ref _maxRowVersion, pr.MaxRowVersion);
-                    _state.LastMaxRowVersion = MaxRowVersion;
-                    PersistState();
+                    _forceFullPull = false;
                     return;
                 }
 
-                // ② 증분 적용
+                // (기존) 패치 적용 경로 …
                 await ApplyIncrementalPatches(pr).ConfigureAwait(false);
 
-                // ③ 초기 워크북 보정: 증분 0이고 로컬 버전도 0이면 rows(0) 한 번 더
-                if ((pr.Patches == null || pr.Patches.Count == 0) &&
-                    since != 0 &&
-                    MaxRowVersion == 0 &&
-                    _state.LastMaxRowVersion == 0)
-                {
-                    pr = await _backend.PullRows(0, _cts.Token).ConfigureAwait(false);
-                    await ApplyIncrementalPatches(pr).ConfigureAwait(false);
-                }
-
-                // ④ 버전/상태 갱신
                 if (pr.MaxRowVersion > 0)
                     XqlCommon.InterlockedMax(ref _maxRowVersion, pr.MaxRowVersion);
-                if (_forceFullPull) { _forceFullPull = false; _state.LastFullPullUtc = DateTime.UtcNow; }
-                _state.LastMaxRowVersion = MaxRowVersion;
-                PersistState();
 
-                // 성공 → 백오프 초기화
                 _pullErr = 0;
                 _pullBackoffUntilMs = 0;
+                _state.LastMaxRowVersion = MaxRowVersion;
+                PersistState();
             }
             catch
             {
@@ -278,7 +252,7 @@ namespace XQLite.AddIn
             finally
             {
                 _pullSem.Release();
-                System.Threading.Interlocked.Exchange(ref _pulling, 0);
+                Interlocked.Exchange(ref _pulling, 0);
                 PullStateChanged?.Invoke(false);
             }
         }
@@ -297,76 +271,97 @@ namespace XQLite.AddIn
 
         // Private
 
-        // FULL Pull 전용: 메타헤더가 없으면 만들고, 시트를 초기화한 뒤 스냅샷을 채워 넣는다.
-        private async Task ApplyBootstrapSnapshot(PullResult pr)
+        // 풀 전체가 처음이거나, 증분이 0건인 초기 상태에서 호출
+        private async Task ApplyBootstrapAsync(PullResult pr)
         {
-            var app = (Excel.Application)ExcelDnaUtil.Application;
-            await Task.Yield(); // UI 양보
+            // 1) 서버 메타 가져와서 '플랜'만 구성 (비-COM)
+            var meta = await _backend.TryFetchServerMeta().ConfigureAwait(false);
+            if (meta == null) return;
 
-            using var scope = new XqlCommon.ExcelBatchScope(app);
-            foreach (var grp in pr.Patches.GroupBy(p => p.Table, StringComparer.Ordinal))
+            var plan = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+
+            // (A) 신형 포맷: meta.tables[{ name, key, columns }]
+            if (meta["tables"] is JArray tablesNew)
             {
-                string table = grp.Key ?? "Sheet1";
-                Excel.Worksheet? ws = null;
-                Excel.Range? header = null;
-                try
+                foreach (var t in tablesNew.OfType<JObject>())
                 {
-                    // 1) 대상 시트 얻기(없으면 생성)
-                    ws = XqlSheet.FindWorksheet(app, table) ?? (Excel.Worksheet)app.Worksheets.Add();
-                    if (!string.Equals(ws.Name, table, StringComparison.Ordinal)) ws.Name = table;
+                    var tname = (t["name"] ?? t["table_name"])?.ToString();
+                    if (string.IsNullOrWhiteSpace(tname)) continue;
 
-                    // 2) 헤더 이름 구성: 첫 패치의 cells 키들로 결정 (정렬 안정성 확보)
-                    var firstCells = grp.FirstOrDefault()?.Cells ?? new Dictionary<string, object?>();
-                    var colNames = firstCells.Keys
-                                             .Where(k => !string.Equals(k, "id", StringComparison.OrdinalIgnoreCase)) // id는 맨 앞으로
-                                             .OrderBy(k => k, StringComparer.Ordinal)
-                                             .ToList();
-                    // id, row_version, updated_at, deleted 메타는 항상 보장(앞 쪽)
-                    var headerNames = new List<string> { "id", "row_version", "updated_at", "deleted" };
-                    foreach (var c in colNames)
-                        if (!headerNames.Contains(c, StringComparer.OrdinalIgnoreCase))
-                            headerNames.Add(c);
-
-                    // 3) 시트 초기화(헤더 + 본문)
-                    ws.Cells.Clear();
-                    for (int i = 0; i < headerNames.Count; i++)
-                        (ws.Cells[1, i + 1] as Excel.Range)!.Value2 = headerNames[i];
-
-                    header = XqlSheet.GetHeaderRange(ws); // 1행 전체
-                                                          // 메타 등록 + UI(툴팁/검증)
-                    var sm = XqlAddIn.Sheet!.GetOrCreateSheet(ws.Name);
-                    XqlAddIn.Sheet!.EnsureColumns(ws.Name, headerNames);
-                    XqlSheetView.ApplyHeaderUi(ws, header, sm, withValidation: true);
-                    XqlSheet.SetHeaderMarker(ws, header); // 마커 박제
-
-                    // 4) 본문 채우기(행당 id 열은 필수로 사용)
-                    int row = 2;
-                    foreach (var p in grp.OrderBy<RowPatch, object>(x => x.RowKey, Comparer<object>.Default))
+                    // columns: [ {name:..}, ... ] or [ "id","Name", ... ]
+                    var cols = new List<string>();
+                    if (t["columns"] is JArray ca)
                     {
-                        if (p.Deleted) continue;
-                        var cells = p.Cells ?? new Dictionary<string, object?>();
-
-                        (ws.Cells[row, 1] as Excel.Range)!.Value2 = p.RowKey; // id
-                                                                              // meta 기본값
-                        (ws.Cells[row, 2] as Excel.Range)!.Value2 = p.RowVersion;    // row_version
-                        (ws.Cells[row, 3] as Excel.Range)!.Value2 = DateTime.Now;    // updated_at (표시용)
-                        (ws.Cells[row, 4] as Excel.Range)!.Value2 = 0;               // deleted
-
-                        // 나머지 데이터
-                        for (int c = 5; c <= headerNames.Count; c++)
+                        foreach (var e in ca)
                         {
-                            var name = headerNames[c - 1];
-                            if (cells.TryGetValue(name, out var v))
-                                (ws.Cells[row, c] as Excel.Range)!.Value2 = XqlCommon.ValueToString(v);
+                            if (e is JObject jo && jo["name"] != null)
+                                cols.Add((jo["name"]!.ToString() ?? "").Trim());
+                            else
+                                cols.Add((e?.ToString() ?? "").Trim());
                         }
-                        row++;
                     }
-                }
-                finally
-                {
-                    XqlCommon.ReleaseCom(header, ws);
+
+                    // 컬럼이 비어있으면 서버에 질의(레거시/보강)
+                    if (cols.Count == 0)
+                    {
+                        try
+                        {
+                            var infos = await _backend.GetTableColumns(tname!).ConfigureAwait(false);
+                            cols = infos.Select(i => (i.name ?? "").Trim())
+                                                                    .Where(s => s.Length > 0)
+                                                                    .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                        }
+                        catch { /* ignore */ }
+                    }
+
+                    // 키 보강(id 선호)
+                    var key = (t["key"] ?? t["key_column"])?.ToString();
+                    key = string.IsNullOrWhiteSpace(key) ? "id" : key!;
+                    if (!cols.Any(c => c.Equals(key, StringComparison.OrdinalIgnoreCase)))
+                        cols.Insert(0, key);
+
+                    // 메타 컬럼(선택) — 있으면 뒤로 유지
+                    foreach (var m in new[] { "row_version", "updated_at", "deleted" })
+                        if (!cols.Any(c => c.Equals(m, StringComparison.OrdinalIgnoreCase)))
+                            cols.Add(m);
+
+                    // 중복/빈 제거
+                    cols = cols.Where(s => !string.IsNullOrWhiteSpace(s))
+                                                   .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                    if (cols.Count > 0) plan[tname!] = cols;
                 }
             }
+            // (B) 레거시 포맷: meta.schema[{ table_name, key_column }]
+            else if (meta["schema"] is JArray legacy)
+            {
+                foreach (var t in legacy.OfType<JObject>())
+                {
+                    var tname = t["table_name"]?.ToString();
+                    if (string.IsNullOrWhiteSpace(tname)) continue;
+
+                    var cols = new List<string>();
+                    try
+                    {
+                        var infos = await _backend.GetTableColumns(tname!).ConfigureAwait(false);
+                        cols = infos.Select(i => (i.name ?? "").Trim())
+                                                            .Where(s => s.Length > 0)
+                                                            .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                    }
+                    catch { /* ignore */ }
+
+                    var key = t["key_column"]?.ToString();
+                    key = string.IsNullOrWhiteSpace(key) ? "id" : key!;
+                    if (!cols.Any(c => c.Equals(key, StringComparison.OrdinalIgnoreCase)))
+                        cols.Insert(0, key);
+
+                    if (cols.Count > 0) plan[tname!] = cols;
+                }
+            }
+
+            if (plan.Count == 0) return;
+
+            // 2) UI 스레드에서만 Excel 만지기
+            XqlSheetView.CreateHeadersOnUiThread(plan);
         }
 
         // 증분 패치를 UI 스레드에서 적용 (항상 한 경로)

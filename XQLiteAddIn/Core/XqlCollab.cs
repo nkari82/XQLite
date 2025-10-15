@@ -1,6 +1,5 @@
 ﻿// XqlCollab.cs (Migration + RelativeKey 내장 통합판, refactored)
 using ExcelDna.Integration;
-using Microsoft.Office.Interop.Excel;
 using System;
 using System.Threading;
 using System.Threading.Tasks;

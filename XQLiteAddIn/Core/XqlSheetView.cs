@@ -1,10 +1,8 @@
 ﻿// XqlSheetView.cs
 using ExcelDna.Integration;
-using Microsoft.VisualStudio.OLE.Interop;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.ComponentModel.Composition.Primitives;
 using System.Globalization;
 using System.Linq;
 using System.Reflection;
@@ -837,7 +835,8 @@ namespace XQLite.AddIn
                         if (headers.Count == 0) return true;
                         for (int i = 0; i < headers.Count; i++)
                         {
-                            var expect = XqlCommon.ColumnIndexToLetter(header.Column + i);
+                            // FIX: off-by-one (기존 header.Column + i → -1 보정)
+                            var expect = XqlCommon.ColumnIndexToLetter(header.Column + i - 1);
                             if (!string.Equals(headers[i], expect, StringComparison.Ordinal)) return false;
                         }
                         return true;
@@ -937,6 +936,56 @@ namespace XQLite.AddIn
         public static void InvalidateHeaderCache(string sheetName)
         {
             _hdrCache.TryRemove(sheetName, out _);
+        }
+
+
+        // ─────────────────────────────────────────────────────────────
+        // NEW: 서버 메타 기반 헤더 부트스트랩 (UI 전용)
+        // plan: { "SheetName" -> ["id","Name","Type", ...] }
+        // ─────────────────────────────────────────────────────────────
+        public static void CreateHeadersOnUiThread(IReadOnlyDictionary<string, List<string>> plan)
+        {
+            if (plan == null || plan.Count == 0) return;
+            ExcelAsyncUtil.QueueAsMacro(() =>
+            {
+                var app = (Excel.Application)ExcelDnaUtil.Application;
+                using var _ = new XqlCommon.ExcelBatchScope(app); // 화면/이벤트/자동계산 OFF (짧게)
+
+                foreach (var kv in plan)
+                {
+                    var table = kv.Key;
+                    var cols = kv.Value?.Where(s => !string.IsNullOrWhiteSpace(s)).ToList() ?? new List<string>();
+                    if (string.IsNullOrWhiteSpace(table) || cols.Count == 0) continue;
+
+                    Excel.Worksheet? ws = null; Excel.Range? header = null; Excel.Range? start = null; Excel.Range? end = null;
+                    try
+                    {
+                        // 1) 시트 찾기/없으면 생성
+                        ws = XqlSheet.FindWorksheet(app, table) ?? (Excel.Worksheet)app.Worksheets.Add();
+                        try { if (!string.Equals(ws.Name, table, StringComparison.Ordinal)) ws.Name = table; } catch { /* 이름 충돌시 사용자가 수동정리 */ }
+
+                        // 2) 1행에 헤더 텍스트 배치
+                        start = (Excel.Range)ws.Cells[1, 1];
+                        end = (Excel.Range)ws.Cells[1, cols.Count];
+                        header = ws.Range[start, end];
+                        var arr = new object[1, cols.Count];
+                        for (int i = 0; i < cols.Count; i++) arr[0, i] = cols[i];
+                        header.Value2 = arr;
+
+                        // 3) 메타/마커/UI
+                        var sm = XqlAddIn.Sheet!.GetOrCreateSheet(ws.Name);
+                        XqlAddIn.Sheet!.EnsureColumns(ws.Name, cols);
+                        XqlSheet.SetHeaderMarker(ws, header);
+                        ApplyHeaderUi(ws, header, sm, withValidation: true);
+                        RegisterTableSheet(table, ws.Name);
+                        InvalidateHeaderCache(ws.Name);
+                    }
+                    finally
+                    {
+                        XqlCommon.ReleaseCom(end, start, header, ws);
+                    }
+                }
+            });
         }
 
         // Commit/스키마 동기화 등에서 테이블과 실제 시트를 등록

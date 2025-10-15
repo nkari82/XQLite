@@ -1,5 +1,4 @@
 ﻿// XqlCommon.cs
-using Newtonsoft.Json;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -10,9 +9,7 @@ using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
-using System.Security.Policy;
 using System.Text;
-using XQLite.AddIn;
 using Excel = Microsoft.Office.Interop.Excel;
 
 

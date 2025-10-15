@@ -3,16 +3,13 @@
 using GraphQL;
 using GraphQL.Client.Http;
 using GraphQL.Client.Serializer.Newtonsoft;
-using Microsoft.Office.Interop.Excel;
 using Newtonsoft.Json.Linq;
 using System;
 using System.Collections.Generic;
-using System.Data.Common;
 using System.Linq;
 using System.Reactive.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-using static System.Net.WebRequestMethods;
 using static XQLite.AddIn.IXqlBackend;
 
 namespace XQLite.AddIn
@@ -349,15 +346,30 @@ namespace XQLite.AddIn
 
         public async Task<JObject?> TryFetchServerMeta(CancellationToken ct = default)
         {
-            var resp = await _http.SendQueryAsync<JObject>(new GraphQLRequest { Query = Q_META }, ct).ConfigureAwait(false);
-            var raw = resp.Data?["meta"];
-            if (raw is JObject jo) return jo;
-            if (raw is JValue jv && jv.Type == JTokenType.String)
+            try
             {
-                try { return JObject.Parse((string)jv!); } catch { }
+                var resp = await _http.SendQueryAsync<JObject>(new GraphQLRequest { Query = Q_META }, ct).ConfigureAwait(false);
+                var raw = resp.Data?["meta"];
+
+#if true
+                var str = raw?.ToString(Newtonsoft.Json.Formatting.Indented);
+#endif
+
+                if (raw is JObject jo) return jo;
+
+                if (raw is JValue jv)
+                {
+                    var s = jv.Type == JTokenType.String ? (string?)jv.Value : jv.ToString(Newtonsoft.Json.Formatting.None);
+                    if (!string.IsNullOrWhiteSpace(s))
+                    {
+                        try { return JObject.Parse(s!); } catch { /* 서버가 문자열로 보내되 들여쓰기가 섞인 경우 대비 */ }
+                    }
+                }
+                return null;
             }
-            return null;
+            catch { return null; }
         }
+
 
         public async Task<JArray?> TryFetchAuditLog(long? since = null, CancellationToken ct = default)
         {
