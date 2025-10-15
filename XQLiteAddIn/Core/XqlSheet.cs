@@ -1,8 +1,15 @@
 ﻿// XqlSheet.cs
+using Microsoft.Office.Interop.Excel;
 using Newtonsoft.Json.Linq;
 using System;
 using System.Collections.Generic;
+using System.ComponentModel.Composition.Primitives;
+using System.IO;
 using System.Linq;
+using System.Text.RegularExpressions;
+using System.Xml.Linq;
+using XQLite.AddIn;
+using static XQLite.AddIn.XqlSheet;
 using Excel = Microsoft.Office.Interop.Excel;
 
 namespace XQLite.AddIn
@@ -177,7 +184,6 @@ namespace XQLite.AddIn
 
 
         // ───────────────────────── Header (fallback to UsedRange row1)
-        // XqlSheetView.cs에서만 사용하므로 옮길수 도 있다.
         internal static Excel.Range GetHeaderRange(Excel.Worksheet sh)
         {
             Excel.Range? used = null;
@@ -205,6 +211,128 @@ namespace XQLite.AddIn
                 return (Excel.Range)sh.Cells[1, 1];
             }
             finally { XqlCommon.ReleaseCom(used); }
+        }
+
+        // ───────────────────────── Header helpers (공용)
+        /// <summary>헤더 Range에서 트림된 컬럼명 배열을 뽑아낸다. 빈 값은 A/B/C…로 대체.</summary>
+        internal static List<string> ComputeHeaderNames(Excel.Range header)
+        {
+            var names = new List<string>(Math.Max(1, header?.Columns.Count ?? 0));
+            if (header == null) return names;
+            var v = header.Value2 as object[,];
+            if (v != null)
+            {
+                int cols = header.Columns.Count;
+                for (int c = 1; c <= cols; c++)
+                {
+                    var raw = (Convert.ToString(v[1, c]) ?? string.Empty).Trim();
+                    if (string.IsNullOrEmpty(raw))
+                    {
+                        var hc = (Excel.Range)header.Cells[1, c];
+                        raw = XqlCommon.ColumnIndexToLetter(hc.Column);
+                        XqlCommon.ReleaseCom(hc);
+                    }
+                    names.Add(raw);
+                }
+                return names;
+            }
+            // Value2 2차원배열이 아닌 경우의 폴백
+            for (int i = 1; i <= header.Columns.Count; i++)
+            {
+                Excel.Range? hc = null;
+                try
+                {
+                    hc = (Excel.Range)header.Cells[1, i];
+                    var raw = (hc.Value2 as string)?.Trim();
+                    names.Add(string.IsNullOrEmpty(raw) ? XqlCommon.ColumnIndexToLetter(hc.Column) : raw!);
+                }
+                finally { XqlCommon.ReleaseCom(hc); }
+            }
+            return names;
+        }
+
+        /// <summary>헤더가 A/B/C… 기본 글자들로만 구성되어 있는지 판별.</summary>
+        internal static bool IsFallbackLetterHeader(Excel.Range header)
+        {
+            if (header == null || header.Columns.Count == 0) return true;
+            for (int i = 1; i <= header.Columns.Count; i++)
+            {
+                Excel.Range? hc = null;
+                try
+                {
+                    hc = (Excel.Range)header.Cells[1, i];
+                    var name = (hc.Value2 as string)?.Trim() ?? "";
+                    var expect = XqlCommon.ColumnIndexToLetter(header.Column + i - 1);
+                    if (!string.Equals(name, expect, StringComparison.Ordinal))
+                        return false;
+                }
+                finally { XqlCommon.ReleaseCom(hc); }
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// 테이블명으로 워크시트를 찾는다. (시트 캐시→메타→시트명 일치 순으로 탐색)
+        /// </summary>
+        internal static Excel.Worksheet? FindWorksheetByTable(Excel.Application app, string table, out XqlSheet.Meta? smeta)
+        {
+            smeta = null;
+            // 캐시가 있으면 우선 사용
+            if (XqlSheetView.TryGetCachedSheetForTable(table, out var cached))
+            {
+                try
+                {
+                    var ws = app.Worksheets[cached] as Excel.Worksheet;
+                    if (ws != null)
+                    {
+                        if (!XqlAddIn.Sheet!.TryGetSheet(ws.Name, out var m))
+                            m = XqlAddIn.Sheet!.GetOrCreateSheet(ws.Name);
+                        smeta = m; return ws;
+                    }
+                }
+                catch { /* miss → 폴백 */ }
+            }
+            // 통합문서 스캔
+            Excel.Worksheet? match = null;
+            try
+            {
+                foreach (Excel.Worksheet w in app.Worksheets)
+                {
+                    try
+                    {
+                        if (XqlAddIn.Sheet!.TryGetSheet(w.Name, out var m))
+                        {
+                            var t = string.IsNullOrWhiteSpace(m.TableName) ? w.Name : m.TableName!;
+                            if (string.Equals(t, table, StringComparison.OrdinalIgnoreCase))
+                            { smeta = m; match = w; XqlSheetView.CacheTableToSheet(table, w.Name); break; }
+                        }
+                        else if (string.Equals(w.Name, table, StringComparison.OrdinalIgnoreCase))
+                        { smeta = XqlAddIn.Sheet!.GetOrCreateSheet(w.Name); match = w; XqlSheetView.CacheTableToSheet(table, w.Name); break; }
+                    }
+                    finally { if (!ReferenceEquals(match, w)) XqlCommon.ReleaseCom(w); }
+                }
+            }
+            catch { }
+            return match;
+        }
+
+        /// <summary>
+        /// 이 시트가 부트스트랩(헤더/데이터 초기화)이 필요한 상태인지 판단.
+        /// 마커 없음 OR 사실상 비어있음 OR 1행이 A/B/C…만 있을 때 true.
+        /// </summary>
+        internal static bool NeedsBootstrap(Excel.Worksheet ws)
+        {
+            try
+            {
+                if (TryGetHeaderMarker(ws, out var hdr)) { XqlCommon.ReleaseCom(hdr); return false; }
+                Excel.Range? used = null;
+                try { used = ws.UsedRange; if ((long)used.CountLarge <= 1) return true; }
+                finally { XqlCommon.ReleaseCom(used); }
+                var header = GetHeaderRange(ws);
+                try { return IsFallbackLetterHeader(header); }
+                finally { XqlCommon.ReleaseCom(header); }
+            }
+            catch { return false; }
         }
 
         // ───────────────────────── Finders (인스턴스)
@@ -362,6 +490,114 @@ namespace XQLite.AddIn
             catch { }
             return null;
         }
+
+
+        // ───────────────────────── 생성/정렬 유틸 (헤더/시트) — (요청) XqlSheet 내부에 정리
+
+        /// <summary>
+        /// 시트 이름으로 찾고, 없으면 맨 뒤에 새로 만들어 반환한다.
+        /// 반환 객체는 호출자가 해제하지 않는다(소유권 유지).
+        /// </summary>
+        internal static Excel.Worksheet GetOrAddWorksheet(Excel.Application app, string sheetName)
+        {
+            if (app == null) throw new ArgumentNullException(nameof(app));
+            if (string.IsNullOrWhiteSpace(sheetName)) throw new ArgumentException(nameof(sheetName));
+
+            var found = FindWorksheet(app, sheetName);
+            if (found != null) return found; // 이미 존재
+
+            Excel.Sheets? sheets = null;
+            Excel.Worksheet? added = null, last = null;
+            try
+            {
+                sheets = app.Worksheets;
+                int cnt = sheets.Count;
+                last = (Excel.Worksheet)sheets[cnt];
+                added = (Excel.Worksheet)sheets.Add(After: last);
+                try { added.Name = sheetName; } catch { /* Excel이 고유 이름으로 바꿀 수 있음 */ }
+                return added; // 반환: 해제 금지
+            }
+            finally
+            {
+                XqlCommon.ReleaseCom(last, sheets);
+                // added는 반환했으므로 해제 금지
+            }
+        }
+
+        /// <summary>
+        /// 1행에 지정된 컬럼명들로 헤더를 생성(또는 덮어씀). 반환된 Range는 호출자가 ReleaseCom.
+        /// </summary>
+        internal static Excel.Range CreateOrReplaceHeaderRow(Excel.Worksheet ws, IList<string> columns)
+        {
+            if (ws == null) throw new ArgumentNullException(nameof(ws));
+            if (columns == null || columns.Count == 0) throw new ArgumentException(nameof(columns));
+
+            Excel.Range? first = null, last = null, header = null;
+            try
+            {
+                first = (Excel.Range)ws.Cells[1, 1];
+                last = (Excel.Range)ws.Cells[1, columns.Count];
+                header = ws.Range[first, last];
+
+                var arr = new object[1, columns.Count];
+                for (int i = 0; i < columns.Count; i++)
+                    arr[0, i] = columns[i] ?? "";
+                header.Value2 = arr;
+                return header; // 호출자가 ReleaseCom
+            }
+            catch
+            {
+                return header!; // 실패해도 caller가 해제
+            }
+            finally
+            {
+                XqlCommon.ReleaseCom(first, last);
+            }
+        }
+
+        /// <summary>
+        /// 기존 헤더 Range를 주어진 컬럼 목록과 동일하게 정렬/갱신한다(개수 증가 시 우측 확장).
+        /// </summary>
+        internal static void AlignHeaderNames(Excel.Worksheet ws, Excel.Range header, IList<string> columns)
+        {
+            if (ws == null || header == null) return;
+            if (columns == null || columns.Count == 0) return;
+
+            Excel.Range? first = null, last = null, target = null;
+            try
+            {
+                int startCol = header.Column;
+                int need = columns.Count;
+                int curr = header.Columns.Count;
+                int endCol = Math.Max(startCol + need - 1, startCol + curr - 1);
+
+                first = (Excel.Range)ws.Cells[1, startCol];
+                last = (Excel.Range)ws.Cells[1, endCol];
+                target = ws.Range[first, last];
+
+                var arr = new object[1, need];
+                for (int i = 0; i < need; i++)
+                    arr[0, i] = columns[i] ?? "";
+
+                try { target.ClearContents(); } catch { }
+                try { target.ClearFormats(); } catch { }
+
+                Excel.Range? t1 = null, t2 = null, rg = null;
+                try
+                {
+                    t1 = (Excel.Range)ws.Cells[1, startCol];
+                    t2 = (Excel.Range)ws.Cells[1, startCol + need - 1];
+                    rg = ws.Range[t1, t2];
+                    rg.Value2 = arr;
+                }
+                finally { XqlCommon.ReleaseCom(rg, t2, t1); }
+            }
+            finally
+            {
+                XqlCommon.ReleaseCom(target, last, first);
+            }
+        }
+
 
         private static Excel.ListObject? FindListObjectByHeaderCaption(Excel.Worksheet ws, string caption)
         {

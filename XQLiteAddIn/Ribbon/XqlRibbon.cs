@@ -205,10 +205,9 @@ namespace XQLite.AddIn
         }
 
         // 1초에 한 번만 재평가(스레드 안전)
-        private static long NowMs() => XqlCommon.Monotonic.NowMs();
         private bool ShouldRecheck()
         {
-            var now = NowMs();
+            var now = XqlCommon.NowMs();
             var last = Interlocked.Read(ref _blockCheckedMs);
             if (now - last <= 1000) return false;
             Interlocked.Exchange(ref _blockCheckedMs, now);

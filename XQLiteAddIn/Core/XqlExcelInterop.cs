@@ -97,7 +97,7 @@ namespace XQLite.AddIn
                 if (ws == null) { await _sync.PullSince(); return; }
 
                 // ✅ 부트스트랩 필요 판단: 마커 없음 OR 유효 데이터 거의 없음 OR 1행이 A/B/C… 폴백 헤더
-                bool needsBootstrap = NeedsBootstrap(ws);
+                bool needsBootstrap = XqlSheet.NeedsBootstrap(ws);
 
                 // 강제 Full Pull(since=0) 또는 증분 Pull
                 await _sync.PullSince(needsBootstrap ? 0 : (long?)null);
@@ -107,57 +107,6 @@ namespace XQLite.AddIn
                 XqlLog.Warn("PullOnly failed: " + ex.Message);
             }
         }
-
-        // 아래 헬퍼 추가 (클래스 내부)
-        private static bool NeedsBootstrap(Excel.Worksheet ws)
-        {
-            try
-            {
-                // 1) 마커가 있으면 일단 부트스트랩 아님
-                if (XqlSheet.TryGetHeaderMarker(ws, out var hdr))
-                {
-                    XqlCommon.ReleaseCom(hdr);
-                    return false;
-                }
-
-                // 2) 데이터가 사실상 비어 있다면 부트스트랩
-                Excel.Range? used = null;
-                try
-                {
-                    used = ws.UsedRange;
-                    var cellCount = (long)used.CountLarge;
-                    if (cellCount <= 1) return true;
-                }
-                finally { XqlCommon.ReleaseCom(used); }
-
-                // 3) 1행 헤더가 A/B/C… 폴백이면 부트스트랩
-                Excel.Range header = XqlSheet.GetHeaderRange(ws);
-                try
-                {
-                    int cols = header.Columns.Count;
-                    if (cols <= 0) return true;
-
-                    for (int i = 1; i <= cols; i++)
-                    {
-                        Excel.Range? c = null;
-                        try
-                        {
-                            c = (Excel.Range)header.Cells[1, i];
-                            var name = (c.Value2 as string)?.Trim() ?? "";
-                            var expected = XqlCommon.ColumnIndexToLetter(header.Column + i - 1);
-                            if (!string.Equals(name, expected, StringComparison.Ordinal))
-                                return false; // 폴백 아님 → 부트스트랩 불필요
-                        }
-                        finally { XqlCommon.ReleaseCom(c); }
-                    }
-                    // 전부 폴백이면 부트스트랩
-                    return true;
-                }
-                finally { XqlCommon.ReleaseCom(header); }
-            }
-            catch { return false; }
-        }
-
 
         public void Cmd_RecoverFromExcel()
         {

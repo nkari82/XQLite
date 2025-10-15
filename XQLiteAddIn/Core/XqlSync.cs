@@ -278,7 +278,7 @@ namespace XQLite.AddIn
             var meta = await _backend.TryFetchServerMeta().ConfigureAwait(false);
             if (meta == null) return;
 
-            var plan = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+            var schema = new Dictionary<string, List<string>>(StringComparer.Ordinal);
 
             // (A) 신형 포맷: meta.tables[{ name, key, columns }]
             if (meta["tables"] is JArray tablesNew)
@@ -328,7 +328,7 @@ namespace XQLite.AddIn
                     // 중복/빈 제거
                     cols = cols.Where(s => !string.IsNullOrWhiteSpace(s))
                                                    .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-                    if (cols.Count > 0) plan[tname!] = cols;
+                    if (cols.Count > 0) schema[tname!] = cols;
                 }
             }
             // (B) 레거시 포맷: meta.schema[{ table_name, key_column }]
@@ -354,21 +354,21 @@ namespace XQLite.AddIn
                     if (!cols.Any(c => c.Equals(key, StringComparison.OrdinalIgnoreCase)))
                         cols.Insert(0, key);
 
-                    if (cols.Count > 0) plan[tname!] = cols;
+                    if (cols.Count > 0) schema[tname!] = cols;
                 }
             }
 
-            if (plan.Count == 0) return;
+            if (schema.Count == 0) return;
 
             // 2) UI 스레드에서만 Excel 만지기
-            XqlSheetView.CreateHeadersOnUiThread(plan);
+            XqlSheetView.ApplyPlanAndPatches(schema, pr?.Patches);
         }
 
         // 증분 패치를 UI 스레드에서 적용 (항상 한 경로)
         private Task ApplyIncrementalPatches(PullResult pr)
         {
             if (pr?.Patches is { Count: > 0 })
-                XqlSheetView.ApplyOnUiThread(pr.Patches); // ← 내부에서 InternalApplyCore 호출
+                XqlSheetView.ApplyPlanAndPatches(null, pr.Patches); // ← 내부에서 InternalApplyCore 호출
             return Task.CompletedTask;
         }
 
@@ -529,7 +529,7 @@ namespace XQLite.AddIn
 
             // ⬇️ 서버 패치를 엑셀에 적용 (UI 스레드 매크로 큐로 안전하게)
             if (resp.Patches is { Count: > 0 })
-                XqlSheetView.ApplyOnUiThread(resp.Patches);
+                XqlSheetView.ApplyPlanAndPatches(null, resp.Patches);
 
             return resp;
         }
@@ -541,7 +541,7 @@ namespace XQLite.AddIn
                 var before = MaxRowVersion;
 
                 if (ev.Patches is { Count: > 0 })
-                    XqlSheetView.ApplyOnUiThread(ev.Patches);
+                    XqlSheetView.ApplyPlanAndPatches(null, ev.Patches);
 
                 if (ev.MaxRowVersion > 0)
                     XqlCommon.InterlockedMax(ref _maxRowVersion, ev.MaxRowVersion);
