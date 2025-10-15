@@ -42,7 +42,7 @@ namespace XQLite.AddIn
         {
             try
             {
-                var now = XqlCommon.Monotonic.NowMs();
+                var now = XqlCommon.NowMs();
                 if (now - _lastPresenceMs < 800) return; // 0.8s 디바운스
 
                 var sig = $"{sheet}|{cellAddr}";

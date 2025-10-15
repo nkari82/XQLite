@@ -208,7 +208,7 @@ namespace XQLite.AddIn
 
         public async Task PullSince(long? sinceOverride = null)
         {
-            if (XqlCommon.Monotonic.NowMs() < _pullBackoffUntilMs) return;
+            if (XqlCommon.NowMs() < _pullBackoffUntilMs) return;
             if (Interlocked.Exchange(ref _pulling, 1) == 1) return;
 
             PullStateChanged?.Invoke(true);
@@ -247,7 +247,7 @@ namespace XQLite.AddIn
             catch
             {
                 _pullErr = Math.Min(_pullErr + 1, 4);
-                _pullBackoffUntilMs = XqlCommon.Monotonic.NowMs() + _pullErr * 2000L;
+                _pullBackoffUntilMs = XqlCommon.NowMs() + _pullErr * 2000L;
             }
             finally
             {
@@ -491,7 +491,7 @@ namespace XQLite.AddIn
             {
                 if (_outbox.IsEmpty) return;
 
-                long deadline = XqlCommon.Monotonic.NowMs() + UPSERT_SLICE_MS;
+                long deadline = XqlCommon.NowMs() + UPSERT_SLICE_MS;
                 do
                 {
                     var batch = DrainDedupCells(_outbox, UPSERT_CHUNK);
@@ -512,7 +512,7 @@ namespace XQLite.AddIn
                     // FlushUpsertsCore 내 성공 후 기록 교체
                     foreach (var e in batch) RememberPushed(Key(e), XqlCommon.Canonicalize(e.Value));
                 }
-                while (!_outbox.IsEmpty && XqlCommon.Monotonic.NowMs() < deadline);
+                while (!_outbox.IsEmpty && XqlCommon.NowMs() < deadline);
             }
             catch (Exception ex)
             {

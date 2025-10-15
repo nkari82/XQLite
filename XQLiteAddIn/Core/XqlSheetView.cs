@@ -723,6 +723,49 @@ namespace XQLite.AddIn
                 => Convert.ToString(v, CultureInfo.InvariantCulture) ?? "";
         }
 
+        public readonly struct ExcelBatchScope : IDisposable
+        {
+            private readonly Excel.Application? _app;
+            private readonly bool _oldEvents, _oldScreen, _oldAlerts;
+            private readonly Excel.XlCalculation _oldCalc;
+
+            public ExcelBatchScope(Excel.Application? app)
+            {
+                _app = app;
+                if (app == null)
+                {
+                    _oldEvents = _oldScreen = _oldAlerts = false;
+                    _oldCalc = Excel.XlCalculation.xlCalculationAutomatic;
+                    return;
+                }
+                try
+                {
+                    _oldEvents = app.EnableEvents;
+                    _oldScreen = app.ScreenUpdating;
+                    _oldAlerts = app.DisplayAlerts;
+                    _oldCalc = app.Calculation;
+
+                    app.EnableEvents = false;
+                    app.ScreenUpdating = false;
+                    app.DisplayAlerts = false;
+                    app.Calculation = Excel.XlCalculation.xlCalculationManual;
+                }
+                catch { /* ignore */ }
+            }
+
+            public void Dispose()
+            {
+                if (_app == null) return;
+                try
+                {
+                    _app.Calculation = _oldCalc;
+                    _app.DisplayAlerts = _oldAlerts;
+                    _app.ScreenUpdating = _oldScreen;
+                    _app.EnableEvents = _oldEvents;
+                }
+                catch { /* ignore */ }
+            }
+        }
 
 
         public static void ApplyOnUiThread(IReadOnlyList<RowPatch> patches)
@@ -732,7 +775,7 @@ namespace XQLite.AddIn
                 var app = ExcelDnaUtil.Application as Excel.Application;
                 if (app == null || patches == null || patches.Count == 0) return;
 
-                using var scope = new XqlCommon.ExcelBatchScope(app); // 화면/이벤트/자동계산 OFF (짧게)
+                using var scope = new ExcelBatchScope(app); // 화면/이벤트/자동계산 OFF (짧게)
 
                 InternalApplyCore(app, patches); // ✅ 아래 (B)에 구현
 
@@ -949,7 +992,7 @@ namespace XQLite.AddIn
             ExcelAsyncUtil.QueueAsMacro(() =>
             {
                 var app = (Excel.Application)ExcelDnaUtil.Application;
-                using var _ = new XqlCommon.ExcelBatchScope(app); // 화면/이벤트/자동계산 OFF (짧게)
+                using var _ = new ExcelBatchScope(app); // 화면/이벤트/자동계산 OFF (짧게)
 
                 foreach (var kv in plan)
                 {

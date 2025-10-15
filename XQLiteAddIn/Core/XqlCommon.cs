@@ -18,55 +18,9 @@ namespace XQLite.AddIn
     internal static class XqlCommon
     {
         // XqlCommon.cs (공용으로 쓰고 싶다면)
-        public static class Monotonic
-        {
-            [MethodImpl(MethodImplOptions.AggressiveInlining)]
-            public static long NowMs() => (Stopwatch.GetTimestamp() * 1000L) / Stopwatch.Frequency;
-        }
 
-        public readonly struct ExcelBatchScope : IDisposable
-        {
-            private readonly Excel.Application? _app;
-            private readonly bool _oldEvents, _oldScreen, _oldAlerts;
-            private readonly Excel.XlCalculation _oldCalc;
+        public static long NowMs() => (Stopwatch.GetTimestamp() * 1000L) / Stopwatch.Frequency;
 
-            public ExcelBatchScope(Excel.Application? app)
-            {
-                _app = app;
-                if (app == null)
-                {
-                    _oldEvents = _oldScreen = _oldAlerts = false;
-                    _oldCalc = Excel.XlCalculation.xlCalculationAutomatic;
-                    return;
-                }
-                try
-                {
-                    _oldEvents = app.EnableEvents;
-                    _oldScreen = app.ScreenUpdating;
-                    _oldAlerts = app.DisplayAlerts;
-                    _oldCalc = app.Calculation;
-
-                    app.EnableEvents = false;
-                    app.ScreenUpdating = false;
-                    app.DisplayAlerts = false;
-                    app.Calculation = Excel.XlCalculation.xlCalculationManual;
-                }
-                catch { /* ignore */ }
-            }
-
-            public void Dispose()
-            {
-                if (_app == null) return;
-                try
-                {
-                    _app.Calculation = _oldCalc;
-                    _app.DisplayAlerts = _oldAlerts;
-                    _app.ScreenUpdating = _oldScreen;
-                    _app.EnableEvents = _oldEvents;
-                }
-                catch { /* ignore */ }
-            }
-        }
 
         /// <summary>값 정규화(전송/비교용) – 모든 모듈에서 이 함수만 사용.</summary>
         public static string? Canonicalize(object? v)
