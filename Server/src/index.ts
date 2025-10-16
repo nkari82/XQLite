@@ -1,706 +1,761 @@
-// src/index.ts — XQLite GraphQL server (single file)
-// deps: npm i graphql graphql-yoga graphql-type-json better-sqlite3
-// env:  PORT, XQL_DB, XQL_DEFAULT_KEY
+// src/index.ts
+//
+// XQLite GraphQL Server — data.sqlite + ATTACH admin.sqlite
+//  - 데이터 DB(<project>.sqlite): 실제 테이블 + 메타(row_version, updated_at, deleted)
+//  - admin DB(<project>.admin.sqlite): _meta(max_row_version), _events, _presence, _locks, _audit_log
+//  - Subscription: events
+//  - project: null/"" -> "default"
+//  - 타임스탬프(ms) Float, READONLY 지원
+//
+// deps:
+//   npm i graphql graphql-yoga graphql-type-json better-sqlite3
+//   npm i -D ts-node typescript @types/node
+//
+// run:
+//   ts-node --transpile-only src/index.ts
+//
 
-import { createServer } from "http";
-import { createYoga, createPubSub } from "graphql-yoga";
-import {
-  GraphQLObjectType,
-  GraphQLInputObjectType,
-  GraphQLSchema,
-  GraphQLString,
-  GraphQLList,
-  GraphQLInt,
-  GraphQLBoolean,
-  GraphQLNonNull,
-  GraphQLScalarType,
-} from "graphql";
-import GraphQLJSON from "graphql-type-json";
-import Database from "better-sqlite3";
-import fs from "fs";
+import fs from 'fs';
+import path from 'path';
+import Database from 'better-sqlite3';
+import { createServer } from 'http';
+import { createSchema, createYoga, createPubSub } from 'graphql-yoga';
+import { GraphQLJSON } from 'graphql-type-json';
 
-// ========================= DB bootstrap =========================
-const DB_PATH = process.env.XQL_DB ?? "./xqlite.db";
-const db = new Database(DB_PATH);
-db.pragma("journal_mode = WAL");
-db.pragma("synchronous = NORMAL");
-db.pragma("busy_timeout = 5000");
+// ────────────────────────────────────────────────────────────
+// ENV
+// ────────────────────────────────────────────────────────────
+const PORT = process.env.PORT ? Number(process.env.PORT) : 4000;
+const DATA_DIR = process.env.XQLITE_DATA_DIR || path.resolve(process.cwd(), 'data');
+const PROJECT_FALLBACK = 'default';
+const READONLY = process.env.XQLITE_READONLY === '1';
 
-db.exec(`
-CREATE TABLE IF NOT EXISTS _meta (
-  k TEXT PRIMARY KEY,
-  v TEXT
-);
-CREATE TABLE IF NOT EXISTS _presence (
-  nickname TEXT PRIMARY KEY,
-  sheet TEXT,
-  cell TEXT,
-  updated_at INTEGER
-);
-CREATE TABLE IF NOT EXISTS _locks (
-  cell TEXT PRIMARY KEY,
-  by TEXT NOT NULL,
-  ts INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS _audit (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  ts INTEGER NOT NULL,
-  user TEXT,
-  table_name TEXT,
-  row_key TEXT,
-  column_name TEXT,
-  old_value TEXT,
-  new_value TEXT,
-  row_version INTEGER
-);
-CREATE TABLE IF NOT EXISTS _tombstones (
-  table_name TEXT NOT NULL,
-  row_key TEXT NOT NULL,
-  row_version INTEGER NOT NULL,
-  created_at INTEGER NOT NULL,
-  PRIMARY KEY (table_name, row_key)
-);
-CREATE TABLE IF NOT EXISTS _schema (
-  table_name TEXT PRIMARY KEY,
-  key_column TEXT NOT NULL
-);
-`);
+const PRESENCE_TTL_MS = 10_000;
+const LOCK_TTL_MS = 10_000;
+const CLEAN_INTERVAL_MS = 5_000;
+const BROADCAST_BACKSCAN = 1024;
 
-db.exec(`INSERT OR IGNORE INTO _meta(k,v) VALUES('max_row_version','0')`);
-
-type RowV = { v: number };
-const getMaxRowVersion = db.prepare<[], RowV>(
-  `SELECT CAST(v AS INTEGER) AS v FROM _meta WHERE k='max_row_version'`
-);
-const setMaxRowVersion = db.prepare<[number]>(
-  `UPDATE _meta SET v=? WHERE k='max_row_version'`
-);
-
-function nextRowVersion(): number {
-  const cur = Number(getMaxRowVersion.get()?.v ?? 0) + 1;
-  setMaxRowVersion.run(cur);
-  return cur;
+// ────────────────────────────────────────────────────────────
+// utils
+// ────────────────────────────────────────────────────────────
+function nowMs(): number { return Date.now(); }
+function normalizeProject(input?: string | null): string { const v = (input ?? '').trim(); return v || PROJECT_FALLBACK; }
+function ensureDir(p: string) { if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true }); }
+function applyPragmasTo(db: Database.Database, schema?: string) {
+  const prefix = schema ? `${schema}.` : '';
+  db.pragma(`${prefix}journal_mode = WAL`);
+  db.pragma(`${prefix}synchronous = NORMAL`);
+  db.pragma(`${prefix}busy_timeout = 5000`);
 }
+function escapeIdent(name: string): string { return `"${String(name).replace(/"/g, '""')}"`; }
+function capInt32(n: number): number { if (!Number.isFinite(n)) return 0; return Math.max(Math.min(n | 0, 2147483647), -2147483648); }
+function dataPath(project: string) { ensureDir(DATA_DIR); return path.join(DATA_DIR, `${project}.sqlite`); }
+function adminPath(project: string) { ensureDir(DATA_DIR); return path.join(DATA_DIR, `${project}.admin.sqlite`); }
 
-// ========================= helpers =========================
-function keepValueForStore(v: any) {
-  if (v === null || v === undefined) return null;
-  if (typeof v === "object") return JSON.stringify(v);
-  if (v === true) return 1;
-  if (v === false) return 0;
-  return v;
-}
+// ────────────────────────────────────────────────────────────
+// types/cache
+// ────────────────────────────────────────────────────────────
+type DBBundle = {
+  project: string;
+  db: Database.Database; // main connection (admin ATTACH)
+  stmts: {
+    // admin
+    getMetaVersion: Database.Statement;
+    setMetaVersion: Database.Statement;
+    selectMaxVersion: Database.Statement;
 
-function reviveValue(v: any) {
-  if (typeof v === "string" && v.length > 0 && (v[0] === "{" || v[0] === "[")) {
-    try { return JSON.parse(v); } catch { /* keep string */ }
-  }
-  return v;
-}
+    insertEvent: Database.Statement;
+    selectEventsSince: Database.Statement;
 
-function rowToCells(row: any, keyCol: string): Record<string, any> {
-  const cells: Record<string, any> = {};
-  for (const k of Object.keys(row)) {
-    if (k === keyCol || k === "row_version" || k === "updated_at" || k === "deleted") continue;
-    cells[k] = reviveValue(row[k]);
-  }
-  return cells;
-}
+    presenceUpsert: Database.Statement;
+    presenceListLive: Database.Statement;
+    presenceCleanup: Database.Statement;
 
-function ensureTable(table: string, key: string) {
-  const rec = db.prepare<[string], { key_column: string }>(
-    `SELECT key_column FROM _schema WHERE table_name=?`
-  ).get(table);
-  if (rec?.key_column && rec.key_column !== key) {
-    throw new Error(`Key mismatch for table '${table}': existing=${rec.key_column}, requested=${key}`);
-  }
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS "${table}" (
-      "${key}" TEXT PRIMARY KEY,
-      row_version INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL,
-      deleted INTEGER NOT NULL DEFAULT 0
-    )
-  `);
-  db.prepare(`INSERT OR IGNORE INTO _schema(table_name,key_column) VALUES(?,?)`).run(table, key);
-}
+    lockAcquire: Database.Statement;
+    lockReleaseBy: Database.Statement;
+    lockCleanup: Database.Statement;
 
-type ColumnDefInput = { name: string; kind?: string; notNull?: boolean; check?: string };
+    auditInsert: Database.Statement;
+    auditSince: Database.Statement;
 
-const GqlColumnInfo = new GraphQLObjectType({
-  name: "ColumnInfo",
-  fields: {
-    name: { type: new GraphQLNonNull(GraphQLString) },
-    type: { type: GraphQLString },        // declared type (affinity용)
-    notnull: { type: new GraphQLNonNull(GraphQLBoolean) },
-    pk: { type: new GraphQLNonNull(GraphQLBoolean) },
-  }
-});
-
-
-function addColumns(table: string, defs: ColumnDefInput[]) {
-  const pragmaCols = db.prepare(`PRAGMA table_info("${table}")`).all() as any[];
-  const have = new Set<string>(pragmaCols.map(c => String(c.name)));
-  const colSqls: string[] = [];
-  for (const d of defs) {
-    if (!have.has(d.name)) {
-      let typ = "TEXT";
-      switch ((d.kind ?? "text").toLowerCase()) {
-        case "int":
-        case "integer": typ = "INTEGER"; break;
-        case "real":
-        case "float":
-        case "double": typ = "REAL"; break;
-        case "bool":
-        case "boolean": typ = "INTEGER"; break; // 0/1
-        case "date": typ = "INTEGER"; break;    // epoch ms
-        case "json": typ = "TEXT"; break;       // JSON1 + TEXT
-        default: typ = "TEXT";
-      }
-      const notNull = d.notNull ? " NOT NULL" : "";
-      const check = d.check ? ` CHECK(${d.check})` : "";
-      colSqls.push(`ALTER TABLE "${table}" ADD COLUMN "${d.name}" ${typ}${notNull}${check}`);
-    }
-  }
-  const tx = db.transaction(() => colSqls.forEach(sql => db.exec(sql)));
-  if (colSqls.length) tx();
-}
-
-function getSchemaRec(table: string): { key_column: string } | undefined {
-  return db.prepare<[string], { key_column: string }>(
-    `SELECT key_column FROM _schema WHERE table_name=?`
-  ).get(table);
-}
-function getKeyCol(table: string): string {
-  const r = getSchemaRec(table);
-  if (!r) throw new Error(`Table not registered: ${table}`);
-  return String(r.key_column);
-}
-
-const DEFAULT_KEY = process.env.XQL_DEFAULT_KEY ?? "id";
-function ensureTableIfMissing(table: string, keyColHint?: string): string {
-  const rec = getSchemaRec(table);
-  if (rec?.key_column) return rec.key_column;
-  const key = keyColHint ?? DEFAULT_KEY;
-  ensureTable(table, key);
-  return key;
-}
-
-function inferKind(v: any): "integer" | "real" | "boolean" | "json" | "text" {
-  if (v === null || v === undefined) return "text";
-  if (typeof v === "number") return Number.isInteger(v) ? "integer" : "real";
-  if (typeof v === "boolean") return "boolean";
-  if (typeof v === "object") return "json";
-  return "text";
-}
-
-function ensureColumnsForSamples(table: string, sample: Record<string, any>, keyCol: string) {
-  const reserved = new Set([keyCol, "row_version", "updated_at", "deleted"]);
-  const defs: ColumnDefInput[] = [];
-  for (const [name, val] of Object.entries(sample)) {
-    if (reserved.has(name)) continue;
-    defs.push({ name, kind: inferKind(val) });
-  }
-  if (defs.length) addColumns(table, defs);
-}
-
-type PatchRecord = {
-  table: string;
-  row_key: string;
-  row_version: number;
-  deleted: boolean;
-  cells: Record<string, any>;
+    // data helpers
+    selectPk: (table: string) => string;
+    tableInfo: (table: string) => Array<{ name: string; type: string | null; notnull: number; pk: number }>;
+    selectRowByPk: (table: string, pkName: string, id: string) => any;
+  };
 };
 
-function readSince(table: string, since: number) {
-  const key = getKeyCol(table);
-  const rows = db.prepare<[number], any>(
-    `SELECT * FROM "${table}" WHERE row_version > ? ORDER BY row_version`
-  ).all(since);
-  const patches: PatchRecord[] = rows.map((r: any) => ({
-    table,
-    row_key: String(r[key]),
-    row_version: Number(r.row_version),
-    deleted: !!r.deleted,
-    cells: rowToCells(r, key),
-  }));
+const dbCache = new Map<string, DBBundle>();
 
-  const latestByRow = new Map<string, number>();
-  for (const p of patches) {
-    const current = latestByRow.get(p.row_key) ?? -Infinity;
-    if (p.row_version > current) latestByRow.set(p.row_key, p.row_version);
+// 메인 스키마가 순수 데이터인지 검증
+function assertDataSchemaIsPure(db: Database.Database) {
+  const rows = db.prepare(`SELECT name FROM sqlite_master WHERE type='table'`).all() as Array<{ name: string }>;
+  const names = new Set(rows.map(r => r.name));
+  const forbidden = ['_meta', '_events', '_presence', '_locks', '_audit_log'];
+  const found = forbidden.filter(n => names.has(n));
+  if (found.length) {
+    throw new Error(`Admin tables must NOT exist in main schema: ${found.join(', ')}. Use admin.<table> via ATTACH.`);
   }
-
-  const tombstones = db.prepare<[string, number], { row_key: string; row_version: number }>(
-    `SELECT row_key, row_version FROM _tombstones WHERE table_name=? AND row_version > ? ORDER BY row_version`
-  ).all(table, since);
-  for (const t of tombstones) {
-    const rk = String(t.row_key);
-    const rv = Number(t.row_version);
-    const latest = latestByRow.get(rk);
-    if (latest !== undefined && latest >= rv) continue;
-    patches.push({
-      table,
-      row_key: rk,
-      row_version: rv,
-      deleted: true,
-      cells: {} as Record<string, any>,
-    });
-  }
-
-  patches.sort((a, b) => a.row_version - b.row_version);
-  return patches;
+  const suspicious = rows.map(r => r.name).filter(n => n.startsWith('_'));
+  if (suspicious.length) console.warn(`[WARN] Main schema has '_' prefixed tables: ${suspicious.join(', ')} (consider moving to admin schema)`);
 }
 
-// ========================= GraphQL types =========================
-type CellEditInput = { table: string; row_key: string; column: string; value?: any };
+function openBundle(projectRaw?: string | null): DBBundle {
+  const project = normalizeProject(projectRaw);
+  const cached = dbCache.get(project);
+  if (cached) return cached;
 
+  // open main (data)
+  const db = new Database(dataPath(project), READONLY ? { readonly: true } : {});
+  applyPragmasTo(db);
+  assertDataSchemaIsPure(db);
 
-const GqlPatch = new GraphQLObjectType({
-  name: "RowPatch",
-  fields: {
-    table: { type: new GraphQLNonNull(GraphQLString) },
-    row_key: { type: new GraphQLNonNull(GraphQLString) },
-    row_version: { type: new GraphQLNonNull(GraphQLInt) },
-    deleted: { type: new GraphQLNonNull(GraphQLBoolean) },
-    cells: { type: GraphQLJSON },
+  // ATTACH admin
+  const ap = adminPath(project).replace(/"/g, '""');
+  db.exec(`ATTACH DATABASE "${ap}" AS admin;`);
+  applyPragmasTo(db, 'admin');
+
+  // admin schema
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS admin._meta (key TEXT PRIMARY KEY, value TEXT);
+    CREATE TABLE IF NOT EXISTS admin._events (
+      row_version INTEGER PRIMARY KEY,
+      table_name TEXT NOT NULL,
+      row_key TEXT NOT NULL,
+      deleted INTEGER NOT NULL DEFAULT 0,
+      cells TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS admin._presence (
+      nickname TEXT NOT NULL,
+      sheet TEXT,
+      cell TEXT,
+      updated_at REAL NOT NULL,
+      PRIMARY KEY (nickname)
+    );
+    CREATE TABLE IF NOT EXISTS admin._locks (
+      cell TEXT PRIMARY KEY,
+      by TEXT NOT NULL,
+      updated_at REAL NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS admin._audit_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts REAL NOT NULL,
+      user TEXT NOT NULL,
+      table_name TEXT NOT NULL,
+      row_key TEXT NOT NULL,
+      column TEXT,
+      old_value TEXT,
+      new_value TEXT,
+      row_version INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS admin._events_rowver    ON _events(row_version);
+    CREATE INDEX IF NOT EXISTS admin._presence_updated ON _presence(updated_at);
+    CREATE INDEX IF NOT EXISTS admin._locks_updated    ON _locks(updated_at);
+    CREATE INDEX IF NOT EXISTS admin._audit_rowver     ON _audit_log(row_version);
+  `);
+
+  // _meta init
+  const getMetaVersion = db.prepare(`SELECT value FROM admin._meta WHERE key='max_row_version'`);
+  const setMetaVersion = db.prepare(`
+    INSERT INTO admin._meta(key, value) VALUES('max_row_version', @v)
+    ON CONFLICT(key) DO UPDATE SET value=@v
+  `);
+  if (!getMetaVersion.get()) setMetaVersion.run({ v: '0' });
+
+  const stmts = {
+    getMetaVersion,
+    setMetaVersion,
+    selectMaxVersion: db.prepare(`SELECT CAST(value AS INTEGER) AS v FROM admin._meta WHERE key='max_row_version'`),
+
+    insertEvent: db.prepare(`
+      INSERT INTO admin._events(row_version, table_name, row_key, deleted, cells)
+      VALUES(@row_version, @table_name, @row_key, @deleted, @cells)
+    `),
+    selectEventsSince: db.prepare(`
+      SELECT row_version, table_name, row_key, deleted, cells
+      FROM admin._events
+      WHERE row_version > @since
+      ORDER BY row_version ASC
+    `),
+
+    presenceUpsert: db.prepare(`
+      INSERT INTO admin._presence(nickname, sheet, cell, updated_at)
+      VALUES(@nickname, @sheet, @cell, @updated_at)
+      ON CONFLICT(nickname) DO UPDATE SET
+        sheet=excluded.sheet, cell=excluded.cell, updated_at=excluded.updated_at
+    `),
+    presenceListLive: db.prepare(`
+      SELECT nickname, sheet, cell, updated_at
+      FROM admin._presence
+      WHERE updated_at >= @since
+      ORDER BY updated_at DESC
+    `),
+    presenceCleanup: db.prepare(`DELETE FROM admin._presence WHERE updated_at < @cutoff`),
+
+    lockAcquire: db.prepare(`
+      INSERT INTO admin._locks(cell, by, updated_at)
+      VALUES(@cell, @by, @updated_at)
+      ON CONFLICT(cell) DO UPDATE SET by=excluded.by, updated_at=excluded.updated_at
+    `),
+    lockReleaseBy: db.prepare(`DELETE FROM admin._locks WHERE by=@by`),
+    lockCleanup: db.prepare(`DELETE FROM admin._locks WHERE updated_at < @cutoff`),
+
+    auditInsert: db.prepare(`
+      INSERT INTO admin._audit_log(ts, user, table_name, row_key, column, old_value, new_value, row_version)
+      VALUES(@ts, @user, @table_name, @row_key, @column, @old_value, @new_value, @row_version)
+    `),
+    auditSince: db.prepare(`
+      SELECT ts, user, table_name, row_key, column, old_value, new_value, row_version
+      FROM admin._audit_log
+      WHERE row_version > @since
+      ORDER BY row_version ASC
+    `),
+
+    // data helpers
+    selectPk: (table: string) => {
+      const rows = db.prepare(`PRAGMA table_info(${escapeIdent(table)})`).all() as Array<{ name: string; pk: number }>;
+      return rows.find(c => (c.pk | 0) > 0)?.name ?? 'id';
+    },
+    tableInfo: (table: string) => {
+      return db.prepare(`PRAGMA table_info(${escapeIdent(table)})`).all() as Array<{
+        name: string; type: string | null; notnull: number; pk: number;
+      }>;
+    },
+    selectRowByPk: (table: string, pkName: string, id: string) => {
+      return db.prepare(`SELECT * FROM ${escapeIdent(table)} WHERE ${escapeIdent(pkName)}=@id LIMIT 1`).get({ id });
+    },
+  };
+
+  const bundle: DBBundle = { project, db, stmts };
+  dbCache.set(project, bundle);
+  return bundle;
+}
+
+function closeAll() {
+  for (const [, b] of dbCache) { try { b.db.close(); } catch { } }
+  dbCache.clear();
+}
+
+function nextRowVersion(bundle: DBBundle): number {
+  const cur = bundle.stmts.selectMaxVersion.get() as { v: number } | undefined;
+  const next = ((cur?.v ?? 0) | 0) + 1;
+  bundle.stmts.setMetaVersion.run({ v: String(next) });
+  return next;
+}
+
+// ────────────────────────────────────────────────────────────
+// GraphQL Schema
+// ────────────────────────────────────────────────────────────
+const typeDefs = /* GraphQL */ `
+  scalar JSON
+
+  type Patch {
+    table: String!
+    row_key: String!
+    row_version: Int!
+    deleted: Int!
+    cells: JSON!
+  }
+
+  type RowsResult {
+    max_row_version: Int!
+    patches: [Patch!]!
+  }
+
+  type UpsertResult {
+    max_row_version: Int!
+    errors: [String!]
+    conflicts: [Conflict!]
+  }
+
+  type Conflict {
+    table: String!
+    row_key: String!
+    column: String!
+    message: String
+  }
+
+  type PresenceItem {
+    nickname: String!
+    sheet: String
+    cell: String
+    updated_at: Float
+  }
+
+  type ColumnInfo {
+    name: String!
+    type: String!
+    notnull: Boolean!
+    pk: Boolean!
+  }
+
+  type Ok { ok: Boolean! }
+
+  type Audit {
+    ts: Float!
+    user: String!
+    table: String!
+    row_key: String!
+    column: String
+    old_value: String
+    new_value: String
+    row_version: Int!
+  }
+
+  input CellEditInput {
+    table: String!
+    row_key: String!
+    column: String!
+    value: String
+  }
+
+  input ColumnDefInput {
+    name: String!
+    type: String
+    notNull: Boolean
+    check: String
+  }
+
+  type Query {
+    ping: Float!
+    rows(since_version: Int, table: String, project: String): RowsResult!
+    meta(project: String): JSON
+    audit_log(since_version: Int, project: String): [Audit!]!
+    presence(project: String): [PresenceItem!]!
+    tableColumns(table: String!, project: String): [ColumnInfo!]!
+    exportDatabase(project: String): String
+    health: String!
+  }
+
+  type Mutation {
+    upsertCells(cells: [CellEditInput!]!, project: String): UpsertResult!
+    upsertRows(table: String!, rows: [JSON!]!, project: String): UpsertResult!
+    createTable(table: String!, key: String!, project: String): Ok!
+    addColumns(table: String!, columns: [ColumnDefInput!]!, project: String): Ok!
+    dropColumns(table: String!, names: [String!]!, project: String): Ok!
+    deleteRows(table: String!, keys: [String!]!, hard: Boolean, project: String): Ok!
+    presenceTouch(nickname: String!, sheet: String, cell: String, project: String): Ok!
+    acquireLock(cell: String!, by: String!, project: String): Ok!
+    releaseLocksBy(by: String!, project: String): Ok!
+  }
+
+  type Subscription {
+    events: RowsResult!
+  }
+`;
+
+// ────────────────────────────────────────────────────────────
+// PubSub (타입: 이벤트당 단일 인자 튜플)
+// ────────────────────────────────────────────────────────────
+type Patch = { table: string; row_key: string; row_version: number; deleted: number; cells: Record<string, unknown> };
+type RowsResult = { max_row_version: number; patches: Patch[] };
+
+const pubsub = createPubSub<{ 'rows-events': [RowsResult] }>();
+
+async function publishEvents(bundle: DBBundle, since: number) {
+  const rows = bundle.stmts.selectEventsSince.all({ since }) as Array<{
+    row_version: number; table_name: string; row_key: string; deleted: number; cells: string;
+  }>;
+  const patches: Patch[] = rows.map(r => ({
+    table: r.table_name,
+    row_key: r.row_key,
+    row_version: r.row_version,
+    deleted: r.deleted | 0,
+    cells: JSON.parse(r.cells || '{}'),
+  }));
+  const mv = bundle.stmts.selectMaxVersion.get() as { v: number };
+  const maxRow = (mv?.v ?? 0) | 0;
+  await pubsub.publish('rows-events', { max_row_version: maxRow, patches });
+}
+
+// ────────────────────────────────────────────────────────────
+// Resolvers
+// ────────────────────────────────────────────────────────────
+const resolvers = {
+  JSON: GraphQLJSON,
+
+  Query: {
+    ping: () => nowMs(),
+
+    rows: (_: unknown, args: { since_version?: number; table?: string; project?: string }) => {
+      const bundle = openBundle(args.project);
+      const since = capInt32(Number(args.since_version ?? 0));
+      const list = bundle.stmts.selectEventsSince.all({ since }) as Array<{
+        row_version: number; table_name: string; row_key: string; deleted: number; cells: string;
+      }>;
+      const patches: Patch[] = list
+        .filter(r => (args.table ? r.table_name === args.table : true))
+        .map(r => ({
+          table: r.table_name, row_key: r.row_key, row_version: r.row_version,
+          deleted: r.deleted | 0, cells: JSON.parse(r.cells || '{}'),
+        }));
+      const mv = bundle.stmts.selectMaxVersion.get() as { v: number };
+      const max = (mv?.v ?? 0) | 0;
+      return { max_row_version: max, patches };
+    },
+
+    meta: (_: unknown, args: { project?: string }) => {
+      const bundle = openBundle(args.project);
+      const mv = bundle.stmts.selectMaxVersion.get() as { v: number };
+      const tables = bundle.db
+        .prepare(`
+          SELECT name FROM sqlite_master
+          WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_%'
+          ORDER BY name`)
+        .all() as Array<{ name: string }>;
+      const schema = tables.map(t => {
+        const info = bundle.stmts.tableInfo(t.name);
+        const pk = info.find(c => (c.pk | 0) > 0)?.name ?? 'id';
+        return { table_name: t.name, key_column: pk };
+      });
+      const max = (mv?.v ?? 0) | 0;
+      return { meta: { max_row_version: String(max) }, schema };
+    },
+
+    audit_log: (_: unknown, args: { since_version?: number; project?: string }) => {
+      const bundle = openBundle(args.project);
+      const since = capInt32(Number(args.since_version ?? 0));
+      const rows = bundle.stmts.auditSince.all({ since }) as Array<{
+        ts: number; user: string; table_name: string; row_key: string; column: string | null;
+        old_value: string | null; new_value: string | null; row_version: number;
+      }>;
+      return rows.map(r => ({
+        ts: r.ts, user: r.user, table: r.table_name, row_key: r.row_key,
+        column: r.column, old_value: r.old_value, new_value: r.new_value,
+        row_version: r.row_version | 0,
+      }));
+    },
+
+    presence: (_: unknown, args: { project?: string }) => {
+      const bundle = openBundle(args.project);
+      const since = nowMs() - PRESENCE_TTL_MS;
+      const rows = bundle.stmts.presenceListLive.all({ since }) as Array<{
+        nickname: string; sheet: string | null; cell: string | null; updated_at: number;
+      }>;
+      return rows.map(r => ({ nickname: r.nickname, sheet: r.sheet, cell: r.cell, updated_at: r.updated_at }));
+    },
+
+    tableColumns: (_: unknown, args: { table: string; project?: string }) => {
+      const bundle = openBundle(args.project);
+      const info = bundle.stmts.tableInfo(args.table);
+      return info.map(c => ({ name: c.name, type: c.type ?? '', notnull: !!(c.notnull | 0), pk: !!(c.pk | 0) }));
+    },
+
+    exportDatabase: (_: unknown, args: { project?: string }) => {
+      const project = normalizeProject(args.project);
+      const buf = fs.readFileSync(dataPath(project));
+      return buf.toString('base64');
+    },
+
+    health: () => 'ok',
   },
-});
 
-const GqlUpsertResult = new GraphQLObjectType({
-  name: "UpsertResult",
-  fields: {
-    max_row_version: { type: new GraphQLNonNull(GraphQLInt) },
-    errors: { type: new GraphQLList(GraphQLString) },
-    conflicts: {
-      type: new GraphQLList(new GraphQLObjectType({
-        name: "Conflict",
-        fields: {
-          table: { type: GraphQLString },
-          row_key: { type: GraphQLString },
-          column: { type: GraphQLString },
-          message: { type: GraphQLString },
-          server_version: { type: GraphQLInt },
-          local_version: { type: GraphQLInt },
-          sheet: { type: GraphQLString },
-          address: { type: GraphQLString },
-          type: { type: GraphQLString },
+  Mutation: {
+    presenceTouch: (_: unknown, args: { nickname: string; sheet?: string; cell?: string; project?: string }) => {
+      if (READONLY) return { ok: true };
+      const bundle = openBundle(args.project);
+      bundle.stmts.presenceUpsert.run({
+        nickname: args.nickname, sheet: args.sheet ?? null, cell: args.cell ?? null, updated_at: nowMs(),
+      });
+      return { ok: true };
+    },
+
+    acquireLock: (_: unknown, args: { cell: string; by: string; project?: string }) => {
+      if (READONLY) return { ok: true };
+      const bundle = openBundle(args.project);
+      bundle.stmts.lockAcquire.run({ cell: args.cell, by: args.by, updated_at: nowMs() });
+      return { ok: true };
+    },
+
+    releaseLocksBy: (_: unknown, args: { by: string; project?: string }) => {
+      if (READONLY) return { ok: true };
+      const bundle = openBundle(args.project);
+      bundle.stmts.lockReleaseBy.run({ by: args.by });
+      return { ok: true };
+    },
+
+    createTable: (_: unknown, args: { table: string; key: string; project?: string }) => {
+      if (READONLY) return { ok: true };
+      const bundle = openBundle(args.project);
+      const sql = `
+        CREATE TABLE IF NOT EXISTS ${escapeIdent(args.table)} (
+          ${escapeIdent(args.key)} TEXT PRIMARY KEY,
+          row_version INTEGER NOT NULL DEFAULT 0,
+          updated_at  REAL    NOT NULL DEFAULT (strftime('%s','now') * 1000),
+          deleted     INTEGER NOT NULL DEFAULT 0
+        )`;
+      bundle.db.exec(sql);
+      return { ok: true };
+    },
+
+    addColumns: (_: unknown, args: { table: string; columns: Array<{ name: string; type?: string; notNull?: boolean; check?: string }>; project?: string }) => {
+      if (READONLY) return { ok: true };
+      const bundle = openBundle(args.project);
+      const cols = args.columns.map(c => ({
+        name: c.name,
+        type: (c.type ?? '').trim(),
+        notnull: !!(c as any).notnull || !!c.notNull,
+        check: (c.check ?? '').trim(),
+      }));
+      const exists = bundle.stmts.tableInfo(args.table).map(x => x.name);
+      const existSet = new Set(exists);
+
+      const tx = bundle.db.transaction(() => {
+        for (const c of cols) {
+          if (!c.name) continue;
+          if (existSet.has(c.name)) continue;
+          try {
+            let ddl = `ALTER TABLE ${escapeIdent(args.table)} ADD COLUMN ${escapeIdent(c.name)}`;
+            ddl += c.type ? ` ${c.type}` : '';
+            if (c.check) ddl += ` CHECK(${c.check})`;
+            bundle.db.exec(ddl);
+          } catch (e: any) {
+            throw new Error(`addColumns failed for "${args.table}.${c.name}": ${e?.message ?? e}`);
+          }
         }
-      }))
-    }
-  }
-});
+      });
+      tx();
+      return { ok: true };
+    },
 
-const GqlRowsResult = new GraphQLObjectType({
-  name: "RowsResult",
-  fields: {
-    max_row_version: { type: new GraphQLNonNull(GraphQLInt) },
-    patches: { type: new GraphQLList(GqlPatch) },
-  }
-});
+    dropColumns: (_: unknown, args: { table: string; names: string[]; project?: string }) => {
+      if (READONLY) return { ok: true };
+      const bundle = openBundle(args.project);
+      for (const n of args.names) {
+        try {
+          bundle.db.exec(`ALTER TABLE ${escapeIdent(args.table)} DROP COLUMN ${escapeIdent(n)}`);
+        } catch { /* ignore for old SQLite or constraints */ }
+      }
+      return { ok: true };
+    },
 
-const GqlOk = new GraphQLObjectType({
-  name: "Ok",
-  fields: { ok: { type: new GraphQLNonNull(GraphQLBoolean) } }
-});
+    deleteRows: (_: unknown, args: { table: string; keys: string[]; hard?: boolean; project?: string }) => {
+      if (READONLY) return { ok: true };
+      const bundle = openBundle(args.project);
+      const info = bundle.stmts.tableInfo(args.table);
+      const pk = info.find(c => (c.pk | 0) > 0)?.name ?? 'id';
 
-const GqlPresence = new GraphQLObjectType({
-  name: "Presence",
-  fields: {
-    nickname: { type: new GraphQLNonNull(GraphQLString) },
-    sheet: { type: GraphQLString },
-    cell: { type: GraphQLString },
-    updated_at: { type: new GraphQLNonNull(GraphQLInt) },
-  }
-});
+      const tx = bundle.db.transaction(() => {
+        for (const id of args.keys) {
+          const rv = nextRowVersion(bundle);
+          const ts = nowMs();
 
-const GqlAudit = new GraphQLObjectType({
-  name: "Audit",
-  fields: {
-    ts: { type: new GraphQLNonNull(GraphQLInt) },
-    user: { type: GraphQLString },
-    table: { type: GraphQLString },
-    row_key: { type: GraphQLString },
-    column: { type: GraphQLString },
-    old_value: { type: GraphQLString },
-    new_value: { type: GraphQLString },
-    row_version: { type: GraphQLInt },
-  }
-});
+          if (args.hard) {
+            bundle.db.prepare(`DELETE FROM ${escapeIdent(args.table)} WHERE ${escapeIdent(pk)}=@id`).run({ id });
+          } else {
+            bundle.db.prepare(
+              `UPDATE ${escapeIdent(args.table)} SET deleted=1, row_version=@rv, updated_at=@ts WHERE ${escapeIdent(pk)}=@id`
+            ).run({ id, rv, ts });
+          }
+          bundle.stmts.insertEvent.run({
+            row_version: rv, table_name: args.table, row_key: id, deleted: 1, cells: JSON.stringify({}),
+          });
+          bundle.stmts.auditInsert.run({
+            ts, user: 'excel', table_name: args.table, row_key: id,
+            column: 'deleted', old_value: args.hard ? '0' : '0',
+            new_value: args.hard ? 'HARD_DELETE' : '1', row_version: rv,
+          });
+        }
+      });
+      tx();
 
-// Input types
-const CellEditInputType = new GraphQLInputObjectType({
-  name: "CellEditInput",
-  fields: {
-    table: { type: new GraphQLNonNull(GraphQLString) },
-    row_key: { type: new GraphQLNonNull(GraphQLString) },
-    column: { type: new GraphQLNonNull(GraphQLString) },
-    value: { type: GraphQLJSON },
-  }
-});
+      const mv = bundle.stmts.selectMaxVersion.get() as { v: number };
+      const maxRow = (mv?.v ?? 0) | 0;
+      publishEvents(bundle, Math.max(0, maxRow - BROADCAST_BACKSCAN)).catch(() => { });
+      return { ok: true };
+    },
 
-const ColumnDefInputType = new GraphQLInputObjectType({
-  name: "ColumnDefInput",
-  fields: {
-    name: { type: new GraphQLNonNull(GraphQLString) },
-    kind: { type: GraphQLString },
-    notNull: { type: GraphQLBoolean },
-    check: { type: GraphQLString },
-  }
-});
+    upsertCells: (_: unknown, args: { cells: Array<{ table: string; row_key: string; column: string; value?: string | null }>; project?: string }) => {
+      const bundle = openBundle(args.project);
+      if (READONLY) {
+        const mv = bundle.stmts.selectMaxVersion.get() as { v: number };
+        return { max_row_version: (mv?.v ?? 0) | 0, errors: ['READONLY'], conflicts: null };
+      }
 
-// ========================= PubSub =========================
-type ServerEventPayload = { max_row_version: number; patches: any[] };
-const pubsub = createPubSub<{ events: [ServerEventPayload] }>();
+      const errors: string[] = [];
+      const conflicts: Array<{ table: string; row_key: string; column: string; message: string }> = [];
 
-// ========================= Mutations/Queries =========================
-function upsertCells(cells: CellEditInput[]) {
-  const errors: string[] = [];
-  const byTable = new Map<string, Map<string, Record<string, any>>>();
+      const grouped = new Map<string, Array<{ column: string; value: any }>>();
+      const keyMap = new Map<string, { table: string; row_key: string }>();
+      for (const c of args.cells) {
+        if (!c.table || !c.row_key || !c.column) continue;
+        const key = `${c.table}::${c.row_key}`;
+        if (!grouped.has(key)) grouped.set(key, []);
+        grouped.get(key)!.push({ column: c.column, value: c.value ?? null });
+        keyMap.set(key, { table: c.table, row_key: c.row_key });
+      }
 
-  // group by (table, row_key)
-  for (const c of cells) {
-    if (!byTable.has(c.table)) byTable.set(c.table, new Map());
-    const map = byTable.get(c.table)!;
-    const key = String(c.row_key);
-    const row = map.get(key) ?? {};
-    row[c.column] = c.value;
-    map.set(key, row);
-  }
+      const tx = bundle.db.transaction(() => {
+        for (const [k, edits] of grouped) {
+          const { table, row_key } = keyMap.get(k)!;
+          const info = bundle.stmts.tableInfo(table);
+          const colSet = new Set(info.map(x => x.name));
+          const pk = info.find(c => (c.pk | 0) > 0)?.name ?? 'id';
 
-  const patches: any[] = [];
-  const tx = db.transaction(() => {
-    for (const [table, rowsMap] of byTable) {
-      // auto-create table + columns
-      const keyCol = ensureTableIfMissing(table, DEFAULT_KEY);
-      const sample: Record<string, any> = {};
-      for (const values of rowsMap.values())
-        for (const [col, val] of Object.entries(values))
-          if (!(col in sample)) sample[col] = val;
-      ensureColumnsForSamples(table, sample, keyCol);
+          const before = bundle.stmts.selectRowByPk(table, pk, row_key) ?? null;
 
-      // upsert
-      for (const [rowKey, values] of rowsMap) {
-        const rv = nextRowVersion();
-        const now = Date.now();
+          const cols = Array.from(new Set(edits.map(e => e.column))).filter(c => colSet.has(c));
+          const kv: Record<string, any> = {};
+          for (const e of edits) if (colSet.has(e.column)) kv[e.column] = e.value;
 
-        const old = db.prepare(`SELECT * FROM "${table}" WHERE "${keyCol}"=?`).get(rowKey) as any;
+          const exists = !!bundle.stmts.selectRowByPk(table, pk, row_key);
+          const rv = nextRowVersion(bundle);
+          const ts = nowMs();
 
-        db.prepare(
-          `INSERT INTO "${table}"("${keyCol}",row_version,updated_at,deleted) VALUES (?,?,?,0)
-           ON CONFLICT("${keyCol}") DO NOTHING`
-        ).run(rowKey, rv, now);
-
-        db.prepare(`DELETE FROM _tombstones WHERE table_name=? AND row_key=?`).run(table, rowKey);
-
-        const cols = Object.keys(values);
-        if (cols.length) {
-          const sets = cols.map(c => `"${c}"=?`).join(", ");
-          const vals = cols.map(c => keepValueForStore((values as any)[c]));
-          db.prepare(
-            `UPDATE "${table}" SET ${sets}, row_version=?, updated_at=?, deleted=0 WHERE "${keyCol}"=?`
-          ).run(...vals, rv, now, rowKey);
+          if (exists) {
+            if (cols.length > 0) {
+              const sets = [...cols.map(c => `${escapeIdent(c)}=@${c}`), `row_version=@row_version`, `updated_at=@updated_at`];
+              const sql = `UPDATE ${escapeIdent(table)} SET ${sets.join(', ')} WHERE ${escapeIdent(pk)}=@id`;
+              bundle.db.prepare(sql).run({ ...kv, id: row_key, row_version: rv, updated_at: ts });
+            } else {
+              bundle.db.prepare(
+                `UPDATE ${escapeIdent(table)} SET row_version=@row_version, updated_at=@updated_at WHERE ${escapeIdent(pk)}=@id`
+              ).run({ id: row_key, row_version: rv, updated_at: ts });
+            }
+          } else {
+            const allCols = [pk, ...cols, 'row_version', 'updated_at', 'deleted'];
+            const placeholders = allCols.map(c => `@${c}`);
+            const p: any = { [pk]: row_key, row_version: rv, updated_at: ts, deleted: 0 };
+            for (const c of cols) p[c] = kv[c];
+            const sql = `INSERT INTO ${escapeIdent(table)}(${allCols.map(escapeIdent).join(', ')}) VALUES(${placeholders.join(', ')})`;
+            bundle.db.prepare(sql).run(p);
+          }
 
           for (const c of cols) {
-            const oldv = old ? old[c] : null;
-            const newv = (values as any)[c];
-            db.prepare(`INSERT INTO _audit(ts,user,table_name,row_key,column_name,old_value,new_value,row_version)
-                        VALUES(?,?,?,?,?,?,?,?)`)
-              .run(now, null, table, rowKey, c,
-                oldv !== undefined ? String(oldv) : null,
-                keepValueForStore(newv) !== null ? String(keepValueForStore(newv)) : null,
-                rv);
+            const oldVal = before ? (before[c] != null ? String(before[c]) : null) : null;
+            const newVal = kv[c] != null ? String(kv[c]) : null;
+            bundle.stmts.auditInsert.run({
+              ts, user: 'excel', table_name: table, row_key, column: c, old_value: oldVal, new_value: newVal, row_version: rv,
+            });
           }
+
+          bundle.stmts.insertEvent.run({
+            row_version: rv, table_name: table, row_key, deleted: 0, cells: JSON.stringify(kv),
+          });
         }
+      });
 
-        const rowFull = db.prepare(`SELECT * FROM "${table}" WHERE "${keyCol}"=?`).get(rowKey) as any;
-        patches.push({
-          table,
-          row_key: String(rowKey),
-          row_version: rowFull.row_version,
-          deleted: !!rowFull.deleted,
-          cells: rowToCells(rowFull, keyCol),
-        });
+      try { tx(); } catch (e: any) { errors.push(String(e?.message ?? e)); }
+
+      const mv = bundle.stmts.selectMaxVersion.get() as { v: number };
+      const maxRow = (mv?.v ?? 0) | 0;
+      publishEvents(bundle, Math.max(0, maxRow - BROADCAST_BACKSCAN)).catch(() => { });
+      return { max_row_version: maxRow, errors: errors.length ? errors : null, conflicts: conflicts.length ? conflicts : null };
+    },
+
+    upsertRows: (_: unknown, args: { table: string; rows: Array<Record<string, any>>; project?: string }) => {
+      const bundle = openBundle(args.project);
+      if (READONLY) {
+        const mv = bundle.stmts.selectMaxVersion.get() as { v: number };
+        return { max_row_version: (mv?.v ?? 0) | 0, errors: ['READONLY'], conflicts: null };
       }
-    }
-  });
 
-  try { tx(); }
-  catch (e: unknown) { errors.push(e instanceof Error ? e.message : String(e)); }
+      const table = args.table;
+      const info = bundle.stmts.tableInfo(table);
+      const pk = info.find(c => (c.pk | 0) > 0)?.name ?? 'id';
+      const colSet = new Set(info.map(x => x.name));
+      const errors: string[] = [];
 
-  if (patches.length) {
-    const r = getMaxRowVersion.get();
-    pubsub.publish("events", { max_row_version: Number(r?.v ?? 0), patches });
-  }
+      const tx2 = bundle.db.transaction(() => {
+        for (const row of args.rows) {
+          const row_key = String(row[pk] ?? '');
+          if (!row_key) continue;
 
-  return {
-    max_row_version: Number(getMaxRowVersion.get()?.v ?? 0),
-    errors,
-    conflicts: [] as any[],
-  };
-}
+          const before = bundle.stmts.selectRowByPk(table, pk, row_key) ?? null;
+          const cols = Object.keys(row).filter(c => c !== pk && colSet.has(c));
+          const kv: Record<string, any> = {};
+          for (const c of cols) kv[c] = row[c];
 
-function upsertRows(table: string, rows: any[]) {
-  const keyCol = ensureTableIfMissing(table, DEFAULT_KEY);
+          const exists = !!bundle.stmts.selectRowByPk(table, pk, row_key);
+          const rv = nextRowVersion(bundle);
+          const ts = nowMs();
 
-  const sample: Record<string, any> = {};
-  for (const r of rows)
-    for (const [k, v] of Object.entries(r))
-      if (k !== keyCol && !(k in sample)) sample[k] = v;
-  ensureColumnsForSamples(table, sample, keyCol);
-
-  const cells: CellEditInput[] = [];
-  for (const r of rows) {
-    const rk = (r as any)[keyCol];
-    if (rk === undefined || rk === null) continue;
-    for (const [col, val] of Object.entries(r)) {
-      if (col === keyCol) continue;
-      cells.push({ table, row_key: String(rk), column: col, value: val });
-    }
-  }
-  return upsertCells(cells);
-}
-
-function deleteRow(table: string, row_key: string) {
-  const keyCol = getKeyCol(table);
-  const rv = nextRowVersion();
-  const now = Date.now();
-  const updateRes = db.prepare(
-    `UPDATE "${table}" SET deleted=1, row_version=?, updated_at=? WHERE "${keyCol}"=?`
-  ).run(rv, now, row_key);
-
-  let rowFull: any | undefined;
-  if ((updateRes.changes ?? 0) > 0) {
-    db.prepare(`DELETE FROM _tombstones WHERE table_name=? AND row_key=?`).run(table, row_key);
-    rowFull = db.prepare(`SELECT * FROM "${table}" WHERE "${keyCol}"=?`).get(row_key) as any | undefined;
-  } else {
-    db.prepare(
-      `INSERT INTO _tombstones(table_name,row_key,row_version,created_at)
-       VALUES(?,?,?,?)
-       ON CONFLICT(table_name,row_key) DO UPDATE SET row_version=excluded.row_version, created_at=excluded.created_at`
-    ).run(table, row_key, rv, now);
-  }
-
-  const patch: PatchRecord = {
-    table,
-    row_key: String(row_key),
-    row_version: rowFull ? Number(rowFull.row_version) : rv,
-    deleted: true,
-    cells: rowFull ? rowToCells(rowFull, keyCol) : {} as Record<string, any>,
-  };
-
-  const maxRowVersion = Number(getMaxRowVersion.get()?.v ?? rv);
-  pubsub.publish("events", { max_row_version: maxRowVersion, patches: [patch] });
-  return true;
-}
-
-// ========================= GraphQL schema =========================
-const Query = new GraphQLObjectType({
-  name: "Query",
-  fields: {
-    ping: { // 연결상태 확인용(부작용 없음)
-      type: new GraphQLNonNull(GraphQLInt),
-      resolve: () => Date.now()
-    },
-    rows: {
-      args: { since_version: { type: new GraphQLNonNull(GraphQLInt) } },
-      type: new GraphQLNonNull(GqlRowsResult),
-      resolve: (_src, { since_version }: { since_version: number }) => {
-        const tables = db.prepare(`SELECT table_name FROM _schema`).all() as any[];
-        const patches = tables.flatMap(t => readSince(String(t.table_name), since_version));
-        const max = Number(getMaxRowVersion.get()?.v ?? 0);
-        return { max_row_version: max, patches };
-      },
-    },
-    presence: {
-      type: new GraphQLNonNull(new GraphQLList(GqlPresence)),
-      resolve: () => db.prepare(`SELECT nickname, sheet, cell, updated_at FROM _presence ORDER BY nickname`).all(),
-    },
-    audit_log: {
-      args: { since_version: { type: GraphQLInt } },
-      type: new GraphQLList(GqlAudit),
-      resolve: (_src, { since_version }: { since_version?: number }) => {
-        if (since_version && since_version > 0) {
-          return db.prepare<[number], any>(`SELECT ts,user,table_name AS table,row_key,column_name AS column,old_value,new_value,row_version
-                              FROM _audit WHERE row_version > ? ORDER BY id`).all(since_version);
-        }
-        return db.prepare(`SELECT ts,user,table_name AS table,row_key,column_name AS column,old_value,new_value,row_version
-                           FROM _audit ORDER BY id`).all();
-      }
-    },
-    exportDatabase: {
-      type: GraphQLString,
-      resolve: () => fs.readFileSync(DB_PATH).toString("base64")
-    },
-    meta: {
-      type: GraphQLJSON,
-      resolve: () => {
-        const m = db.prepare(`SELECT k,v FROM _meta`).all() as any[];
-        const s = db.prepare(`SELECT table_name,key_column FROM _schema`).all() as any[];
-        return { meta: Object.fromEntries(m.map(r => [r.k, r.v])), schema: s };
-      }
-    },
-    tableColumns: {
-      args: { table: { type: new GraphQLNonNull(GraphQLString) } },
-      type: new GraphQLNonNull(new GraphQLList(new GraphQLNonNull(GqlColumnInfo))),
-      resolve: (_src, { table }: { table: string }) => {
-        const rows = db.prepare(`PRAGMA table_info("${table}")`).all() as any[];
-        return rows.map(r => ({
-          name: String(r.name),
-          type: r.type ? String(r.type) : null,
-          notnull: Number(r.notnull) === 1,
-          pk: Number(r.pk) >= 1
-        }));
-      }
-    }
-  }
-});
-
-const Mutation = new GraphQLObjectType({
-  name: "Mutation",
-  fields: {
-    upsertCells: {
-      args: {
-        cells: { type: new GraphQLNonNull(new GraphQLList(new GraphQLNonNull(CellEditInputType))) }
-      },
-      type: new GraphQLNonNull(GqlUpsertResult),
-      resolve: (_src, { cells }: { cells: CellEditInput[] }) => upsertCells(cells)
-    },
-    upsertRows: {
-      args: {
-        table: { type: new GraphQLNonNull(GraphQLString) },
-        rows: { type: new GraphQLNonNull(new GraphQLList(GraphQLJSON)) }
-      },
-      type: new GraphQLNonNull(GqlUpsertResult),
-      resolve: (_src, { table, rows }: { table: string; rows: any[] }) => upsertRows(table, rows)
-    },
-    createTable: {
-      args: { table: { type: new GraphQLNonNull(GraphQLString) }, key: { type: new GraphQLNonNull(GraphQLString) } },
-      type: new GraphQLNonNull(GqlOk),
-      resolve: (_src, { table, key }: { table: string; key: string }) => {
-        ensureTable(table, key);
-        return { ok: true };
-      }
-    },
-    addColumns: {
-      args: {
-        table: { type: new GraphQLNonNull(GraphQLString) },
-        columns: { type: new GraphQLNonNull(new GraphQLList(new GraphQLNonNull(ColumnDefInputType))) }
-      },
-      type: new GraphQLNonNull(GqlOk),
-      resolve: (_src, { table, columns }: { table: string; columns: ColumnDefInput[] }) => {
-        addColumns(table, columns);
-        return { ok: true };
-      }
-    },
-    presenceTouch: {
-      args: {
-        nickname: { type: new GraphQLNonNull(GraphQLString) },
-        sheet: { type: GraphQLString },
-        cell: { type: GraphQLString }
-      },
-      type: new GraphQLNonNull(GqlOk),
-      resolve: (_src, { nickname, sheet, cell }: { nickname: string; sheet?: string; cell?: string }) => {
-        const now = Date.now();
-        db.prepare(`INSERT INTO _presence(nickname,sheet,cell,updated_at)
-                    VALUES(?,?,?,?)
-                    ON CONFLICT(nickname) DO UPDATE SET sheet=excluded.sheet, cell=excluded.cell, updated_at=excluded.updated_at`)
-          .run(nickname, sheet ?? null, cell ?? null, now);
-        return { ok: true };
-      }
-    },
-    acquireLock: {
-      args: { cell: { type: new GraphQLNonNull(GraphQLString) }, by: { type: new GraphQLNonNull(GraphQLString) } },
-      type: new GraphQLNonNull(GqlOk),
-      resolve: (_src, { cell, by }: { cell: string; by: string }) => {
-        const now = Date.now();
-        const ttlMs = 10000;
-        const row = db.prepare<[string], any>(`SELECT by,ts FROM _locks WHERE cell=?`).get(cell);
-        if (row) {
-          if (now - Number(row.ts) > ttlMs) {
-            db.prepare(`UPDATE _locks SET by=?, ts=? WHERE cell=?`).run(by, now, cell);
-            return { ok: true };
+          if (exists) {
+            if (cols.length > 0) {
+              const sets = [...cols.map(c => `${escapeIdent(c)}=@${c}`), `row_version=@row_version`, `updated_at=@updated_at`];
+              const sql = `UPDATE ${escapeIdent(table)} SET ${sets.join(', ')} WHERE ${escapeIdent(pk)}=@id`;
+              bundle.db.prepare(sql).run({ ...kv, id: row_key, row_version: rv, updated_at: ts });
+            } else {
+              bundle.db.prepare(
+                `UPDATE ${escapeIdent(table)} SET row_version=@row_version, updated_at=@updated_at WHERE ${escapeIdent(pk)}=@id`
+              ).run({ id: row_key, row_version: rv, updated_at: ts });
+            }
+          } else {
+            const allCols = [pk, ...cols, 'row_version', 'updated_at', 'deleted'];
+            const placeholders = allCols.map(c => `@${c}`);
+            const p: any = { [pk]: row_key, row_version: rv, updated_at: ts, deleted: 0 };
+            for (const c of cols) p[c] = kv[c];
+            const sql = `INSERT INTO ${escapeIdent(table)}(${allCols.map(escapeIdent).join(', ')}) VALUES(${placeholders.join(', ')})`;
+            bundle.db.prepare(sql).run(p);
           }
-          return { ok: false };
-        } else {
-          db.prepare(`INSERT INTO _locks(cell,by,ts) VALUES(?,?,?)`).run(cell, by, now);
-          return { ok: true };
-        }
-      }
-    },
-    releaseLocksBy: {
-      args: { by: { type: new GraphQLNonNull(GraphQLString) } },
-      type: new GraphQLNonNull(GqlOk),
-      resolve: (_src, { by }: { by: string }) => {
-        db.prepare<[string]>(`DELETE FROM _locks WHERE by=?`).run(by);
-        return { ok: true };
-      }
-    },
-    dropColumns: {
-      args: {
-        table: { type: new GraphQLNonNull(GraphQLString) },
-        names: { type: new GraphQLNonNull(new GraphQLList(new GraphQLNonNull(GraphQLString))) }
-      },
-      type: new GraphQLNonNull(GqlOk),
-      resolve: (_src, { table, names }: { table: string; names: string[] }) => {
-        if (!names.length) return { ok: true };
-        const tx = db.transaction(() => {
-          for (const n of names) {
-            // SQLite 3.35+ 지원: DROP COLUMN
-            db.exec(`ALTER TABLE "${table}" DROP COLUMN "${n}"`);
-          }
-        });
-        tx();
-        return { ok: true };
-      }
-    },
-    deleteRow: {
-      args: {
-        table: { type: new GraphQLNonNull(GraphQLString) },
-        row_key: { type: new GraphQLNonNull(GraphQLString) },
-      },
-      type: new GraphQLNonNull(GqlOk),
-      resolve: (_src, { table, row_key }: { table: string; row_key: string }) => {
-        const ok = deleteRow(table, row_key);
-        return { ok };
-      }
-    },
-  }
-});
 
-const Subscription = new GraphQLObjectType({
-  name: "Subscription",
-  fields: {
+          for (const c of cols) {
+            const oldVal = before ? (before[c] != null ? String(before[c]) : null) : null;
+            const newVal = kv[c] != null ? String(kv[c]) : null;
+            bundle.stmts.auditInsert.run({
+              ts, user: 'excel', table_name: table, row_key, column: c, old_value: oldVal, new_value: newVal, row_version: rv,
+            });
+          }
+
+          bundle.stmts.insertEvent.run({
+            row_version: rv, table_name: table, row_key, deleted: 0, cells: JSON.stringify(kv),
+          });
+        }
+      });
+
+      try { tx2(); } catch (e: any) { errors.push(String(e?.message ?? e)); }
+
+      const mv = bundle.stmts.selectMaxVersion.get() as { v: number };
+      const maxRow = (mv?.v ?? 0) | 0;
+      publishEvents(bundle, Math.max(0, maxRow - BROADCAST_BACKSCAN)).catch(() => { });
+      return { max_row_version: maxRow, errors: errors.length ? errors : null, conflicts: null };
+    },
+  },
+
+  Subscription: {
     events: {
-      type: new GraphQLObjectType({
-        name: "ServerEvent",
-        fields: {
-          max_row_version: { type: new GraphQLNonNull(GraphQLInt) },
-          patches: { type: new GraphQLList(GqlPatch) },
-        }
-      }),
-      subscribe: () => pubsub.subscribe("events"),
-      resolve: (p: any) => p,
+      subscribe: () => pubsub.subscribe('rows-events'),
+      resolve: (payload: RowsResult) => payload,
+    },
+  },
+};
+
+// ────────────────────────────────────────────────────────────
+// Server
+// ────────────────────────────────────────────────────────────
+const schema = createSchema({ typeDefs, resolvers });
+const yoga = createYoga({ schema, logging: true, maskedErrors: false });
+const httpServer = createServer(yoga);
+
+// cleaners
+const cleaners = new Set<NodeJS.Timeout>();
+function startCleaners() {
+  const t = setInterval(() => {
+    for (const [, b] of dbCache) {
+      try {
+        const now = nowMs();
+        b.stmts.presenceCleanup.run({ cutoff: now - PRESENCE_TTL_MS });
+        b.stmts.lockCleanup.run({ cutoff: now - LOCK_TTL_MS });
+      } catch { /* ignore */ }
     }
-  }
+  }, CLEAN_INTERVAL_MS);
+  cleaners.add(t);
+}
+function stopCleaners() { for (const t of cleaners) clearInterval(t); cleaners.clear(); }
+
+httpServer.listen(PORT, () => {
+  startCleaners();
+  console.log(`${new Date().toISOString()} XQLite server ready on :${PORT} (data dir: ${DATA_DIR}) RO=${READONLY ? '1' : '0'}`);
 });
 
-const schema = new GraphQLSchema({ query: Query, mutation: Mutation, subscription: Subscription });
-
-// ========================= Server bootstrap =========================
-const yoga = createYoga({
-  schema,
-  graphqlEndpoint: "/graphql",
-  maskedErrors: false,
-  landingPage: true,
-  graphiql: { subscriptionsProtocol: "WS" },
-});
-
-const server = createServer(yoga);
-const port = Number(process.env.PORT ?? 4000);
-
-server.listen(port, () => {
-  console.log(`✅ XQLite GraphQL up`);
-  console.log(`   HTTP/UI : http://localhost:${port}/graphql`);
-  console.log(`   WS      : ws://localhost:${port}/graphql`);
-});
+// graceful shutdown
+function shutdown(code = 0) {
+  try { stopCleaners(); } catch { }
+  try { httpServer.close(() => { }); } catch { }
+  try { closeAll(); } catch { }
+  setTimeout(() => process.exit(code), 200).unref();
+}
+process.on('SIGINT', () => { console.log('SIGINT'); shutdown(0); });
+process.on('SIGTERM', () => { console.log('SIGTERM'); shutdown(0); });
+process.on('uncaughtException', (err) => { console.error('[uncaughtException]', err?.stack || err); });
+process.on('unhandledRejection', (reason) => { console.error('[unhandledRejection]', reason); });
