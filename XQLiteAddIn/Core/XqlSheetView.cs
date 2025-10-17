@@ -809,7 +809,8 @@ namespace XQLite.AddIn
                     {
                         if (p.Deleted || p.Cells == null) continue;
                         foreach (var k in p.Cells.Keys)
-                            if (!string.IsNullOrWhiteSpace(k)) serverCols.Add(k);
+                            if (!string.IsNullOrWhiteSpace(k))
+                                serverCols.Add(k);
                     }
                     var keyName = string.IsNullOrWhiteSpace(smeta.KeyColumn) ? "id" : smeta.KeyColumn!;
                     serverCols.Add(keyName);
@@ -1390,7 +1391,7 @@ namespace XQLite.AddIn
             // 약간 기다렸다가 메인 스레드에서 일괄 재적용 → 깜빡임 최소
             Task.Run(async () =>
             {
-                await Task.Delay(120).ConfigureAwait(false); // 80~150ms 권장
+                await Task.Delay(150).ConfigureAwait(false); // 80~150ms 권장
 
                 ExcelAsyncUtil.QueueAsMacro(() =>
                 {

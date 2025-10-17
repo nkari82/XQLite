@@ -1,5 +1,7 @@
 ﻿// XqlExcelInterop.cs
 using ExcelDna.Integration;
+using Microsoft.Internal.VisualStudio.Shell.Interop;
+using Microsoft.Office.Core;
 using Microsoft.Office.Interop.Excel;
 using System;
 using System.Collections.Generic;
@@ -204,8 +206,10 @@ namespace XQLite.AddIn
 
                                     hdrCell = (Excel.Range)header.Cells[1, hdrIdx];
                                     var colName = (hdrCell.Value2 as string)?.Trim();
+                                    // ✅ 헤더가 비어 있으면 '헤더 셀'의 절대열 기준으로 열 문자 산출 (헤더 시작열이 A가 아닐 수도 있음)
                                     if (string.IsNullOrWhiteSpace(colName))
-                                        colName = XqlCommon.ColumnIndexToLetter(cell.Column);
+                                        colName = XqlCommon.ColumnIndexToLetter(hdrCell.Column);
+
 
                                     int keyAbsCol = XqlSheet.FindKeyColumnAbsolute(header, sm.KeyColumn);
                                     keyCell = sh.Cells[cell.Row, keyAbsCol] as Excel.Range;
@@ -213,16 +217,8 @@ namespace XQLite.AddIn
                                     var rowKeyObj = keyCell?.Value2;
                                     string? rowKey = rowKeyObj?.ToString();
 
-#if false
-                                    if (string.IsNullOrWhiteSpace(rowKey))
-                                    {
-                                        if (!string.Equals(colName, keyColName, StringComparison.OrdinalIgnoreCase))
-                                            continue;
 
-                                        rowKey = Guid.NewGuid().ToString("N").Substring(0, 12);
-                                        if (keyCell != null) keyCell.Value2 = rowKey;
-                                    }
-#else
+#if false
                                     // ✅ 키가 비어 있으면, 수정한 컬럼이 무엇이든 키를 자동 생성해 채운다.
                                     if (string.IsNullOrWhiteSpace(rowKey))
                                     {
@@ -303,13 +299,24 @@ namespace XQLite.AddIn
                 // ③ 서버 컬럼 조회 → '없을 때만' 추가
                 var serverCols = await be.GetTableColumns(table);
                 var serverSet = new HashSet<string>(serverCols.Select(c => c.name), StringComparer.OrdinalIgnoreCase);
-                var addTargets = sm.Columns.Keys.Where(k => !serverSet.Contains(k)).ToList();
+                // ⚠️ 메타(sm.Columns) 대신 실제 시트 헤더(names)로 계산해야 즉시 반영됨
+                var addTargets = names
+                    .Where(k => !string.IsNullOrWhiteSpace(k))
+                    .Where(k => !serverSet.Contains(k))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
 
                 if (addTargets.Count > 0)
                 {
                     var defs = addTargets.Select(name =>
                     {
-                        var ct = sm.Columns[name];
+                        // 헤더가 메타보다 앞설 수 있으므로, 메타에 없으면 TEXT/NULL OK로 즉시 등록
+                        if (!sm.Columns.TryGetValue(name, out var ct))
+                        {
+                            ct = new XqlSheet.ColumnType { Kind = XqlSheet.ColumnKind.Text, Nullable = true };
+                            sm.SetColumn(name, ct);
+                        }
+
                         return new ColumnDef
                         {
                             Name = name,
@@ -340,8 +347,10 @@ namespace XQLite.AddIn
 
                     var drop = serverCols
                         .Where(c => !c.pk && !metaCols.Contains(c.name))
-                        .Select(c => c.name)
+                        .Select(c => c.name?.Trim() ?? "")
+                        .Where(n => n.Length > 0)
                         .Where(n => !headerSet.Contains(n))
+                        .Distinct(StringComparer.OrdinalIgnoreCase)
                         .ToList();
 
                     if (drop.Count > 0)

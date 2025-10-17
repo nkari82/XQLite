@@ -170,7 +170,7 @@ namespace XQLite.AddIn
 
 
         // ── 생성자 ───────────────────────────────────────────────────────────
-        internal XqlGqlBackend(string httpEndpoint, string? apiKey, int heartbeatSec = 3)
+        internal XqlGqlBackend(string httpEndpoint, string? apiKey, string? project = null, int heartbeatSec = 3)
         {
             var httpUri = new Uri(httpEndpoint);
             var wsUri = new UriBuilder(httpUri) { Scheme = httpUri.Scheme == "https" ? "wss" : "ws" }.Uri;
@@ -189,9 +189,27 @@ namespace XQLite.AddIn
                 _ws.HttpClient.DefaultRequestHeaders.Add("x-api-key", apiKey);
             }
 
+            project = (project ?? "").Trim();
+            try
+            {
+                // Header 갱신: 중복 추가 방지 위해 기존 제거 후 추가
+                const string H = "x-project";
+                if (_http.HttpClient.DefaultRequestHeaders.Contains(H))
+                    _http.HttpClient.DefaultRequestHeaders.Remove(H);
+                if (_ws.HttpClient.DefaultRequestHeaders.Contains(H))
+                    _ws.HttpClient.DefaultRequestHeaders.Remove(H);
+                if (!string.IsNullOrEmpty(project))
+                {
+                    _http.HttpClient.DefaultRequestHeaders.Add(H, project);
+                    _ws.HttpClient.DefaultRequestHeaders.Add(H, project);
+                }
+            }
+            catch { /* 무음 */ }
+
             _heartbeat = new Timer(async _ => await SafeHeartbeat(), null, Timeout.Infinite, Timeout.Infinite);
             _ = SafeHeartbeat(); // 즉시 1회
             _heartbeat.Change(TimeSpan.FromSeconds(heartbeatSec), TimeSpan.FromSeconds(heartbeatSec));
+
         }
 
         public void Dispose()
@@ -337,7 +355,7 @@ namespace XQLite.AddIn
                     columns = cols.Select(c => new
                     {
                         name = c.Name,
-                        kind = c.Kind,
+                        type = c.Kind,
                         notNull = c.NotNull,
                         check = c.Check
                     }).ToArray()

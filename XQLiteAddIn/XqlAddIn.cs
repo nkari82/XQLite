@@ -58,8 +58,10 @@ namespace XQLite.AddIn
         {
             try
             {
+                XqlConfig.Load();
+
                 // 1) 백엔드 & 메타
-                _backend = new XqlGqlBackend(XqlConfig.Endpoint, XqlConfig.ApiKey, XqlConfig.HeartbeatSec); // GraphQL 클라이언트(HTTP/WS) 공용 인스턴스
+                _backend = new XqlGqlBackend(XqlConfig.Endpoint, XqlConfig.ApiKey, XqlConfig.Project, XqlConfig.HeartbeatSec); // GraphQL 클라이언트(HTTP/WS) 공용 인스턴스
                 _sheet = new XqlSheet();
 
                 // 2) 동기화/협업/백업

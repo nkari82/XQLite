@@ -133,11 +133,17 @@ namespace XQLite.AddIn
         public void InitPersistentState(string workbookFullName, string? project = null)
         {
             _workbookFullName = workbookFullName;
+            var wbName = Path.GetFileNameWithoutExtension(workbookFullName) ?? "wb";
+
+            var proj = (project ?? XqlConfig.Project ?? "").Trim();
+            if (string.IsNullOrEmpty(proj)) proj = wbName;           // ✅ 비면 워크북명
 
             _state = new PersistentState
             {
-                Project = project ?? XqlConfig.Project ?? "",
-                Workbook = Path.GetFileNameWithoutExtension(workbookFullName) ?? "wb",
+                Project = proj,
+                Workbook = wbName,
+                LastMaxRowVersion = 0,
+                LastFullPullUtc = DateTime.MinValue
             };
 
             // 워크북에서 K/V 읽기 (UI 스레드에서 안전하게)
@@ -320,10 +326,10 @@ namespace XQLite.AddIn
                     if (!cols.Any(c => c.Equals(key, StringComparison.OrdinalIgnoreCase)))
                         cols.Insert(0, key);
 
-                    // 메타 컬럼(선택) — 있으면 뒤로 유지
-                    foreach (var m in new[] { "row_version", "updated_at", "deleted" })
-                        if (!cols.Any(c => c.Equals(m, StringComparison.OrdinalIgnoreCase)))
-                            cols.Add(m);
+                    cols = cols
+                           .Where(s => !string.IsNullOrWhiteSpace(s))
+                           .Distinct(StringComparer.OrdinalIgnoreCase)
+                           .ToList();
 
                     // 중복/빈 제거
                     cols = cols.Where(s => !string.IsNullOrWhiteSpace(s))

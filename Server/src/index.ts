@@ -1,11 +1,15 @@
 // src/index.ts
 //
-// XQLite GraphQL Server — data.sqlite + ATTACH admin.sqlite
-//  - 데이터 DB(<project>.sqlite): 실제 테이블 + 메타(row_version, updated_at, deleted)
-//  - admin DB(<project>.admin.sqlite): _meta(max_row_version), _events, _presence, _locks, _audit_log
-//  - Subscription: events
-//  - project: null/"" -> "default"
-//  - 타임스탬프(ms) Float, READONLY 지원
+// XQLite GraphQL Server — Pure Main DB + Admin ATTACH + Row-State Cache
+// - main(<project>.sqlite): 순수 데이터만 (id + 비즈니스 컬럼들)
+// - admin(<project>.admin.sqlite):
+//     _meta(max_row_version), _events(row_version,ts,table,row_key,deleted,cells),
+//     _row_state(table,row_key,row_version,ts,deleted),
+//     _audit_log, _presence, _locks
+// - upsert/delete: 이벤트 기록 + row_state 즉시 갱신 (O(1) 최신상태 조회)
+// - rowsSnapshot: main ⨝ row_state 를 서버에서 조인해 스냅샷 제공(클라 단점 해소)
+// - project: null/"" -> "default"
+// - PubSub 타입/호출 정리(에러 없이 컴파일)
 //
 // deps:
 //   npm i graphql graphql-yoga graphql-type-json better-sqlite3
@@ -78,6 +82,11 @@ type DBBundle = {
     auditInsert: Database.Statement;
     auditSince: Database.Statement;
 
+    // row_state
+    rowStateUpsert: Database.Statement;
+    rowStateGetAll: Database.Statement;
+    rowStateGetKeys: (count: number) => Database.Statement;
+
     // data helpers
     selectPk: (table: string) => string;
     tableInfo: (table: string) => Array<{ name: string; type: string | null; notnull: number; pk: number }>;
@@ -91,13 +100,13 @@ const dbCache = new Map<string, DBBundle>();
 function assertDataSchemaIsPure(db: Database.Database) {
   const rows = db.prepare(`SELECT name FROM sqlite_master WHERE type='table'`).all() as Array<{ name: string }>;
   const names = new Set(rows.map(r => r.name));
-  const forbidden = ['_meta', '_events', '_presence', '_locks', '_audit_log'];
+  const forbidden = ['_meta', '_events', '_presence', '_locks', '_audit_log', '_row_state'];
   const found = forbidden.filter(n => names.has(n));
   if (found.length) {
     throw new Error(`Admin tables must NOT exist in main schema: ${found.join(', ')}. Use admin.<table> via ATTACH.`);
   }
   const suspicious = rows.map(r => r.name).filter(n => n.startsWith('_'));
-  if (suspicious.length) console.warn(`[WARN] Main schema has '_' prefixed tables: ${suspicious.join(', ')} (consider moving to admin schema)`);
+  if (suspicious.length) console.warn(`[WARN] Main schema has '_' prefixed tables: ${suspicious.join(', ')} (move to admin schema)`);
 }
 
 function openBundle(projectRaw?: string | null): DBBundle {
@@ -120,10 +129,19 @@ function openBundle(projectRaw?: string | null): DBBundle {
     CREATE TABLE IF NOT EXISTS admin._meta (key TEXT PRIMARY KEY, value TEXT);
     CREATE TABLE IF NOT EXISTS admin._events (
       row_version INTEGER PRIMARY KEY,
-      table_name TEXT NOT NULL,
-      row_key TEXT NOT NULL,
-      deleted INTEGER NOT NULL DEFAULT 0,
-      cells TEXT NOT NULL
+      ts         REAL    NOT NULL,                 -- updated_at(ms)
+      table_name TEXT    NOT NULL,
+      row_key    TEXT    NOT NULL,
+      deleted    INTEGER NOT NULL DEFAULT 0,
+      cells      TEXT    NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS admin._row_state (
+      table_name TEXT    NOT NULL,
+      row_key    TEXT    NOT NULL,
+      row_version INTEGER NOT NULL,
+      ts          REAL    NOT NULL,
+      deleted     INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (table_name, row_key)
     );
     CREATE TABLE IF NOT EXISTS admin._presence (
       nickname TEXT NOT NULL,
@@ -149,6 +167,8 @@ function openBundle(projectRaw?: string | null): DBBundle {
       row_version INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS admin._events_rowver    ON _events(row_version);
+    CREATE INDEX IF NOT EXISTS admin._events_tablekey  ON _events(table_name, row_key);
+    CREATE INDEX IF NOT EXISTS admin._row_state_table  ON _row_state(table_name);
     CREATE INDEX IF NOT EXISTS admin._presence_updated ON _presence(updated_at);
     CREATE INDEX IF NOT EXISTS admin._locks_updated    ON _locks(updated_at);
     CREATE INDEX IF NOT EXISTS admin._audit_rowver     ON _audit_log(row_version);
@@ -162,17 +182,18 @@ function openBundle(projectRaw?: string | null): DBBundle {
   `);
   if (!getMetaVersion.get()) setMetaVersion.run({ v: '0' });
 
+  // prepared helpers
   const stmts = {
     getMetaVersion,
     setMetaVersion,
     selectMaxVersion: db.prepare(`SELECT CAST(value AS INTEGER) AS v FROM admin._meta WHERE key='max_row_version'`),
 
     insertEvent: db.prepare(`
-      INSERT INTO admin._events(row_version, table_name, row_key, deleted, cells)
-      VALUES(@row_version, @table_name, @row_key, @deleted, @cells)
+      INSERT INTO admin._events(row_version, ts, table_name, row_key, deleted, cells)
+      VALUES(@row_version, @ts, @table_name, @row_key, @deleted, @cells)
     `),
     selectEventsSince: db.prepare(`
-      SELECT row_version, table_name, row_key, deleted, cells
+      SELECT row_version, ts, table_name, row_key, deleted, cells
       FROM admin._events
       WHERE row_version > @since
       ORDER BY row_version ASC
@@ -211,6 +232,26 @@ function openBundle(projectRaw?: string | null): DBBundle {
       ORDER BY row_version ASC
     `),
 
+    // row_state upsert
+    rowStateUpsert: db.prepare(`
+      INSERT INTO admin._row_state(table_name, row_key, row_version, ts, deleted)
+      VALUES(@table_name, @row_key, @row_version, @ts, @deleted)
+      ON CONFLICT(table_name, row_key) DO UPDATE SET
+        row_version=excluded.row_version,
+        ts=excluded.ts,
+        deleted=excluded.deleted
+    `),
+    rowStateGetAll: db.prepare(`
+      SELECT row_key, row_version, ts, deleted
+      FROM admin._row_state WHERE table_name=@table
+      ORDER BY row_key
+    `),
+    rowStateGetKeys: (count: number) => db.prepare(`
+      SELECT row_key, row_version, ts, deleted
+      FROM admin._row_state
+      WHERE table_name=@table AND row_key IN (${Array(count).fill('?').join(',')})
+    `),
+
     // data helpers
     selectPk: (table: string) => {
       const rows = db.prepare(`PRAGMA table_info(${escapeIdent(table)})`).all() as Array<{ name: string; pk: number }>;
@@ -244,6 +285,26 @@ function nextRowVersion(bundle: DBBundle): number {
 }
 
 // ────────────────────────────────────────────────────────────
+// 온디맨드 컬럼/테이블 (main = 순수 데이터)
+// ────────────────────────────────────────────────────────────
+const RESERVED_MAIN = new Set(['id']);
+
+function ensureColumns(bundle: DBBundle, table: string, columns: string[]) {
+  if (!columns.length) return;
+  const info = bundle.stmts.tableInfo(table);
+  const existing = new Set(info.map(c => c.name));
+  const toAdd = columns.filter(c => c && !existing.has(c) && !RESERVED_MAIN.has(c));
+  for (const name of toAdd) bundle.db.exec(`ALTER TABLE ${escapeIdent(table)} ADD COLUMN ${escapeIdent(name)} TEXT`);
+}
+
+function ensureTable(bundle: DBBundle, table: string, key: string) {
+  bundle.db.exec(`
+    CREATE TABLE IF NOT EXISTS ${escapeIdent(table)} (
+      ${escapeIdent(key)} TEXT PRIMARY KEY
+    )`);
+}
+
+// ────────────────────────────────────────────────────────────
 // GraphQL Schema
 // ────────────────────────────────────────────────────────────
 const typeDefs = /* GraphQL */ `
@@ -253,6 +314,7 @@ const typeDefs = /* GraphQL */ `
     table: String!
     row_key: String!
     row_version: Int!
+    updated_at: Float!   # ms, admin._events.ts
     deleted: Int!
     cells: JSON!
   }
@@ -302,6 +364,13 @@ const typeDefs = /* GraphQL */ `
     row_version: Int!
   }
 
+  type RowState {
+    row_key: String!
+    row_version: Int!
+    updated_at: Float!
+    deleted: Int!
+  }
+
   input CellEditInput {
     table: String!
     row_key: String!
@@ -319,6 +388,8 @@ const typeDefs = /* GraphQL */ `
   type Query {
     ping: Float!
     rows(since_version: Int, table: String, project: String): RowsResult!
+    rowsSnapshot(table: String!, include_deleted: Boolean, project: String): [JSON!]!
+    rowState(table: String!, keys: [String!], project: String): [RowState!]!
     meta(project: String): JSON
     audit_log(since_version: Int, project: String): [Audit!]!
     presence(project: String): [PresenceItem!]!
@@ -330,13 +401,14 @@ const typeDefs = /* GraphQL */ `
   type Mutation {
     upsertCells(cells: [CellEditInput!]!, project: String): UpsertResult!
     upsertRows(table: String!, rows: [JSON!]!, project: String): UpsertResult!
+    deleteRows(table: String!, keys: [String!]!, hard: Boolean, project: String): Ok!
     createTable(table: String!, key: String!, project: String): Ok!
     addColumns(table: String!, columns: [ColumnDefInput!]!, project: String): Ok!
     dropColumns(table: String!, names: [String!]!, project: String): Ok!
-    deleteRows(table: String!, keys: [String!]!, hard: Boolean, project: String): Ok!
     presenceTouch(nickname: String!, sheet: String, cell: String, project: String): Ok!
     acquireLock(cell: String!, by: String!, project: String): Ok!
     releaseLocksBy(by: String!, project: String): Ok!
+    rebuildRowState(table: String, project: String): Ok!
   }
 
   type Subscription {
@@ -345,21 +417,22 @@ const typeDefs = /* GraphQL */ `
 `;
 
 // ────────────────────────────────────────────────────────────
-// PubSub (타입: 이벤트당 단일 인자 튜플)
+// PubSub
 // ────────────────────────────────────────────────────────────
-type Patch = { table: string; row_key: string; row_version: number; deleted: number; cells: Record<string, unknown> };
+type Patch = { table: string; row_key: string; row_version: number; updated_at: number; deleted: number; cells: Record<string, unknown> };
 type RowsResult = { max_row_version: number; patches: Patch[] };
 
 const pubsub = createPubSub<{ 'rows-events': [RowsResult] }>();
 
 async function publishEvents(bundle: DBBundle, since: number) {
   const rows = bundle.stmts.selectEventsSince.all({ since }) as Array<{
-    row_version: number; table_name: string; row_key: string; deleted: number; cells: string;
+    row_version: number; ts: number; table_name: string; row_key: string; deleted: number; cells: string;
   }>;
   const patches: Patch[] = rows.map(r => ({
     table: r.table_name,
     row_key: r.row_key,
     row_version: r.row_version,
+    updated_at: r.ts,
     deleted: r.deleted | 0,
     cells: JSON.parse(r.cells || '{}'),
   }));
@@ -381,17 +454,49 @@ const resolvers = {
       const bundle = openBundle(args.project);
       const since = capInt32(Number(args.since_version ?? 0));
       const list = bundle.stmts.selectEventsSince.all({ since }) as Array<{
-        row_version: number; table_name: string; row_key: string; deleted: number; cells: string;
+        row_version: number; ts: number; table_name: string; row_key: string; deleted: number; cells: string;
       }>;
       const patches: Patch[] = list
         .filter(r => (args.table ? r.table_name === args.table : true))
         .map(r => ({
           table: r.table_name, row_key: r.row_key, row_version: r.row_version,
-          deleted: r.deleted | 0, cells: JSON.parse(r.cells || '{}'),
+          updated_at: r.ts, deleted: r.deleted | 0, cells: JSON.parse(r.cells || '{}'),
         }));
       const mv = bundle.stmts.selectMaxVersion.get() as { v: number };
       const max = (mv?.v ?? 0) | 0;
       return { max_row_version: max, patches };
+    },
+
+    // 서버가 main ⨝ row_state 해서 스냅샷을 JSON 배열로 반환
+    rowsSnapshot: (_: unknown, args: { table: string; include_deleted?: boolean; project?: string }) => {
+      const bundle = openBundle(args.project);
+      const info = bundle.stmts.tableInfo(args.table);
+      if (info.length === 0) return [];
+      const pk = info.find(c => (c.pk | 0) > 0)?.name ?? 'id';
+
+      const whereDel = args.include_deleted ? '' : `AND rs.deleted=0`;
+      const sql = `
+        SELECT m.*, rs.row_version, rs.ts AS updated_at, rs.deleted
+        FROM ${escapeIdent(args.table)} m
+        LEFT JOIN admin._row_state rs
+          ON rs.table_name=@t AND rs.row_key = m.${escapeIdent(pk)}
+        WHERE 1=1 ${whereDel}
+        ORDER BY m.${escapeIdent(pk)}
+      `;
+      const rows = bundle.db.prepare(sql).all({ t: args.table }) as any[];
+      return rows;
+    },
+
+    rowState: (_: unknown, args: { table: string; keys?: string[]; project?: string }) => {
+      const bundle = openBundle(args.project);
+      if (!args.keys || args.keys.length === 0) {
+        const all = bundle.stmts.rowStateGetAll.all({ table: args.table }) as Array<{ row_key: string; row_version: number; ts: number; deleted: number }>;
+        return all.map(r => ({ row_key: r.row_key, row_version: r.row_version | 0, updated_at: r.ts, deleted: r.deleted | 0 }));
+      } else {
+        const stmt = bundle.stmts.rowStateGetKeys(args.keys.length);
+        const list = stmt.all(args.table, ...args.keys) as Array<{ row_key: string; row_version: number; ts: number; deleted: number }>;
+        return list.map(r => ({ row_key: r.row_key, row_version: r.row_version | 0, updated_at: r.ts, deleted: r.deleted | 0 }));
+      }
     },
 
     meta: (_: unknown, args: { project?: string }) => {
@@ -477,14 +582,11 @@ const resolvers = {
     createTable: (_: unknown, args: { table: string; key: string; project?: string }) => {
       if (READONLY) return { ok: true };
       const bundle = openBundle(args.project);
-      const sql = `
+      // main은 순수 데이터만: id PK만 생성
+      bundle.db.exec(`
         CREATE TABLE IF NOT EXISTS ${escapeIdent(args.table)} (
-          ${escapeIdent(args.key)} TEXT PRIMARY KEY,
-          row_version INTEGER NOT NULL DEFAULT 0,
-          updated_at  REAL    NOT NULL DEFAULT (strftime('%s','now') * 1000),
-          deleted     INTEGER NOT NULL DEFAULT 0
-        )`;
-      bundle.db.exec(sql);
+          ${escapeIdent(args.key)} TEXT PRIMARY KEY
+        )`);
       return { ok: true };
     },
 
@@ -494,7 +596,6 @@ const resolvers = {
       const cols = args.columns.map(c => ({
         name: c.name,
         type: (c.type ?? '').trim(),
-        notnull: !!(c as any).notnull || !!c.notNull,
         check: (c.check ?? '').trim(),
       }));
       const exists = bundle.stmts.tableInfo(args.table).map(x => x.name);
@@ -502,16 +603,11 @@ const resolvers = {
 
       const tx = bundle.db.transaction(() => {
         for (const c of cols) {
-          if (!c.name) continue;
-          if (existSet.has(c.name)) continue;
-          try {
-            let ddl = `ALTER TABLE ${escapeIdent(args.table)} ADD COLUMN ${escapeIdent(c.name)}`;
-            ddl += c.type ? ` ${c.type}` : '';
-            if (c.check) ddl += ` CHECK(${c.check})`;
-            bundle.db.exec(ddl);
-          } catch (e: any) {
-            throw new Error(`addColumns failed for "${args.table}.${c.name}": ${e?.message ?? e}`);
-          }
+          if (!c.name || RESERVED_MAIN.has(c.name) || existSet.has(c.name)) continue;
+          let ddl = `ALTER TABLE ${escapeIdent(args.table)} ADD COLUMN ${escapeIdent(c.name)}`;
+          ddl += c.type ? ` ${c.type}` : ' TEXT';
+          if (c.check) ddl += ` CHECK(${c.check})`;
+          bundle.db.exec(ddl);
         }
       });
       tx();
@@ -522,6 +618,7 @@ const resolvers = {
       if (READONLY) return { ok: true };
       const bundle = openBundle(args.project);
       for (const n of args.names) {
+        if (RESERVED_MAIN.has(n)) continue;
         try {
           bundle.db.exec(`ALTER TABLE ${escapeIdent(args.table)} DROP COLUMN ${escapeIdent(n)}`);
         } catch { /* ignore for old SQLite or constraints */ }
@@ -533,6 +630,7 @@ const resolvers = {
       if (READONLY) return { ok: true };
       const bundle = openBundle(args.project);
       const info = bundle.stmts.tableInfo(args.table);
+      if (info.length === 0) return { ok: true };
       const pk = info.find(c => (c.pk | 0) > 0)?.name ?? 'id';
 
       const tx = bundle.db.transaction(() => {
@@ -540,20 +638,19 @@ const resolvers = {
           const rv = nextRowVersion(bundle);
           const ts = nowMs();
 
-          if (args.hard) {
-            bundle.db.prepare(`DELETE FROM ${escapeIdent(args.table)} WHERE ${escapeIdent(pk)}=@id`).run({ id });
-          } else {
-            bundle.db.prepare(
-              `UPDATE ${escapeIdent(args.table)} SET deleted=1, row_version=@rv, updated_at=@ts WHERE ${escapeIdent(pk)}=@id`
-            ).run({ id, rv, ts });
-          }
+          // main에서 실제 삭제
+          bundle.db.prepare(`DELETE FROM ${escapeIdent(args.table)} WHERE ${escapeIdent(pk)}=@id`).run({ id });
+
+          // 이벤트 & 감사 & row_state
           bundle.stmts.insertEvent.run({
-            row_version: rv, table_name: args.table, row_key: id, deleted: 1, cells: JSON.stringify({}),
+            row_version: rv, ts, table_name: args.table, row_key: id, deleted: 1, cells: JSON.stringify({}),
+          });
+          bundle.stmts.rowStateUpsert.run({
+            table_name: args.table, row_key: id, row_version: rv, ts, deleted: 1,
           });
           bundle.stmts.auditInsert.run({
             ts, user: 'excel', table_name: args.table, row_key: id,
-            column: 'deleted', old_value: args.hard ? '0' : '0',
-            new_value: args.hard ? 'HARD_DELETE' : '1', row_version: rv,
+            column: 'deleted', old_value: '0', new_value: args.hard ? 'HARD_DELETE' : '1', row_version: rv,
           });
         }
       });
@@ -572,9 +669,19 @@ const resolvers = {
         return { max_row_version: (mv?.v ?? 0) | 0, errors: ['READONLY'], conflicts: null };
       }
 
-      const errors: string[] = [];
-      const conflicts: Array<{ table: string; row_key: string; column: string; message: string }> = [];
+      // 테이블/컬럼 사전 보정
+      const perTable = new Map<string, Set<string>>();
+      for (const e of args.cells) {
+        ensureTable(bundle, e.table, 'id');
+        const key = e.table;
+        if (!perTable.has(key)) perTable.set(key, new Set());
+        if (e.column) perTable.get(key)!.add(e.column);
+      }
+      for (const [table, set] of perTable) ensureColumns(bundle, table, Array.from(set));
 
+      const errors: string[] = [];
+
+      // 실제 upsert
       const grouped = new Map<string, Array<{ column: string; value: any }>>();
       const keyMap = new Map<string, { table: string; row_key: string }>();
       for (const c of args.cells) {
@@ -598,29 +705,26 @@ const resolvers = {
           const kv: Record<string, any> = {};
           for (const e of edits) if (colSet.has(e.column)) kv[e.column] = e.value;
 
-          const exists = !!bundle.stmts.selectRowByPk(table, pk, row_key);
+          const exists = !!before;
           const rv = nextRowVersion(bundle);
           const ts = nowMs();
 
           if (exists) {
             if (cols.length > 0) {
-              const sets = [...cols.map(c => `${escapeIdent(c)}=@${c}`), `row_version=@row_version`, `updated_at=@updated_at`];
+              const sets = cols.map(c => `${escapeIdent(c)}=@${c}`);
               const sql = `UPDATE ${escapeIdent(table)} SET ${sets.join(', ')} WHERE ${escapeIdent(pk)}=@id`;
-              bundle.db.prepare(sql).run({ ...kv, id: row_key, row_version: rv, updated_at: ts });
-            } else {
-              bundle.db.prepare(
-                `UPDATE ${escapeIdent(table)} SET row_version=@row_version, updated_at=@updated_at WHERE ${escapeIdent(pk)}=@id`
-              ).run({ id: row_key, row_version: rv, updated_at: ts });
+              bundle.db.prepare(sql).run({ ...kv, id: row_key });
             }
           } else {
-            const allCols = [pk, ...cols, 'row_version', 'updated_at', 'deleted'];
+            const allCols = [pk, ...cols];
             const placeholders = allCols.map(c => `@${c}`);
-            const p: any = { [pk]: row_key, row_version: rv, updated_at: ts, deleted: 0 };
+            const p: any = { [pk]: row_key };
             for (const c of cols) p[c] = kv[c];
             const sql = `INSERT INTO ${escapeIdent(table)}(${allCols.map(escapeIdent).join(', ')}) VALUES(${placeholders.join(', ')})`;
             bundle.db.prepare(sql).run(p);
           }
 
+          // 감사 + 이벤트 + row_state
           for (const c of cols) {
             const oldVal = before ? (before[c] != null ? String(before[c]) : null) : null;
             const newVal = kv[c] != null ? String(kv[c]) : null;
@@ -628,9 +732,11 @@ const resolvers = {
               ts, user: 'excel', table_name: table, row_key, column: c, old_value: oldVal, new_value: newVal, row_version: rv,
             });
           }
-
           bundle.stmts.insertEvent.run({
-            row_version: rv, table_name: table, row_key, deleted: 0, cells: JSON.stringify(kv),
+            row_version: rv, ts, table_name: table, row_key, deleted: 0, cells: JSON.stringify(kv),
+          });
+          bundle.stmts.rowStateUpsert.run({
+            table_name: table, row_key, row_version: rv, ts, deleted: 0,
           });
         }
       });
@@ -640,7 +746,7 @@ const resolvers = {
       const mv = bundle.stmts.selectMaxVersion.get() as { v: number };
       const maxRow = (mv?.v ?? 0) | 0;
       publishEvents(bundle, Math.max(0, maxRow - BROADCAST_BACKSCAN)).catch(() => { });
-      return { max_row_version: maxRow, errors: errors.length ? errors : null, conflicts: conflicts.length ? conflicts : null };
+      return { max_row_version: maxRow, errors: errors.length ? errors : null, conflicts: null };
     },
 
     upsertRows: (_: unknown, args: { table: string; rows: Array<Record<string, any>>; project?: string }) => {
@@ -650,42 +756,46 @@ const resolvers = {
         return { max_row_version: (mv?.v ?? 0) | 0, errors: ['READONLY'], conflicts: null };
       }
 
-      const table = args.table;
-      const info = bundle.stmts.tableInfo(table);
-      const pk = info.find(c => (c.pk | 0) > 0)?.name ?? 'id';
-      const colSet = new Set(info.map(x => x.name));
+      // 테이블/컬럼 보정
+      ensureTable(bundle, args.table, 'id');
+      const keys = new Set<string>();
+      for (const r of args.rows) for (const k of Object.keys(r)) if (k) keys.add(k);
+      const info0 = bundle.stmts.tableInfo(args.table);
+      const pk = info0.find(c => (c.pk | 0) > 0)?.name ?? 'id';
+      keys.delete(pk);
+      ensureColumns(bundle, args.table, Array.from(keys));
+
       const errors: string[] = [];
 
       const tx2 = bundle.db.transaction(() => {
+        const info2 = bundle.stmts.tableInfo(args.table);
+        const colSet = new Set(info2.map(x => x.name));
+
         for (const row of args.rows) {
           const row_key = String(row[pk] ?? '');
           if (!row_key) continue;
 
-          const before = bundle.stmts.selectRowByPk(table, pk, row_key) ?? null;
+          const before = bundle.stmts.selectRowByPk(args.table, pk, row_key) ?? null;
           const cols = Object.keys(row).filter(c => c !== pk && colSet.has(c));
           const kv: Record<string, any> = {};
           for (const c of cols) kv[c] = row[c];
 
-          const exists = !!bundle.stmts.selectRowByPk(table, pk, row_key);
+          const exists = !!before;
           const rv = nextRowVersion(bundle);
           const ts = nowMs();
 
           if (exists) {
             if (cols.length > 0) {
-              const sets = [...cols.map(c => `${escapeIdent(c)}=@${c}`), `row_version=@row_version`, `updated_at=@updated_at`];
-              const sql = `UPDATE ${escapeIdent(table)} SET ${sets.join(', ')} WHERE ${escapeIdent(pk)}=@id`;
-              bundle.db.prepare(sql).run({ ...kv, id: row_key, row_version: rv, updated_at: ts });
-            } else {
-              bundle.db.prepare(
-                `UPDATE ${escapeIdent(table)} SET row_version=@row_version, updated_at=@updated_at WHERE ${escapeIdent(pk)}=@id`
-              ).run({ id: row_key, row_version: rv, updated_at: ts });
+              const sets = cols.map(c => `${escapeIdent(c)}=@${c}`);
+              const sql = `UPDATE ${escapeIdent(args.table)} SET ${sets.join(', ')} WHERE ${escapeIdent(pk)}=@id`;
+              bundle.db.prepare(sql).run({ ...kv, id: row_key });
             }
           } else {
-            const allCols = [pk, ...cols, 'row_version', 'updated_at', 'deleted'];
+            const allCols = [pk, ...cols];
             const placeholders = allCols.map(c => `@${c}`);
-            const p: any = { [pk]: row_key, row_version: rv, updated_at: ts, deleted: 0 };
+            const p: any = { [pk]: row_key };
             for (const c of cols) p[c] = kv[c];
-            const sql = `INSERT INTO ${escapeIdent(table)}(${allCols.map(escapeIdent).join(', ')}) VALUES(${placeholders.join(', ')})`;
+            const sql = `INSERT INTO ${escapeIdent(args.table)}(${allCols.map(escapeIdent).join(', ')}) VALUES(${placeholders.join(', ')})`;
             bundle.db.prepare(sql).run(p);
           }
 
@@ -693,12 +803,15 @@ const resolvers = {
             const oldVal = before ? (before[c] != null ? String(before[c]) : null) : null;
             const newVal = kv[c] != null ? String(kv[c]) : null;
             bundle.stmts.auditInsert.run({
-              ts, user: 'excel', table_name: table, row_key, column: c, old_value: oldVal, new_value: newVal, row_version: rv,
+              ts, user: 'excel', table_name: args.table, row_key, column: c, old_value: oldVal, new_value: newVal, row_version: rv,
             });
           }
 
           bundle.stmts.insertEvent.run({
-            row_version: rv, table_name: table, row_key, deleted: 0, cells: JSON.stringify(kv),
+            row_version: rv, ts, table_name: args.table, row_key, deleted: 0, cells: JSON.stringify(kv),
+          });
+          bundle.stmts.rowStateUpsert.run({
+            table_name: args.table, row_key, row_version: rv, ts, deleted: 0,
           });
         }
       });
@@ -709,6 +822,46 @@ const resolvers = {
       const maxRow = (mv?.v ?? 0) | 0;
       publishEvents(bundle, Math.max(0, maxRow - BROADCAST_BACKSCAN)).catch(() => { });
       return { max_row_version: maxRow, errors: errors.length ? errors : null, conflicts: null };
+    },
+
+    rebuildRowState: (_: unknown, args: { table?: string; project?: string }) => {
+      if (READONLY) return { ok: true };
+      const bundle = openBundle(args.project);
+
+      const tx = bundle.db.transaction(() => {
+        if (args.table) {
+          bundle.db.prepare(`DELETE FROM admin._row_state WHERE table_name=@t`).run({ t: args.table });
+          const cur = bundle.db.prepare(`
+            SELECT table_name, row_key,
+                   MAX(row_version) AS row_version,
+                   MAX(ts) AS ts,
+                   (SELECT deleted FROM admin._events e2
+                      WHERE e2.table_name=e1.table_name AND e2.row_key=e1.row_key
+                      ORDER BY row_version DESC LIMIT 1) AS deleted
+            FROM admin._events e1
+            WHERE table_name=@t
+            GROUP BY table_name, row_key
+          `).all({ t: args.table }) as Array<{ table_name: string; row_key: string; row_version: number; ts: number; deleted: number }>;
+          const ins = bundle.stmts.rowStateUpsert;
+          for (const r of cur) ins.run({ table_name: r.table_name, row_key: r.row_key, row_version: r.row_version, ts: r.ts, deleted: r.deleted | 0 });
+        } else {
+          bundle.db.exec(`DELETE FROM admin._row_state`);
+          const cur = bundle.db.prepare(`
+            SELECT table_name, row_key,
+                   MAX(row_version) AS row_version,
+                   MAX(ts) AS ts,
+                   (SELECT deleted FROM admin._events e2
+                      WHERE e2.table_name=e1.table_name AND e2.row_key=e1.row_key
+                      ORDER BY row_version DESC LIMIT 1) AS deleted
+            FROM admin._events e1
+            GROUP BY table_name, row_key
+          `).all() as Array<{ table_name: string; row_key: string; row_version: number; ts: number; deleted: number }>;
+          const ins = bundle.stmts.rowStateUpsert;
+          for (const r of cur) ins.run({ table_name: r.table_name, row_key: r.row_key, row_version: r.row_version, ts: r.ts, deleted: r.deleted | 0 });
+        }
+      });
+      tx();
+      return { ok: true };
     },
   },
 
