@@ -31,9 +31,6 @@ namespace XQLite.AddIn
         public static int LockTtlSec { get; set; } = 10;
 
         [JsonProperty]
-        public static bool DropColumnsOnCommit { get; set; } = false;
-
-        [JsonProperty]
         public static bool AlwaysFullPullOnStartup { get; set; } = true;
         [JsonProperty]
         public static bool FullPullWhenSchemaChanged { get; set; } = true;
@@ -79,7 +76,6 @@ namespace XQLite.AddIn
                 DebounceMs,
                 HeartbeatSec,
                 LockTtlSec,
-                DropColumnsOnCommit,
                 AlwaysFullPullOnStartup,
                 FullPullWhenSchemaChanged,
                 StateDirName,
@@ -129,7 +125,6 @@ namespace XQLite.AddIn
                 DebounceMs = (int?)x["DebounceMs"] ?? DebounceMs;
                 HeartbeatSec = (int?)x["HeartbeatSec"] ?? HeartbeatSec;
                 LockTtlSec = (int?)x["LockTtlSec"] ?? LockTtlSec;
-                DropColumnsOnCommit = (bool?)x["DropColumnsOnCommit"] ?? DropColumnsOnCommit;
                 AlwaysFullPullOnStartup = (bool?)x["AlwaysFullPullOnStartup"] ?? AlwaysFullPullOnStartup;
                 FullPullWhenSchemaChanged = (bool?)x["FullPullWhenSchemaChanged"] ?? FullPullWhenSchemaChanged;
                 StateDirName = (string?)x["StateDirName"] ?? StateDirName;

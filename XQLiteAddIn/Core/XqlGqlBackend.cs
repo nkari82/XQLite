@@ -1,4 +1,4 @@
-﻿// XqlGqlBackend.cs (async-first, 정리 버전)
+﻿// XqlGqlBackend.cs (async-first, 정리 + 컬럼 Rename/Alter 확장)
 
 using GraphQL;
 using GraphQL.Client.Http;
@@ -14,8 +14,6 @@ using static XQLite.AddIn.IXqlBackend;
 
 namespace XQLite.AddIn
 {
-
-
     // =======================================================================
     // Backend 인터페이스 (Async 전용)
     // =======================================================================
@@ -25,7 +23,6 @@ namespace XQLite.AddIn
 
         // Sync (데이터 동기화)
         Task<UpsertResult> UpsertCells(IEnumerable<EditCell> cells, CancellationToken ct = default);
-
         Task<PullResult> PullRows(long since, CancellationToken ct = default);
         void StartSubscription(Action<ServerEvent> onEvent, long since);
         void StopSubscription();
@@ -38,6 +35,12 @@ namespace XQLite.AddIn
         // Backup / Schema
         Task TryCreateTable(string table, string key, CancellationToken ct = default);
         Task TryAddColumns(string table, IEnumerable<ColumnDef> cols, CancellationToken ct = default);
+        Task TryDropColumns(string table, IEnumerable<string> names, CancellationToken ct = default);
+
+        // 스키마 변경 고수준 API
+        Task TryRenameColumns(string table, IEnumerable<RenameDef> renames, CancellationToken ct = default);
+        Task TryAlterColumns(string table, IEnumerable<AlterDef> alters, CancellationToken ct = default);
+
         Task<JObject?> TryFetchServerMeta(CancellationToken ct = default);
         Task<JArray?> TryFetchAuditLog(long? since = null, CancellationToken ct = default);
         Task<byte[]?> TryExportDatabase(CancellationToken ct = default);
@@ -48,13 +51,10 @@ namespace XQLite.AddIn
         // Recover
         Task<bool> UpsertRows(string table, List<Dictionary<string, object?>> rows, CancellationToken ct = default);
 
-
         // 연결상태 하트비트(부작용 없음) — 호출할 때마다 상태 업데이트
         Task<long> Ping(CancellationToken ct = default);
 
         Task<List<ColumnInfo>> GetTableColumns(string table, CancellationToken ct = default);
-
-        Task TryDropColumns(string table, IEnumerable<string> names, CancellationToken ct = default);
 
         // 상태 조회/이벤트
         event Action<ConnState, string?>? StateChanged;
@@ -68,7 +68,7 @@ namespace XQLite.AddIn
     // =======================================================================
     internal sealed class XqlGqlBackend : IXqlBackend
     {
-        // ── GraphQL 문서 (서버 스키마에 맞춰 사용) ───────────────────────────────
+        // ── GraphQL 문서 (서버 스키마에 맞춰 사용) ───────────────────────────
 
         // 1) Pull: Long → Int
         private const string Q_PULL = @"query($since:Int!){
@@ -78,17 +78,13 @@ namespace XQLite.AddIn
             }
         }";
 
-
-        // #TODO 없어도 되나보다?? ⬇️ [ADD] 테이블 전체 스냅샷(rows) — 초기 부트스트랩 시 사용
+        // 1-2) 테이블 스냅샷(JSON 배열) — selection 없이 호출
         private const string Q_ROWS_SNAPSHOT = @"
         query($t:String!){
-          rows(table:$t){
-            row_key
-            cells
-          }
+          rowsSnapshot(table:$t)
         }";
 
-        // 2) Subscription: rowsChanged → events, 변수 제거
+        // 2) Subscription: rowsChanged → events
         private const string SUB_ROWS = @"subscription{
             events{
                 max_row_version
@@ -99,13 +95,13 @@ namespace XQLite.AddIn
         private const string MUT_UPSERT_CELLS = @"
             mutation($cells:[CellEditInput!]!){
                 upsertCells(cells:$cells){
-                max_row_version
-                errors
-                conflicts { table row_key column message }
-            }
-        }";
+                    max_row_version
+                    errors
+                    conflicts { table row_key column message }
+                }
+            }";
 
-        // 3) PresenceTouch는 동일 (변경 없음)
+        // 3) PresenceTouch
         private const string MUT_PRESENCE = @"mutation($n:String!,$s:String,$c:String){
             presenceTouch(nickname:$n, sheet:$s, cell:$c){ ok }
         }";
@@ -117,40 +113,47 @@ namespace XQLite.AddIn
           createTable(table:$table, key:$key){ ok }
         }";
 
-        // 4) addColumns: notnull → notNull
+        // 4) addColumns: 서버 ColumnDefInput {name,type,notNull,check}
         private const string MUT_ADD_COLUMNS = @"mutation($table:String!, $columns:[ColumnDefInput!]!){
             addColumns(table:$table, columns:$columns){ ok }
         }";
 
-        // 5) upsertRows: 서버 반환과 일치하게 selection 축소
+        // 5) upsertRows
         private const string MUT_UPSERT_ROWS = @"mutation ($table:String!,$rows:[JSON!]!){
-                upsertRows(table:$table, rows:$rows){
+            upsertRows(table:$table, rows:$rows){
                 max_row_version
                 errors
             }
         }";
 
-        // 6) meta: JSON 스칼라 → 필드 선택 없이 그대로
+        // 6) meta (JSON)
         private const string Q_META = @"query{ meta }";
 
         // 7) audit: Long → Int
         private const string Q_AUDIT = @"query($since:Int){
-                audit_log(since_version:$since){
+            audit_log(since_version:$since){
                 ts user table row_key column old_value new_value row_version
             }
         }";
 
         private const string Q_EXPORT_DB = @"query{ exportDatabase }";
-
         private const string Q_PRESENCE = @"query { presence { nickname sheet cell updated_at } }";
 
-        // ── GQL
+        // ── GQL: 테이블 메타/드랍/리네임/알터 ──────────────────────────────
         private const string Q_TABLE_COLUMNS = @"query($t:String!){
             tableColumns(table:$t){ name type notnull pk }
         }";
 
         private const string MUT_DROP_COLUMNS = @"mutation($t:String!,$ns:[String!]!){
             dropColumns(table:$t, names:$ns){ ok }
+        }";
+
+        private const string MUT_RENAME_COLUMNS = @"mutation($t:String!,$rs:[RenameDefInput!]!){
+            renameColumns(table:$t, renames:$rs){ ok }
+        }";
+
+        private const string MUT_ALTER_COLUMNS = @"mutation($t:String!,$alters:[AlterDefInput!]!){
+            alterColumns(table:$t, alters:$alters){ ok }
         }";
 
         // ── 필드 ─────────────────────────────────────────────────────────────
@@ -167,7 +170,6 @@ namespace XQLite.AddIn
         public event Action<ConnState, string?>? StateChanged;
 
         private const int HB_TTL_MS = 10_000; // 마지막 성공 이후 이 시간 넘도록 성공 없으면 Disconnected
-
 
         // ── 생성자 ───────────────────────────────────────────────────────────
         internal XqlGqlBackend(string httpEndpoint, string? apiKey, string? project = null, int heartbeatSec = 3)
@@ -189,27 +191,24 @@ namespace XQLite.AddIn
                 _ws.HttpClient.DefaultRequestHeaders.Add("x-api-key", apiKey);
             }
 
-            project = (project ?? "").Trim();
+            // project 헤더는 비어있으면 "default"
+            var prj = string.IsNullOrWhiteSpace(project) ? "default" : project!.Trim();
+            const string H = "x-project";
             try
             {
-                // Header 갱신: 중복 추가 방지 위해 기존 제거 후 추가
-                const string H = "x-project";
                 if (_http.HttpClient.DefaultRequestHeaders.Contains(H))
                     _http.HttpClient.DefaultRequestHeaders.Remove(H);
                 if (_ws.HttpClient.DefaultRequestHeaders.Contains(H))
                     _ws.HttpClient.DefaultRequestHeaders.Remove(H);
-                if (!string.IsNullOrEmpty(project))
-                {
-                    _http.HttpClient.DefaultRequestHeaders.Add(H, project);
-                    _ws.HttpClient.DefaultRequestHeaders.Add(H, project);
-                }
-            }
-            catch { /* 무음 */ }
 
-            _heartbeat = new Timer(async _ => await SafeHeartbeat(), null, Timeout.Infinite, Timeout.Infinite);
+                _http.HttpClient.DefaultRequestHeaders.Add(H, prj);
+                _ws.HttpClient.DefaultRequestHeaders.Add(H, prj);
+            }
+            catch { /* ignore */ }
+
+            _heartbeat = new Timer(async _ => await SafeHeartbeat().ConfigureAwait(false), null, Timeout.Infinite, Timeout.Infinite);
             _ = SafeHeartbeat(); // 즉시 1회
             _heartbeat.Change(TimeSpan.FromSeconds(heartbeatSec), TimeSpan.FromSeconds(heartbeatSec));
-
         }
 
         public void Dispose()
@@ -236,7 +235,7 @@ namespace XQLite.AddIn
             try { StateChanged?.Invoke(st, detail); } catch { }
         }
 
-        // ⬇️ 연결상태 하트비트 (호출 시 상태 업데이트)
+        // 연결상태 하트비트
         public async Task<long> Ping(CancellationToken ct = default)
         {
             try
@@ -260,30 +259,19 @@ namespace XQLite.AddIn
                     if (ms > HB_TTL_MS) SetState(ConnState.Disconnected, $"ping timeout {(int)(ms / 1000)}s");
                     else SetState(ConnState.Degraded, $"ping fail: {ex.GetType().Name}");
                 }
-                throw; // 호출측에서 필요 시 무시 가능
+                throw;
             }
         }
 
         private async Task SafeHeartbeat()
         {
-            if (_heartbeat == null)
-                return;
-
-            try
-            {
-                // 연결상태 확인 (상태는 PingAsync 내부에서 갱신됨)
-                await Ping().ConfigureAwait(false);
-            }
-            catch { /* 네트워크 일시 오류는 무시 */ }
+            try { await Ping().ConfigureAwait(false); } catch { /* ignore transient */ }
         }
-
 
         // ── Sync ─────────────────────────────────────────────────────────────
         public async Task<PullResult> PullRows(long since, CancellationToken ct = default)
         {
-            // 서버 rows(since_version: Int!) 스키마 보호
             var since32 = (int)Math.Min(Math.Max(since, int.MinValue), int.MaxValue);
-
             var req = new GraphQLRequest { Query = Q_PULL, Variables = new { since = since32 } };
             var resp = await _http.SendQueryAsync<JObject>(req, ct).ConfigureAwait(false);
             return ParsePull(resp.Data);
@@ -292,7 +280,6 @@ namespace XQLite.AddIn
         public void StartSubscription(Action<ServerEvent> onEvent, long since)
         {
             StopSubscription();
-            // 변수 없이 바로 구독
             var req = new GraphQLRequest { Query = SUB_ROWS };
             var observable = _ws.CreateSubscriptionStream<JObject>(req);
 
@@ -322,7 +309,6 @@ namespace XQLite.AddIn
         }
 
         // ── Collab ───────────────────────────────────────────────────────────
-        // ⬇️ 프레즌스 갱신 (연결상태와 무관)
         public async Task PresenceTouch(string nickname, string? sheet, string? cell, CancellationToken ct = default)
         {
             var req = new GraphQLRequest { Query = MUT_PRESENCE, Variables = new { n = nickname, s = sheet, c = cell } };
@@ -352,15 +338,70 @@ namespace XQLite.AddIn
                 Variables = new
                 {
                     table,
-                    columns = cols.Select(c => new
-                    {
-                        name = c.Name,
-                        type = c.Kind,
-                        notNull = c.NotNull,
-                        check = c.Check
-                    }).ToArray()
+                    columns = cols.Where(c => !string.IsNullOrWhiteSpace(c.Name))
+                                   .Select(c => new
+                                   {
+                                       name = c.Name,
+                                       type = MapType(c.Kind),   // 서버 ColumnDefInput.type
+                                       notNull = c.NotNull,
+                                       check = c.Check
+                                   }).ToArray()
                 }
             }, ct);
+
+        public Task TryDropColumns(string table, IEnumerable<string> names, CancellationToken ct = default)
+        {
+            var list = names?.Where(n => !string.IsNullOrWhiteSpace(n))
+                             .Distinct(StringComparer.OrdinalIgnoreCase)
+                             .ToArray() ?? Array.Empty<string>();
+
+            if (list.Length == 0) return Task.CompletedTask;
+
+            return _http.SendMutationAsync<object>(new GraphQLRequest
+            {
+                Query = MUT_DROP_COLUMNS,
+                Variables = new { t = table, ns = list }
+            }, ct);
+        }
+
+        // 컬럼 이름 변경(복수)
+        public Task TryRenameColumns(string table, IEnumerable<RenameDef> renames, CancellationToken ct = default)
+        {
+            var pairs = renames?.Where(r => !string.IsNullOrWhiteSpace(r.From) && !string.IsNullOrWhiteSpace(r.To) &&
+                                            !r.From.Equals(r.To, StringComparison.OrdinalIgnoreCase))
+                                .Select(r => new { from = r.From, to = r.To })
+                                .ToArray() ?? Array.Empty<object>();
+
+            if (pairs.Length == 0) return Task.CompletedTask;
+
+            return _http.SendMutationAsync<object>(new GraphQLRequest
+            {
+                Query = MUT_RENAME_COLUMNS,
+                Variables = new { t = table, rs = pairs }
+            }, ct);
+        }
+
+        // 컬럼 타입/NOT NULL/CHECK 변경(복수)
+        public Task TryAlterColumns(string table, IEnumerable<AlterDef> alters, CancellationToken ct = default)
+        {
+            var list = alters?.Where(a => !string.IsNullOrWhiteSpace(a.Name))
+                              .Select(a => new
+                              {
+                                  name = a.Name,
+                                  toType = a.ToType != null ? MapType(a.ToType) : null,
+                                  toNotNull = a.ToNotNull,
+                                  toCheck = a.ToCheck
+                              })
+                              .ToArray() ?? Array.Empty<object>();
+
+            if (list.Length == 0) return Task.CompletedTask;
+
+            return _http.SendMutationAsync<object>(new GraphQLRequest
+            {
+                Query = MUT_ALTER_COLUMNS,
+                Variables = new { t = table, alters = list }
+            }, ct);
+        }
 
         public async Task<JObject?> TryFetchServerMeta(CancellationToken ct = default)
         {
@@ -368,11 +409,6 @@ namespace XQLite.AddIn
             {
                 var resp = await _http.SendQueryAsync<JObject>(new GraphQLRequest { Query = Q_META }, ct).ConfigureAwait(false);
                 var raw = resp.Data?["meta"];
-
-#if true
-                var str = raw?.ToString(Newtonsoft.Json.Formatting.Indented);
-#endif
-
                 if (raw is JObject jo) return jo;
 
                 if (raw is JValue jv)
@@ -380,14 +416,13 @@ namespace XQLite.AddIn
                     var s = jv.Type == JTokenType.String ? (string?)jv.Value : jv.ToString(Newtonsoft.Json.Formatting.None);
                     if (!string.IsNullOrWhiteSpace(s))
                     {
-                        try { return JObject.Parse(s!); } catch { /* 서버가 문자열로 보내되 들여쓰기가 섞인 경우 대비 */ }
+                        try { return JObject.Parse(s!); } catch { }
                     }
                 }
                 return null;
             }
             catch { return null; }
         }
-
 
         public async Task<JArray?> TryFetchAuditLog(long? since = null, CancellationToken ct = default)
         {
@@ -410,18 +445,12 @@ namespace XQLite.AddIn
             catch { return null; }
         }
 
-        // ── Presence / Recover ───────────────────────────────────────────────
+        // Presence / Recover
         public async Task<PresenceItem[]?> FetchPresence(CancellationToken ct = default)
         {
-            var req = new GraphQLRequest
-            {
-                Query = Q_PRESENCE
-            };
-
+            var req = new GraphQLRequest { Query = Q_PRESENCE };
             var resp = await _http.SendQueryAsync<PresenceResp>(req, ct).ConfigureAwait(false);
             var arr = resp.Data?.presence ?? Array.Empty<PresenceItem>();
-
-            // 혹시라도 역직렬화 중 null 항목이 섞이면 제거
             return arr.Where(p => p != null).ToArray();
         }
 
@@ -433,32 +462,31 @@ namespace XQLite.AddIn
             return parsed.Errors == null || parsed.Errors.Count == 0;
         }
 
-        // ⬇️ [ADD] 테이블 전체 스냅샷을 RowPatch 리스트로 변환
+        // 테이블 스냅샷(JSON 배열) → RowPatch 리스트 변환
         public async Task<List<RowPatch>> FetchRowsSnapshot(string table, CancellationToken ct = default)
         {
             try
             {
                 var req = new GraphQLRequest { Query = Q_ROWS_SNAPSHOT, Variables = new { t = table } };
                 var resp = await _http.SendQueryAsync<JObject>(req, ct).ConfigureAwait(false);
-                var arr = resp.Data?["rows"] as JArray;
+                var arr = resp.Data?["rowsSnapshot"] as JArray;
                 var list = new List<RowPatch>();
                 if (arr == null) return list;
+
                 foreach (var it in arr.OfType<JObject>())
                 {
-                    var rk = it["row_key"]?.ToString() ?? "";
+                    var rk = it["id"]?.ToString() ?? it["row_key"]?.ToString() ?? "";
                     var cells = new Dictionary<string, object?>(StringComparer.Ordinal);
-                    if (it["cells"] is JObject jo)
+                    foreach (var p in it.Properties())
                     {
-                        foreach (var p in jo.Properties())
-                            cells[p.Name] = p.Value.Type == JTokenType.Null ? null : (p.Value as JValue)?.Value;
+                        var pn = p.Name;
+                        if (pn.Equals("row_version", StringComparison.OrdinalIgnoreCase)) continue;
+                        if (pn.Equals("updated_at", StringComparison.OrdinalIgnoreCase)) continue;
+                        if (pn.Equals("deleted", StringComparison.OrdinalIgnoreCase)) continue;
+                        if (pn.Equals("id", StringComparison.OrdinalIgnoreCase)) continue;
+                        cells[pn] = (p.Value as JValue)?.Value;
                     }
-                    list.Add(new RowPatch
-                    {
-                        Table = table,
-                        RowKey = rk,
-                        Deleted = false,
-                        Cells = cells
-                    });
+                    list.Add(new RowPatch { Table = table, RowKey = rk, Deleted = false, Cells = cells });
                 }
                 return list;
             }
@@ -467,7 +495,6 @@ namespace XQLite.AddIn
 
         public async Task<UpsertResult> UpsertCells(IEnumerable<EditCell> cells, CancellationToken ct = default)
         {
-            // ✅ 서버 스키마(CellEditInput): table,row_key,column,value 로 맞춰 변환
             var payload = cells.Select(c => new
             {
                 table = c.Table,
@@ -497,16 +524,6 @@ namespace XQLite.AddIn
             var resp = await _http.SendQueryAsync<JObject>(req, ct).ConfigureAwait(false);
             var arr = resp.Data?["tableColumns"] as JArray;
             return arr?.ToObject<List<ColumnInfo>>() ?? new List<ColumnInfo>();
-        }
-
-        public Task TryDropColumns(string table, IEnumerable<string> names, CancellationToken ct = default)
-        {
-            var list = names?.Distinct(StringComparer.Ordinal) ?? Enumerable.Empty<string>();
-            return _http.SendMutationAsync<object>(new GraphQLRequest
-            {
-                Query = MUT_DROP_COLUMNS,
-                Variables = new { t = table, ns = list.ToArray() }
-            }, ct);
         }
 
         // ── Parser bridge ────────────────────────────────────────────────────
@@ -567,7 +584,7 @@ namespace XQLite.AddIn
                         Table = p["table"]?.ToString() ?? "",
                         RowKey = p["row_key"]?.ToObject<object>() ?? 0,
                         RowVersion = (long?)p["row_version"] ?? 0,
-                        Deleted = p["deleted"]?.Type == JTokenType.Boolean && (bool)p["deleted"]!,
+                        Deleted = ParseDeleted(p["deleted"]),
                         Cells = new Dictionary<string, object?>(StringComparer.Ordinal)
                     };
 
@@ -586,9 +603,7 @@ namespace XQLite.AddIn
             var ev = new ServerEvent { MaxRowVersion = 0, Patches = new List<RowPatch>() };
             if (data == null) return ev;
 
-            // ✅ 서버는 events
             var root = data["events"] as JObject;
-            // 혹시 구독 구현에서 배열로 올 수도 있으니 방어
             if (root == null && data["events"] is JArray arr && arr.Count > 0)
                 root = arr[0] as JObject;
             if (root == null) return ev;
@@ -604,7 +619,7 @@ namespace XQLite.AddIn
                         Table = p["table"]?.ToString() ?? "",
                         RowKey = p["row_key"]?.ToObject<object>() ?? 0,
                         RowVersion = (long?)p["row_version"] ?? 0,
-                        Deleted = p["deleted"]?.Type == JTokenType.Boolean && (bool)p["deleted"]!,
+                        Deleted = ParseDeleted(p["deleted"]),
                         Cells = new Dictionary<string, object?>(StringComparer.Ordinal)
                     };
 
@@ -616,6 +631,37 @@ namespace XQLite.AddIn
                 }
             }
             return ev;
+        }
+
+        // Int(0/1) 또는 Boolean 모두 허용
+        private static bool ParseDeleted(JToken? tok)
+        {
+            if (tok == null || tok.Type == JTokenType.Null) return false;
+            if (tok.Type == JTokenType.Boolean) return (bool)tok!;
+            if (tok.Type == JTokenType.Integer) return ((long)tok!) != 0;
+            if (tok.Type == JTokenType.String && long.TryParse((string)tok!, out var n)) return n != 0;
+            return false;
+        }
+
+        // ── 공통: 엑셀 메타 → 서버 type 매핑 ────────────────────────────────
+        private static string MapType(string kind)
+        {
+            if (string.IsNullOrWhiteSpace(kind)) return "text";
+            switch (kind.Trim().ToLowerInvariant())
+            {
+                case "int":
+                case "integer": return "integer";
+                case "real":
+                case "float":
+                case "double": return "real";
+                case "bool":
+                case "boolean": return "bool";
+                case "json": return "json";
+                case "date": return "integer"; // epoch ms 저장
+                case "text":
+                case "string":
+                default: return "text";
+            }
         }
     }
 
@@ -649,16 +695,32 @@ namespace XQLite.AddIn
         public long? LocalVersion { get; set; }
 
         public static Conflict System(string where, string msg) =>
-            new()
-            { Kind = "system", Message = $"[{where}] {msg}" };
+            new() { Kind = "system", Message = $"[{where}] {msg}" };
     }
 
+    // 추가/드랍 입력 DTO (입력 전용)
     internal sealed class ColumnDef
     {
         public string Name = "";
-        public string Kind = "text";   // int/real/text/bool/json/date
+        public string Kind = "text";   // integer/real/text/bool/json/date
         public bool NotNull = false;
         public string? Check;
+    }
+
+    // 이름 변경 입력 DTO
+    internal sealed class RenameDef
+    {
+        public string From = "";
+        public string To = "";
+    }
+
+    // 타입/제약 변경 입력 DTO
+    internal sealed class AlterDef
+    {
+        public string Name = "";
+        public string? ToType;      // integer/real/text/bool/json/date
+        public bool? ToNotNull;
+        public string? ToCheck;
     }
 
     // GraphQL 응답 DTO
@@ -667,7 +729,7 @@ namespace XQLite.AddIn
         public string? nickname { get; set; }
         public string? sheet { get; set; }
         public string? cell { get; set; }
-        public long? updated_at { get; set; } // ← ms epoch
+        public long? updated_at { get; set; } // ms epoch
     }
 
     internal sealed class PresenceResp
@@ -675,8 +737,7 @@ namespace XQLite.AddIn
         public PresenceItem[]? presence { get; set; }
     }
 
-    // Parser 결과 DTO
-
+    // 서버 tableColumns 결과
     public sealed class ColumnInfo
     {
         public string name { get; set; } = "";

@@ -1,7 +1,5 @@
 ﻿// XqlExcelInterop.cs
 using ExcelDna.Integration;
-using Microsoft.Internal.VisualStudio.Shell.Interop;
-using Microsoft.Office.Core;
 using Microsoft.Office.Interop.Excel;
 using System;
 using System.Collections.Generic;
@@ -16,7 +14,6 @@ namespace XQLite.AddIn
     /// - 리본/메뉴 → 명령 라우팅(Cmd_*)
     /// - Excel 이벤트(시트 변경/선택 변경/통합문서 열기·닫기) 핸들링
     /// - 헤더 범위 탐색, 타입 툴팁/주석 표시
-    /// - 셀 검증(정적 로직은 XqlMetaRegistry), 결과 시각화(주석)
     /// - Presence/락 하트비트 전송(선택 변경 시)
     /// - 셀 편집 → 2초 디바운스 업서트 큐 적재(XqlSync)
     /// </summary>
@@ -76,17 +73,14 @@ namespace XQLite.AddIn
         {
             try
             {
-                await EnsureActiveSheetSchema();
-                await _sync.FlushUpsertsNow(force: true);  // 변경된 셀만 즉시 업서트
-                                                           // Pull은 필요 시(버튼/갭 감지/주기)만
+                await EnsureActiveSheetSchema();             // 헤더 → 서버 스키마 동기화
+                await _sync.FlushUpsertsNow(force: true);    // 변경된 셀만 즉시 업서트
             }
             catch (Exception ex)
             {
                 XqlLog.Warn("CommitSmart failed: " + ex.Message);
             }
         }
-
-        // XqlExcelInterop.cs
 
         public async void Cmd_PullOnly()
         {
@@ -98,10 +92,8 @@ namespace XQLite.AddIn
                 var ws = app.ActiveSheet as Excel.Worksheet;
                 if (ws == null) { await _sync.PullSince(); return; }
 
-                // ✅ 부트스트랩 필요 판단: 마커 없음 OR 유효 데이터 거의 없음 OR 1행이 A/B/C… 폴백 헤더
+                // ✅ 부트스트랩 필요 판단
                 bool needsBootstrap = XqlSheet.NeedsBootstrap(ws);
-
-                // 강제 Full Pull(since=0) 또는 증분 Pull
                 await _sync.PullSince(needsBootstrap ? 0 : (long?)null);
             }
             catch (Exception ex)
@@ -112,7 +104,6 @@ namespace XQLite.AddIn
 
         public void Cmd_RecoverFromExcel()
         {
-            // 원클릭 복구: 엑셀 파일을 원본으로 DB 재생성
             var _ = _backup.RecoverFromExcel();
         }
 
@@ -129,10 +120,8 @@ namespace XQLite.AddIn
             finally { XqlCommon.ReleaseCom(wb); }
         }
 
-
         private void App_WorkbookBeforeClose(Excel.Workbook wb, ref bool Cancel)
         {
-            // 락 해제, 프레즌스 정리, 타이머 정지(중복 안전)
             var _ = _collab.ReleaseByMe();
             try { _sync.Stop(); } catch { }
             XqlCommon.ReleaseCom(wb);
@@ -171,11 +160,12 @@ namespace XQLite.AddIn
                 (header, data, lo) = ResolveHeaderAndData(sh);
                 if (header == null || data == null) return;
 
-                // 헤더 편집이면 캐시 무효화만
+                // 헤더 편집이면 캐시 무효화 + 커밋 가능 알림
                 var hitHeader = sh.Application.Intersect(target, header) as Excel.Range;
                 if (hitHeader != null)
                 {
                     XqlSheetView.InvalidateHeaderCache(sh.Name);
+                    XqlEvents.RaiseSchemaChanged(); // 리본 상태 갱신
                     XqlCommon.ReleaseCom(hitHeader);
                     return;
                 }
@@ -206,26 +196,15 @@ namespace XQLite.AddIn
 
                                     hdrCell = (Excel.Range)header.Cells[1, hdrIdx];
                                     var colName = (hdrCell.Value2 as string)?.Trim();
-                                    // ✅ 헤더가 비어 있으면 '헤더 셀'의 절대열 기준으로 열 문자 산출 (헤더 시작열이 A가 아닐 수도 있음)
+                                    // 편집 이벤트에서는 빈 헤더라도 열문자 사용(사용자 피드백용)
                                     if (string.IsNullOrWhiteSpace(colName))
                                         colName = XqlCommon.ColumnIndexToLetter(hdrCell.Column);
-
 
                                     int keyAbsCol = XqlSheet.FindKeyColumnAbsolute(header, sm.KeyColumn);
                                     keyCell = sh.Cells[cell.Row, keyAbsCol] as Excel.Range;
 
                                     var rowKeyObj = keyCell?.Value2;
                                     string? rowKey = rowKeyObj?.ToString();
-
-
-#if false
-                                    // ✅ 키가 비어 있으면, 수정한 컬럼이 무엇이든 키를 자동 생성해 채운다.
-                                    if (string.IsNullOrWhiteSpace(rowKey))
-                                    {
-                                        rowKey = Guid.NewGuid().ToString("N").Substring(0, 12);
-                                        if (keyCell != null) keyCell.Value2 = rowKey;
-                                    }
-#endif
 
                                     object? value = cell.Value2;
                                     _sync.EnqueueIfChanged(table, rowKey!, colName!, value);
@@ -255,7 +234,6 @@ namespace XQLite.AddIn
                 var ws = Sh as Excel.Worksheet; if (ws == null) return;
                 string sheet = ws.Name;
                 string cell = Target?.Address[false, false] ?? "";
-
                 XqlAddIn.Collab?.SelectionChanged(sheet, cell);
             }
             catch { /* non-fatal */ }
@@ -263,7 +241,9 @@ namespace XQLite.AddIn
         }
 
         /// <summary>
-        /// 활성 시트의 헤더/메타를 읽어 서버에 테이블 없으면 생성, 누락 컬럼을 추가.
+        /// 활성 시트의 헤더/메타를 읽어 서버 스키마(테이블/컬럼)와 동기화.
+        /// - Rename → Alter → Add → Drop 순으로 항상 실행(드랍 자동).
+        /// - 빈 헤더는 "삭제 의도"로 해석(추가/유지 대상에서 제외).
         /// </summary>
         private async Task EnsureActiveSheetSchema()
         {
@@ -280,29 +260,54 @@ namespace XQLite.AddIn
 
                 var sm = _sheet.GetOrCreateSheet(ws.Name);
 
-                // ① 헤더/컬럼명
-                var (hdr, names) = XqlSheet.GetHeaderAndNames(ws);
+                // ① 헤더/컬럼명 — 빈 칸은 그대로(삭제 의도 반영)
+                var (hdr, headerNamesRaw) = XqlSheet.GetHeaderAndNames(ws);
                 header = hdr;
-                if (header == null || names is not { Count: > 0 }) return;
+                if (header == null || headerNamesRaw is not { Count: > 0 }) return;
 
-                _sheet.EnsureColumns(ws.Name, names);
+                var headerNames = NormalizeHeaderNamesKeepBlanks(headerNamesRaw); // ★ 빈 이름 유지
+                var headerNamesForMeta = headerNames.Where(n => !string.IsNullOrWhiteSpace(n)).ToList();
+                _sheet.EnsureColumns(ws.Name, headerNamesForMeta);
 
                 var table = string.IsNullOrWhiteSpace(sm.TableName) ? ws.Name : sm.TableName!;
                 var key = string.IsNullOrWhiteSpace(sm.KeyColumn) ? "id" : sm.KeyColumn!;
 
                 // ② 테이블 보장
                 await be.TryCreateTable(table, key);
-
-                // ✅ 새 테이블이 생겼거나 헤더 기본구성이 바뀌었을 수 있음 → 캐시 무효화
                 XqlSheetView.InvalidateHeaderCache(ws.Name);
 
-                // ③ 서버 컬럼 조회 → '없을 때만' 추가
+                // ③ 서버 컬럼 조회
                 var serverCols = await be.GetTableColumns(table);
                 var serverSet = new HashSet<string>(serverCols.Select(c => c.name), StringComparer.OrdinalIgnoreCase);
-                // ⚠️ 메타(sm.Columns) 대신 실제 시트 헤더(names)로 계산해야 즉시 반영됨
-                var addTargets = names
-                    .Where(k => !string.IsNullOrWhiteSpace(k))
-                    .Where(k => !serverSet.Contains(k))
+
+                // ④ Rename 추론 → 적용
+                var renames = InferRenamesByIndex(serverCols, headerNames);
+                if (renames.Count > 0)
+                {
+                    try { await be.TryRenameColumns(table, renames); }
+                    catch (Exception ex) { XqlLog.Warn("RenameColumns skipped: " + ex.Message); }
+                    finally
+                    {
+                        serverCols = await be.GetTableColumns(table); // 갱신
+                        serverSet = new HashSet<string>(serverCols.Select(c => c.name), StringComparer.OrdinalIgnoreCase);
+                        XqlSheetView.InvalidateHeaderCache(ws.Name);
+                    }
+                }
+
+                // ⑤ Alter 후보(타입/Null)
+                var desired = BuildDesiredColumnSpec(sm, headerNamesForMeta);
+                var alters = InferAlters(serverCols, desired);
+                if (alters.Count > 0)
+                {
+                    try { await be.TryAlterColumns(table, alters); }
+                    catch (Exception ex) { XqlLog.Warn("AlterColumns skipped: " + ex.Message); }
+                }
+
+                // ⑥ Add 후보 — 빈 이름 제외 + rename 타겟 제외
+                var renamedTargets = new HashSet<string>(renames.Select(r => r.To), StringComparer.OrdinalIgnoreCase);
+                var addTargets = headerNamesForMeta
+                    .Where(n => !serverSet.Contains(n))
+                    .Where(n => !renamedTargets.Contains(n))
                     .Distinct(StringComparer.OrdinalIgnoreCase)
                     .ToList();
 
@@ -310,13 +315,11 @@ namespace XQLite.AddIn
                 {
                     var defs = addTargets.Select(name =>
                     {
-                        // 헤더가 메타보다 앞설 수 있으므로, 메타에 없으면 TEXT/NULL OK로 즉시 등록
                         if (!sm.Columns.TryGetValue(name, out var ct))
                         {
                             ct = new XqlSheet.ColumnType { Kind = XqlSheet.ColumnKind.Text, Nullable = true };
                             sm.SetColumn(name, ct);
                         }
-
                         return new ColumnDef
                         {
                             Name = name,
@@ -324,26 +327,25 @@ namespace XQLite.AddIn
                             {
                                 XqlSheet.ColumnKind.Int => "integer",
                                 XqlSheet.ColumnKind.Real => "real",
-                                XqlSheet.ColumnKind.Bool => "bool",     // ✅ 서버 규격
-                                XqlSheet.ColumnKind.Date => "integer",  // (epoch ms를 int로 저장)
+                                XqlSheet.ColumnKind.Bool => "bool",
+                                XqlSheet.ColumnKind.Date => "integer",  // epoch ms
                                 XqlSheet.ColumnKind.Json => "json",
                                 _ => "text"
                             },
                             NotNull = !ct.Nullable,
                             Check = null
                         };
-                    });
-                    await be.TryAddColumns(table, defs);
+                    }).ToList();
 
-                    // ✅ 헤더 컬럼이 늘어남 → 캐시 무효화
-                    XqlSheetView.InvalidateHeaderCache(ws.Name);
+                    try { await be.TryAddColumns(table, defs); }
+                    catch (Exception ex) { XqlLog.Warn("AddColumns skipped: " + ex.Message); }
+                    finally { XqlSheetView.InvalidateHeaderCache(ws.Name); }
                 }
 
-                // ④ (옵션) 헤더에 없는 서버 컬럼 DROP
-                if (XqlConfig.DropColumnsOnCommit)
+                // ⑦ Drop 후보 — **항상 실행** (PK/예약 제외, 헤더에 없는 컬럼 드랍)
                 {
                     var metaCols = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { key, "row_version", "updated_at", "deleted" };
-                    var headerSet = new HashSet<string>(names, StringComparer.OrdinalIgnoreCase);
+                    var headerSet = new HashSet<string>(headerNamesForMeta, StringComparer.OrdinalIgnoreCase);
 
                     var drop = serverCols
                         .Where(c => !c.pk && !metaCols.Contains(c.name))
@@ -357,11 +359,7 @@ namespace XQLite.AddIn
                     {
                         try { await be.TryDropColumns(table, drop); }
                         catch (Exception ex) { XqlLog.Warn("DropColumns skipped: " + ex.Message); }
-                        finally
-                        {
-                            // ✅ 헤더 기준으로 불필요 컬럼 삭제됨 → 캐시 무효화
-                            XqlSheetView.InvalidateHeaderCache(ws.Name);
-                        }
+                        finally { XqlSheetView.InvalidateHeaderCache(ws.Name); }
                     }
                 }
 
@@ -369,6 +367,110 @@ namespace XQLite.AddIn
             }
             catch (Exception ex) { XqlLog.Warn("EnsureActiveSheetSchema: " + ex.Message); }
             finally { XqlCommon.ReleaseCom(header, ws); }
+        }
+
+        // ======== 내부 유틸 ========
+
+        /// <summary>헤더 이름을 Trim만 하고, 빈 칸은 그대로 유지한다(삭제 의도 반영).</summary>
+        private static List<string> NormalizeHeaderNamesKeepBlanks(IList<string> names)
+        {
+            var list = new List<string>(names.Count);
+            for (int i = 0; i < names.Count; i++)
+                list.Add((names[i] ?? "").Trim());
+            return list;
+        }
+
+        /// <summary>
+        /// 서버 컬럼과 헤더 컬럼을 비교하여 (인덱스 기반) rename 후보를 추론.
+        /// 같은 위치에서 이름만 달라졌으면 rename으로 간주(PK/예약 컬럼 제외).
+        /// </summary>
+        private static List<RenameDef> InferRenamesByIndex(IReadOnlyList<ColumnInfo> serverCols, IList<string> header)
+        {
+            var renames = new List<RenameDef>();
+            if (serverCols.Count == 0 || header.Count == 0) return renames;
+
+            var bizCols = serverCols.Where(c => !c.pk && !IsReserved(c.name)).ToList();
+            int lim = Math.Min(bizCols.Count, header.Count);
+
+            for (int i = 0; i < lim; i++)
+            {
+                var oldName = (bizCols[i].name ?? "").Trim();
+                var newName = (header[i] ?? "").Trim();
+
+                if (string.IsNullOrEmpty(oldName) || string.IsNullOrEmpty(newName)) continue;
+                if (oldName.Equals(newName, StringComparison.OrdinalIgnoreCase)) continue;
+
+                renames.Add(new RenameDef { From = oldName, To = newName });
+            }
+
+            return renames
+                .Where(r => !string.IsNullOrWhiteSpace(r.From) && !string.IsNullOrWhiteSpace(r.To)
+                         && !r.From.Equals(r.To, StringComparison.OrdinalIgnoreCase))
+                .GroupBy(r => (From: r.From.ToLowerInvariant(), To: r.To.ToLowerInvariant()))
+                .Select(g => g.First())
+                .ToList();
+        }
+
+        private static bool IsReserved(string name)
+        {
+            return string.Equals(name, "row_version", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(name, "updated_at", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(name, "deleted", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static Dictionary<string, (string Type, bool NotNull, string? Check)> BuildDesiredColumnSpec(XqlSheet.Meta sm, IEnumerable<string> headerNames)
+        {
+            var result = new Dictionary<string, (string, bool, string?)>(StringComparer.OrdinalIgnoreCase);
+            foreach (var n in headerNames)
+            {
+                if (string.IsNullOrWhiteSpace(n)) continue;
+                if (!sm.Columns.TryGetValue(n, out var ct))
+                {
+                    ct = new XqlSheet.ColumnType { Kind = XqlSheet.ColumnKind.Text, Nullable = true };
+                    sm.SetColumn(n, ct);
+                }
+                string type = ct.Kind switch
+                {
+                    XqlSheet.ColumnKind.Int => "integer",
+                    XqlSheet.ColumnKind.Real => "real",
+                    XqlSheet.ColumnKind.Bool => "bool",
+                    XqlSheet.ColumnKind.Date => "integer",
+                    XqlSheet.ColumnKind.Json => "json",
+                    _ => "text"
+                };
+                bool notNull = !ct.Nullable;
+                result[n] = (type, notNull, null);
+            }
+            return result;
+        }
+
+        private static List<AlterDef> InferAlters(IEnumerable<ColumnInfo> serverCols, Dictionary<string, (string Type, bool NotNull, string? Check)> desired)
+        {
+            var list = new List<AlterDef>();
+            foreach (var sc in serverCols)
+            {
+                if (sc.pk) continue;
+                if (IsReserved(sc.name)) continue;
+                if (!desired.TryGetValue(sc.name, out var want)) continue;
+
+                var serverType = (sc.type ?? "").Trim();
+                var wantType = want.Type.Trim();
+
+                bool typeDiff = !serverType.Equals(wantType, StringComparison.OrdinalIgnoreCase);
+                bool nnDiff = sc.notnull != want.NotNull;
+
+                if (typeDiff || nnDiff)
+                {
+                    list.Add(new AlterDef
+                    {
+                        Name = sc.name,
+                        ToType = typeDiff ? wantType : null,
+                        ToNotNull = nnDiff ? want.NotNull : null,
+                        ToCheck = null
+                    });
+                }
+            }
+            return list;
         }
     }
 }

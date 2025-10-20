@@ -7,9 +7,9 @@
 //     _row_state(table,row_key,row_version,ts,deleted),
 //     _audit_log, _presence, _locks
 // - upsert/delete: 이벤트 기록 + row_state 즉시 갱신 (O(1) 최신상태 조회)
-// - rowsSnapshot: main ⨝ row_state 를 서버에서 조인해 스냅샷 제공(클라 단점 해소)
+// - rowsSnapshot: main ⨝ row_state 를 서버에서 조인해 스냅샷 제공
 // - project: null/"" -> "default"
-// - PubSub 타입/호출 정리(에러 없이 컴파일)
+// - “_” 프리픽스 사용자 테이블 자동 이관(main → admin)
 //
 // deps:
 //   npm i graphql graphql-yoga graphql-type-json better-sqlite3
@@ -40,7 +40,7 @@ const CLEAN_INTERVAL_MS = 5_000;
 const BROADCAST_BACKSCAN = 1024;
 
 // ────────────────────────────────────────────────────────────
-// utils
+// helpers
 // ────────────────────────────────────────────────────────────
 function nowMs(): number { return Date.now(); }
 function normalizeProject(input?: string | null): string { const v = (input ?? '').trim(); return v || PROJECT_FALLBACK; }
@@ -55,6 +55,25 @@ function escapeIdent(name: string): string { return `"${String(name).replace(/"/
 function capInt32(n: number): number { if (!Number.isFinite(n)) return 0; return Math.max(Math.min(n | 0, 2147483647), -2147483648); }
 function dataPath(project: string) { ensureDir(DATA_DIR); return path.join(DATA_DIR, `${project}.sqlite`); }
 function adminPath(project: string) { ensureDir(DATA_DIR); return path.join(DATA_DIR, `${project}.admin.sqlite`); }
+function projectFromCtx(ctx: any): string | undefined {
+  try { return ctx?.request?.headers?.get?.('x-project') ?? undefined; } catch { return undefined; }
+}
+function bundleFrom(ctx: any, projectArg?: string | null): DBBundle {
+  const p = normalizeProject(projectArg ?? projectFromCtx(ctx) ?? null);
+  return openBundle(p);
+}
+
+/** storage class mapping */
+function sqlType(t?: string | null) {
+  const v = (t ?? '').trim().toLowerCase();
+  if (!v) return 'TEXT';
+  if (v === 'integer' || v === 'int') return 'INTEGER';
+  if (v === 'real' || v === 'float' || v === 'double') return 'REAL';
+  if (v === 'bool' || v === 'boolean') return 'INTEGER'; // 0/1
+  if (v === 'json') return 'TEXT'; // JSON in TEXT (JSON1)
+  if (v === 'text' || v === 'string') return 'TEXT';
+  return v.toUpperCase();
+}
 
 // ────────────────────────────────────────────────────────────
 // types/cache
@@ -96,19 +115,90 @@ type DBBundle = {
 
 const dbCache = new Map<string, DBBundle>();
 
-// 메인 스키마가 순수 데이터인지 검증
+// admin 전용 표준 테이블(절대 main 금지)
+const FORBIDDEN_IN_MAIN = new Set<string>(['_meta', '_events', '_presence', '_locks', '_audit_log', '_row_state']);
+
+// ────────────────────────────────────────────────────────────
+// schema hygiene & migration
+// ────────────────────────────────────────────────────────────
+/** admin attach 후 호출: main에 남은 '_' 테이블들을 admin으로 이관 */
+function migrateUnderscoreTablesToAdmin(db: Database.Database) {
+  // 후보 수집
+  const tables = db.prepare(`SELECT name, sql FROM main.sqlite_master WHERE type='table'`).all() as Array<{ name: string; sql: string | null }>;
+  const idxs = db.prepare(`SELECT name, tbl_name, sql FROM main.sqlite_master WHERE type='index' AND sql IS NOT NULL`).all() as Array<{ name: string; tbl_name: string; sql: string }>;
+  const trgs = db.prepare(`SELECT name, tbl_name, sql FROM main.sqlite_master WHERE type='trigger' AND sql IS NOT NULL`).all() as Array<{ name: string; tbl_name: string; sql: string }>;
+
+  const targets = tables
+    .filter(t => t.name.startsWith('_') && !FORBIDDEN_IN_MAIN.has(t.name));
+
+  if (targets.length === 0) return;
+
+  const tx = db.transaction(() => {
+    for (const t of targets) {
+      const name = t.name;
+      const createSQL = (t.sql ?? '').trim();
+      if (!createSQL) {
+        // 스키마가 없으면 컬럼 프로빙 후 AS SELECT로 생성
+        const cols = (db.prepare(`PRAGMA main.table_info(${escapeIdent(name)})`).all() as any[]).map(c => escapeIdent(c.name)).join(',');
+        db.exec(`CREATE TABLE IF NOT EXISTS admin.${escapeIdent(name)} AS SELECT ${cols || '*'} FROM main.${escapeIdent(name)} WHERE 0`);
+      } else {
+        // CREATE TABLE ... → CREATE TABLE admin."name" ...
+        // 첫 테이블 식별자만 admin.<ident>로 치환
+        const ddl = createSQL.replace(/^\s*CREATE\s+TABLE\s+(IF\s+NOT\s+EXISTS\s+)?((["`\[]?).+?\3)/i,
+          (_m, ifexists) => `CREATE TABLE ${ifexists ?? ''}admin.${escapeIdent(name)}`);
+        db.exec(ddl);
+      }
+
+      // 컬럼 교집합으로 데이터 복사
+      const mainCols = (db.prepare(`PRAGMA main.table_info(${escapeIdent(name)})`).all() as Array<{ name: string }>).map(c => c.name);
+      const adminCols = (db.prepare(`PRAGMA admin.table_info(${escapeIdent(name)})`).all() as Array<{ name: string }>).map(c => c.name);
+      const common = mainCols.filter(c => adminCols.includes(c));
+      if (common.length > 0) {
+        const colsList = common.map(escapeIdent).join(',');
+        db.exec(`INSERT INTO admin.${escapeIdent(name)}(${colsList}) SELECT ${colsList} FROM main.${escapeIdent(name)}`);
+      }
+
+      // 인덱스 재생성(있다면)
+      const idxOfTable = idxs.filter(ix => ix.tbl_name === name);
+      for (const ix of idxOfTable) {
+        const idxDDL = ix.sql
+          .replace(/^\s*CREATE\s+INDEX\s+(IF\s+NOT\s+EXISTS\s+)?/i, m => `${m}admin.`)
+          .replace(new RegExp(`ON\\s+(${escapeRegex(name)}|${escapeRegex('"' + name + '"')})`, 'i'),
+            _m => `ON admin.${escapeIdent(name)}`);
+        try { db.exec(idxDDL); } catch { /* ignore conflicting names across schemas */ }
+      }
+
+      // 트리거는 스키마 명시/테이블 참조가 복잡할 수 있어 경고만 출력
+      const trgOfTable = trgs.filter(tr => tr.tbl_name === name);
+      if (trgOfTable.length > 0) {
+        console.warn(`[WARN] Triggers on ${name} detected; migration skipped. Please recreate them on admin manually.`);
+      }
+
+      // 원본 삭제
+      db.exec(`DROP TABLE main.${escapeIdent(name)}`);
+      console.log(`[MIGRATE] Moved table ${name} → admin.${name}`);
+    }
+  });
+  tx();
+}
+
+function escapeRegex(s: string) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** 메인 스키마에 admin 전용 테이블이 남아 있으면 차단 */
 function assertDataSchemaIsPure(db: Database.Database) {
-  const rows = db.prepare(`SELECT name FROM sqlite_master WHERE type='table'`).all() as Array<{ name: string }>;
+  const rows = db.prepare(`SELECT name FROM main.sqlite_master WHERE type='table'`).all() as Array<{ name: string }>;
   const names = new Set(rows.map(r => r.name));
-  const forbidden = ['_meta', '_events', '_presence', '_locks', '_audit_log', '_row_state'];
-  const found = forbidden.filter(n => names.has(n));
+  const found = [...FORBIDDEN_IN_MAIN].filter(n => names.has(n));
   if (found.length) {
     throw new Error(`Admin tables must NOT exist in main schema: ${found.join(', ')}. Use admin.<table> via ATTACH.`);
   }
-  const suspicious = rows.map(r => r.name).filter(n => n.startsWith('_'));
-  if (suspicious.length) console.warn(`[WARN] Main schema has '_' prefixed tables: ${suspicious.join(', ')} (move to admin schema)`);
 }
 
+// ────────────────────────────────────────────────────────────
+// open bundle (with migration)
+// ────────────────────────────────────────────────────────────
 function openBundle(projectRaw?: string | null): DBBundle {
   const project = normalizeProject(projectRaw);
   const cached = dbCache.get(project);
@@ -117,19 +207,18 @@ function openBundle(projectRaw?: string | null): DBBundle {
   // open main (data)
   const db = new Database(dataPath(project), READONLY ? { readonly: true } : {});
   applyPragmasTo(db);
-  assertDataSchemaIsPure(db);
 
-  // ATTACH admin
+  // ATTACH admin first (migration needs it)
   const ap = adminPath(project).replace(/"/g, '""');
   db.exec(`ATTACH DATABASE "${ap}" AS admin;`);
   applyPragmasTo(db, 'admin');
 
-  // admin schema
+  // ── admin schema ensure
   db.exec(`
     CREATE TABLE IF NOT EXISTS admin._meta (key TEXT PRIMARY KEY, value TEXT);
     CREATE TABLE IF NOT EXISTS admin._events (
       row_version INTEGER PRIMARY KEY,
-      ts         REAL    NOT NULL,                 -- updated_at(ms)
+      ts         REAL    NOT NULL,
       table_name TEXT    NOT NULL,
       row_key    TEXT    NOT NULL,
       deleted    INTEGER NOT NULL DEFAULT 0,
@@ -173,6 +262,15 @@ function openBundle(projectRaw?: string | null): DBBundle {
     CREATE INDEX IF NOT EXISTS admin._locks_updated    ON _locks(updated_at);
     CREATE INDEX IF NOT EXISTS admin._audit_rowver     ON _audit_log(row_version);
   `);
+
+  // ── migrate '_' tables (user-owned) from main → admin
+  if (!READONLY) {
+    try { migrateUnderscoreTablesToAdmin(db); }
+    catch (e) { console.warn('[WARN] migration failed:', (e as any)?.message ?? e); }
+  }
+
+  // ── now ensure main is pure
+  assertDataSchemaIsPure(db);
 
   // _meta init
   const getMetaVersion = db.prepare(`SELECT value FROM admin._meta WHERE key='max_row_version'`);
@@ -232,7 +330,7 @@ function openBundle(projectRaw?: string | null): DBBundle {
       ORDER BY row_version ASC
     `),
 
-    // row_state upsert
+    // row_state
     rowStateUpsert: db.prepare(`
       INSERT INTO admin._row_state(table_name, row_key, row_version, ts, deleted)
       VALUES(@table_name, @row_key, @row_version, @ts, @deleted)
@@ -314,7 +412,7 @@ const typeDefs = /* GraphQL */ `
     table: String!
     row_key: String!
     row_version: Int!
-    updated_at: Float!   # ms, admin._events.ts
+    updated_at: Float!
     deleted: Int!
     cells: JSON!
   }
@@ -385,6 +483,18 @@ const typeDefs = /* GraphQL */ `
     check: String
   }
 
+  input RenameDefInput {
+    from: String!
+    to: String!
+  }
+
+  input AlterDefInput {
+    name: String!
+    toType: String
+    toNotNull: Boolean
+    toCheck: String
+  }
+
   type Query {
     ping: Float!
     rows(since_version: Int, table: String, project: String): RowsResult!
@@ -405,6 +515,8 @@ const typeDefs = /* GraphQL */ `
     createTable(table: String!, key: String!, project: String): Ok!
     addColumns(table: String!, columns: [ColumnDefInput!]!, project: String): Ok!
     dropColumns(table: String!, names: [String!]!, project: String): Ok!
+    renameColumns(table: String!, renames: [RenameDefInput!]!, project: String): Ok!
+    alterColumns(table: String!, alters: [AlterDefInput!]!, project: String): Ok!
     presenceTouch(nickname: String!, sheet: String, cell: String, project: String): Ok!
     acquireLock(cell: String!, by: String!, project: String): Ok!
     releaseLocksBy(by: String!, project: String): Ok!
@@ -450,8 +562,8 @@ const resolvers = {
   Query: {
     ping: () => nowMs(),
 
-    rows: (_: unknown, args: { since_version?: number; table?: string; project?: string }) => {
-      const bundle = openBundle(args.project);
+    rows: (_: unknown, args: { since_version?: number; table?: string; project?: string }, ctx: any) => {
+      const bundle = bundleFrom(ctx, args.project);
       const since = capInt32(Number(args.since_version ?? 0));
       const list = bundle.stmts.selectEventsSince.all({ since }) as Array<{
         row_version: number; ts: number; table_name: string; row_key: string; deleted: number; cells: string;
@@ -467,13 +579,11 @@ const resolvers = {
       return { max_row_version: max, patches };
     },
 
-    // 서버가 main ⨝ row_state 해서 스냅샷을 JSON 배열로 반환
-    rowsSnapshot: (_: unknown, args: { table: string; include_deleted?: boolean; project?: string }) => {
-      const bundle = openBundle(args.project);
+    rowsSnapshot: (_: unknown, args: { table: string; include_deleted?: boolean; project?: string }, ctx: any) => {
+      const bundle = bundleFrom(ctx, args.project);
       const info = bundle.stmts.tableInfo(args.table);
       if (info.length === 0) return [];
       const pk = info.find(c => (c.pk | 0) > 0)?.name ?? 'id';
-
       const whereDel = args.include_deleted ? '' : `AND rs.deleted=0`;
       const sql = `
         SELECT m.*, rs.row_version, rs.ts AS updated_at, rs.deleted
@@ -483,12 +593,11 @@ const resolvers = {
         WHERE 1=1 ${whereDel}
         ORDER BY m.${escapeIdent(pk)}
       `;
-      const rows = bundle.db.prepare(sql).all({ t: args.table }) as any[];
-      return rows;
+      return bundle.db.prepare(sql).all({ t: args.table }) as any[];
     },
 
-    rowState: (_: unknown, args: { table: string; keys?: string[]; project?: string }) => {
-      const bundle = openBundle(args.project);
+    rowState: (_: unknown, args: { table: string; keys?: string[]; project?: string }, ctx: any) => {
+      const bundle = bundleFrom(ctx, args.project);
       if (!args.keys || args.keys.length === 0) {
         const all = bundle.stmts.rowStateGetAll.all({ table: args.table }) as Array<{ row_key: string; row_version: number; ts: number; deleted: number }>;
         return all.map(r => ({ row_key: r.row_key, row_version: r.row_version | 0, updated_at: r.ts, deleted: r.deleted | 0 }));
@@ -499,8 +608,8 @@ const resolvers = {
       }
     },
 
-    meta: (_: unknown, args: { project?: string }) => {
-      const bundle = openBundle(args.project);
+    meta: (_: unknown, args: { project?: string }, ctx: any) => {
+      const bundle = bundleFrom(ctx, args.project);
       const mv = bundle.stmts.selectMaxVersion.get() as { v: number };
       const tables = bundle.db
         .prepare(`
@@ -517,8 +626,8 @@ const resolvers = {
       return { meta: { max_row_version: String(max) }, schema };
     },
 
-    audit_log: (_: unknown, args: { since_version?: number; project?: string }) => {
-      const bundle = openBundle(args.project);
+    audit_log: (_: unknown, args: { since_version?: number; project?: string }, ctx: any) => {
+      const bundle = bundleFrom(ctx, args.project);
       const since = capInt32(Number(args.since_version ?? 0));
       const rows = bundle.stmts.auditSince.all({ since }) as Array<{
         ts: number; user: string; table_name: string; row_key: string; column: string | null;
@@ -531,8 +640,8 @@ const resolvers = {
       }));
     },
 
-    presence: (_: unknown, args: { project?: string }) => {
-      const bundle = openBundle(args.project);
+    presence: (_: unknown, args: { project?: string }, ctx: any) => {
+      const bundle = bundleFrom(ctx, args.project);
       const since = nowMs() - PRESENCE_TTL_MS;
       const rows = bundle.stmts.presenceListLive.all({ since }) as Array<{
         nickname: string; sheet: string | null; cell: string | null; updated_at: number;
@@ -540,15 +649,15 @@ const resolvers = {
       return rows.map(r => ({ nickname: r.nickname, sheet: r.sheet, cell: r.cell, updated_at: r.updated_at }));
     },
 
-    tableColumns: (_: unknown, args: { table: string; project?: string }) => {
-      const bundle = openBundle(args.project);
+    tableColumns: (_: unknown, args: { table: string; project?: string }, ctx: any) => {
+      const bundle = bundleFrom(ctx, args.project);
       const info = bundle.stmts.tableInfo(args.table);
       return info.map(c => ({ name: c.name, type: c.type ?? '', notnull: !!(c.notnull | 0), pk: !!(c.pk | 0) }));
     },
 
-    exportDatabase: (_: unknown, args: { project?: string }) => {
-      const project = normalizeProject(args.project);
-      const buf = fs.readFileSync(dataPath(project));
+    exportDatabase: (_: unknown, args: { project?: string }, ctx: any) => {
+      const bundle = bundleFrom(ctx, args.project);
+      const buf = fs.readFileSync(dataPath(bundle.project));
       return buf.toString('base64');
     },
 
@@ -556,33 +665,32 @@ const resolvers = {
   },
 
   Mutation: {
-    presenceTouch: (_: unknown, args: { nickname: string; sheet?: string; cell?: string; project?: string }) => {
+    presenceTouch: (_: unknown, args: { nickname: string; sheet?: string; cell?: string; project?: string }, ctx: any) => {
       if (READONLY) return { ok: true };
-      const bundle = openBundle(args.project);
+      const bundle = bundleFrom(ctx, args.project);
       bundle.stmts.presenceUpsert.run({
         nickname: args.nickname, sheet: args.sheet ?? null, cell: args.cell ?? null, updated_at: nowMs(),
       });
       return { ok: true };
     },
 
-    acquireLock: (_: unknown, args: { cell: string; by: string; project?: string }) => {
+    acquireLock: (_: unknown, args: { cell: string; by: string; project?: string }, ctx: any) => {
       if (READONLY) return { ok: true };
-      const bundle = openBundle(args.project);
+      const bundle = bundleFrom(ctx, args.project);
       bundle.stmts.lockAcquire.run({ cell: args.cell, by: args.by, updated_at: nowMs() });
       return { ok: true };
     },
 
-    releaseLocksBy: (_: unknown, args: { by: string; project?: string }) => {
+    releaseLocksBy: (_: unknown, args: { by: string; project?: string }, ctx: any) => {
       if (READONLY) return { ok: true };
-      const bundle = openBundle(args.project);
+      const bundle = bundleFrom(ctx, args.project);
       bundle.stmts.lockReleaseBy.run({ by: args.by });
       return { ok: true };
     },
 
-    createTable: (_: unknown, args: { table: string; key: string; project?: string }) => {
+    createTable: (_: unknown, args: { table: string; key: string; project?: string }, ctx: any) => {
       if (READONLY) return { ok: true };
-      const bundle = openBundle(args.project);
-      // main은 순수 데이터만: id PK만 생성
+      const bundle = bundleFrom(ctx, args.project);
       bundle.db.exec(`
         CREATE TABLE IF NOT EXISTS ${escapeIdent(args.table)} (
           ${escapeIdent(args.key)} TEXT PRIMARY KEY
@@ -590,12 +698,12 @@ const resolvers = {
       return { ok: true };
     },
 
-    addColumns: (_: unknown, args: { table: string; columns: Array<{ name: string; type?: string; notNull?: boolean; check?: string }>; project?: string }) => {
+    addColumns: (_: unknown, args: { table: string; columns: Array<{ name: string; type?: string; notNull?: boolean; check?: string }>; project?: string }, ctx: any) => {
       if (READONLY) return { ok: true };
-      const bundle = openBundle(args.project);
+      const bundle = bundleFrom(ctx, args.project);
       const cols = args.columns.map(c => ({
         name: c.name,
-        type: (c.type ?? '').trim(),
+        type: sqlType(c.type),
         check: (c.check ?? '').trim(),
       }));
       const exists = bundle.stmts.tableInfo(args.table).map(x => x.name);
@@ -604,31 +712,103 @@ const resolvers = {
       const tx = bundle.db.transaction(() => {
         for (const c of cols) {
           if (!c.name || RESERVED_MAIN.has(c.name) || existSet.has(c.name)) continue;
-          let ddl = `ALTER TABLE ${escapeIdent(args.table)} ADD COLUMN ${escapeIdent(c.name)}`;
-          ddl += c.type ? ` ${c.type}` : ' TEXT';
+          let ddl = `ALTER TABLE ${escapeIdent(args.table)} ADD COLUMN ${escapeIdent(c.name)} ${c.type}`;
           if (c.check) ddl += ` CHECK(${c.check})`;
           bundle.db.exec(ddl);
+          existSet.add(c.name);
         }
       });
       tx();
       return { ok: true };
     },
 
-    dropColumns: (_: unknown, args: { table: string; names: string[]; project?: string }) => {
+    dropColumns: (_: unknown, args: { table: string; names: string[]; project?: string }, ctx: any) => {
       if (READONLY) return { ok: true };
-      const bundle = openBundle(args.project);
-      for (const n of args.names) {
-        if (RESERVED_MAIN.has(n)) continue;
+      const bundle = bundleFrom(ctx, args.project);
+      const info = bundle.stmts.tableInfo(args.table);
+      if (!info.length) return { ok: true };
+      const pk = info.find(c => (c.pk | 0) > 0)?.name ?? 'id';
+      const targets = (args.names ?? []).filter(n => n && n !== pk && !RESERVED_MAIN.has(n));
+      if (!targets.length) return { ok: true };
+
+      // 최신 SQLite에서 직접 DROP COLUMN 시도
+      let allOk = true;
+      for (const n of targets) {
         try {
           bundle.db.exec(`ALTER TABLE ${escapeIdent(args.table)} DROP COLUMN ${escapeIdent(n)}`);
-        } catch { /* ignore for old SQLite or constraints */ }
+        } catch {
+          allOk = false;
+          break;
+        }
       }
+      if (allOk) return { ok: true };
+
+      // 폴백: 재구성
+      const cols = bundle.stmts.tableInfo(args.table);
+      const kept = cols.filter(c => !targets.includes(c.name));
+      const def = kept.map(c => {
+        const typ = c.type ? ` ${c.type}` : '';
+        const nn = (c.notnull | 0) ? ' NOT NULL' : '';
+        const pkd = (c.pk | 0) ? ' PRIMARY KEY' : '';
+        return `${escapeIdent(c.name)}${typ}${nn}${pkd}`;
+      }).join(', ');
+      const tmp = `_tmp_${Date.now().toString(36)}`;
+      const colList = kept.map(c => escapeIdent(c.name)).join(', ');
+
+      const tx = bundle.db.transaction(() => {
+        bundle.db.exec(`CREATE TABLE ${escapeIdent(tmp)} (${def})`);
+        bundle.db.exec(`INSERT INTO ${escapeIdent(tmp)} (${colList}) SELECT ${colList} FROM ${escapeIdent(args.table)}`);
+        bundle.db.exec(`DROP TABLE ${escapeIdent(args.table)}`);
+        bundle.db.exec(`ALTER TABLE ${escapeIdent(tmp)} RENAME TO ${escapeIdent(args.table)}`);
+      });
+      tx();
       return { ok: true };
     },
 
-    deleteRows: (_: unknown, args: { table: string; keys: string[]; hard?: boolean; project?: string }) => {
+    renameColumns: (_: unknown, args: { table: string; renames: Array<{ from: string; to: string }>; project?: string }, ctx: any) => {
       if (READONLY) return { ok: true };
-      const bundle = openBundle(args.project);
+      const bundle = bundleFrom(ctx, args.project);
+      const info = bundle.stmts.tableInfo(args.table);
+      if (info.length === 0) return { ok: true };
+
+      const reserved = new Set(['row_version', 'updated_at', 'deleted']); // defensive
+      const pk = info.find(c => (c.pk | 0) > 0)?.name;
+
+      const tx = bundle.db.transaction(() => {
+        for (const r of args.renames) {
+          if (!r?.from || !r?.to) continue;
+          if (pk && r.from === pk) continue;
+          if (reserved.has(r.from)) continue;
+          if (r.from === r.to) continue;
+          const sql = `ALTER TABLE ${escapeIdent(args.table)} RENAME COLUMN ${escapeIdent(r.from)} TO ${escapeIdent(r.to)}`;
+          bundle.db.exec(sql);
+        }
+      });
+      tx();
+
+      return { ok: true };
+    },
+
+    alterColumns: (_: unknown, args: { table: string; alters: Array<{ name: string; toType?: string | null; toNotNull?: boolean | null; toCheck?: string | null }>; project?: string }, ctx: any) => {
+      if (READONLY) return { ok: true };
+      const bundle = bundleFrom(ctx, args.project);
+      const info = bundle.stmts.tableInfo(args.table);
+      if (info.length === 0) return { ok: true };
+
+      const wants = new Map<string, { toType?: string | null; toNotNull?: boolean | null; toCheck?: string | null }>();
+      for (const a of args.alters ?? []) {
+        if (!a?.name) continue;
+        wants.set(a.name, { toType: (a.toType ?? null), toNotNull: a.toNotNull ?? null, toCheck: a.toCheck ?? null });
+      }
+      if (wants.size === 0) return { ok: true };
+
+      rebuildTableWithAlters(bundle, args.table, info, wants);
+      return { ok: true };
+    },
+
+    deleteRows: (_: unknown, args: { table: string; keys: string[]; hard?: boolean; project?: string }, ctx: any) => {
+      if (READONLY) return { ok: true };
+      const bundle = bundleFrom(ctx, args.project);
       const info = bundle.stmts.tableInfo(args.table);
       if (info.length === 0) return { ok: true };
       const pk = info.find(c => (c.pk | 0) > 0)?.name ?? 'id';
@@ -637,11 +817,7 @@ const resolvers = {
         for (const id of args.keys) {
           const rv = nextRowVersion(bundle);
           const ts = nowMs();
-
-          // main에서 실제 삭제
           bundle.db.prepare(`DELETE FROM ${escapeIdent(args.table)} WHERE ${escapeIdent(pk)}=@id`).run({ id });
-
-          // 이벤트 & 감사 & row_state
           bundle.stmts.insertEvent.run({
             row_version: rv, ts, table_name: args.table, row_key: id, deleted: 1, cells: JSON.stringify({}),
           });
@@ -662,14 +838,13 @@ const resolvers = {
       return { ok: true };
     },
 
-    upsertCells: (_: unknown, args: { cells: Array<{ table: string; row_key: string; column: string; value?: string | null }>; project?: string }) => {
-      const bundle = openBundle(args.project);
+    upsertCells: (_: unknown, args: { cells: Array<{ table: string; row_key: string; column: string; value?: string | null }>; project?: string }, ctx: any) => {
+      const bundle = bundleFrom(ctx, args.project);
       if (READONLY) {
         const mv = bundle.stmts.selectMaxVersion.get() as { v: number };
         return { max_row_version: (mv?.v ?? 0) | 0, errors: ['READONLY'], conflicts: null };
       }
 
-      // 테이블/컬럼 사전 보정
       const perTable = new Map<string, Set<string>>();
       for (const e of args.cells) {
         ensureTable(bundle, e.table, 'id');
@@ -680,8 +855,6 @@ const resolvers = {
       for (const [table, set] of perTable) ensureColumns(bundle, table, Array.from(set));
 
       const errors: string[] = [];
-
-      // 실제 upsert
       const grouped = new Map<string, Array<{ column: string; value: any }>>();
       const keyMap = new Map<string, { table: string; row_key: string }>();
       for (const c of args.cells) {
@@ -724,7 +897,6 @@ const resolvers = {
             bundle.db.prepare(sql).run(p);
           }
 
-          // 감사 + 이벤트 + row_state
           for (const c of cols) {
             const oldVal = before ? (before[c] != null ? String(before[c]) : null) : null;
             const newVal = kv[c] != null ? String(kv[c]) : null;
@@ -749,14 +921,13 @@ const resolvers = {
       return { max_row_version: maxRow, errors: errors.length ? errors : null, conflicts: null };
     },
 
-    upsertRows: (_: unknown, args: { table: string; rows: Array<Record<string, any>>; project?: string }) => {
-      const bundle = openBundle(args.project);
+    upsertRows: (_: unknown, args: { table: string; rows: Array<Record<string, any>>; project?: string }, ctx: any) => {
+      const bundle = bundleFrom(ctx, args.project);
       if (READONLY) {
         const mv = bundle.stmts.selectMaxVersion.get() as { v: number };
         return { max_row_version: (mv?.v ?? 0) | 0, errors: ['READONLY'], conflicts: null };
       }
 
-      // 테이블/컬럼 보정
       ensureTable(bundle, args.table, 'id');
       const keys = new Set<string>();
       for (const r of args.rows) for (const k of Object.keys(r)) if (k) keys.add(k);
@@ -824,9 +995,9 @@ const resolvers = {
       return { max_row_version: maxRow, errors: errors.length ? errors : null, conflicts: null };
     },
 
-    rebuildRowState: (_: unknown, args: { table?: string; project?: string }) => {
+    rebuildRowState: (_: unknown, args: { table?: string; project?: string }, ctx: any) => {
       if (READONLY) return { ok: true };
-      const bundle = openBundle(args.project);
+      const bundle = bundleFrom(ctx, args.project);
 
       const tx = bundle.db.transaction(() => {
         if (args.table) {

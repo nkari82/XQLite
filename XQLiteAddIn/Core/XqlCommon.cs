@@ -79,6 +79,36 @@ namespace XQLite.AddIn
             }
         }
 
+        public static void SafeReleaseCom(params object?[] objs)
+        {
+            foreach (var o in objs)
+            {
+                if (o == null) continue;
+                try
+                {
+                    // Excel Interop 객체만 대상
+                    if (Marshal.IsComObject(o))
+                    {
+                        // 모든 RC 해제 (가끔 2 이상)
+                        int rc;
+                        do { rc = Marshal.ReleaseComObject(o); }
+                        while (rc > 0);
+                    }
+                }
+                catch (COMException)
+                {
+                    // Excel이 "사용 중"일 때 던지는 예외 포함 — 전부 무시
+                }
+                catch
+                {
+                    // 어떤 예외도 삼킴
+                }
+            }
+            // 여기서 GC 호출은 선택 — 빈도 높지 않게만
+            // GC.Collect();
+            // GC.WaitForPendingFinalizers();
+        }
+
         internal static string CreateTempDir(string prefix)
         {
             var root = Path.Combine(Path.GetTempPath(), prefix + Guid.NewGuid().ToString("N"));

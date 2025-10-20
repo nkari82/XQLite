@@ -1,12 +1,15 @@
 ﻿using ExcelDna.Integration;
 using ExcelDna.Integration.CustomUI;
+using Microsoft.Office.Interop.Excel;
 using System;
 using System.Collections.Concurrent;
+using System.Linq;
 using System.Reflection;
 using System.Threading; // Interlocked / Volatile
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using static XQLite.AddIn.IXqlBackend;
+using Action = System.Action;
 using Excel = Microsoft.Office.Interop.Excel;
 
 namespace XQLite.AddIn
@@ -48,12 +51,6 @@ namespace XQLite.AddIn
                   getEnabled='Commit_GetEnabled'
                   screentip='커밋'
                   supertip='필요하면 테이블/컬럼을 생성하고, 변경된 셀만 효율적으로 업서트합니다.'/>
-          <toggleButton id='tglDropCols' label='헤더 외 컬럼 DROP'
-                        getPressed='DropCols_GetPressed'
-                        onAction='DropCols_OnToggle'
-                        imageMso='DeleteColumns'
-                        screentip='헤더에 없는 컬럼 삭제'
-                        supertip='켜면 커밋 시 헤더에 없는 서버 컬럼을 DROP합니다(주의: 되돌릴 수 없습니다). 끄면 컬럼은 추가만 합니다.'/>
         </group>
 
         <!-- 연결 상태 -->
@@ -161,9 +158,9 @@ namespace XQLite.AddIn
             {
                 XqlAddIn.Sync?.PullStateChanged += pulling =>
                 ExcelAsyncUtil.QueueAsMacro(() =>
-                            {
-                                try { _ribbon?.InvalidateControl("btnPull"); } catch { }
-                            });
+                {
+                    try { _ribbon?.InvalidateControl("btnPull"); } catch { }
+                });
             }
             catch { /* ignore */ }
 
@@ -175,9 +172,9 @@ namespace XQLite.AddIn
                     {
                         try { _ribbon?.InvalidateControl("btnStatus"); } catch { }
                         try { _ribbon?.InvalidateControl("btnCommit"); } catch { }
-#pragma warning disable CS4014 // 이 호출을 대기하지 않으므로 호출이 완료되기 전에 현재 메서드가 계속 실행됩니다.
+#pragma warning disable CS4014
                         RefreshCommitEnabled(); // 반환값 사용 안 함
-#pragma warning restore CS4014 // 이 호출을 대기하지 않으므로 호출이 완료되기 전에 현재 메서드가 계속 실행됩니다.
+#pragma warning restore CS4014
                         try
                         {
                             var app = (Excel.Application)ExcelDnaUtil.Application;
@@ -186,6 +183,19 @@ namespace XQLite.AddIn
                         catch { }
                     });
             }
+
+            // ✅ 이벤트 허브 구독: 스키마/커밋 재평가 신호
+            XqlEvents.SchemaChanged += () =>
+            {
+                SetBlock(false);
+                try { _ribbon?.InvalidateControl("btnCommit"); } catch { }
+            };
+
+            XqlEvents.RequestReevalCommit += () =>
+            {
+                try { _ribbon?.InvalidateControl("btnCommit"); } catch { }
+                _ = RefreshCommitEnabled();
+            };
         }
 
         private void App_WorkbookNewSheet(Excel.Workbook wb, object sh)
@@ -199,9 +209,9 @@ namespace XQLite.AddIn
         private void SafeReevalCommit()
         {
             try { _ribbon?.InvalidateControl("btnCommit"); } catch { }
-#pragma warning disable CS4014 // 이 호출을 대기하지 않으므로 호출이 완료되기 전에 현재 메서드가 계속 실행됩니다.
+#pragma warning disable CS4014
             RefreshCommitEnabled(); // 반환값 무시
-#pragma warning restore CS4014 // 이 호출을 대기하지 않으므로 호출이 완료되기 전에 현재 메서드가 계속 실행됩니다.
+#pragma warning restore CS4014
         }
 
         // 1초에 한 번만 재평가(스레드 안전)
@@ -218,9 +228,9 @@ namespace XQLite.AddIn
         public bool Commit_GetEnabled(IRibbonControl _)
         {
             if (ShouldRecheck())
-#pragma warning disable CS4014 // 이 호출을 대기하지 않으므로 호출이 완료되기 전에 현재 메서드가 계속 실행됩니다.
+#pragma warning disable CS4014
                 RefreshCommitEnabled(); // 비동기 재평가
-#pragma warning restore CS4014 // 이 호출을 대기하지 않으므로 호출이 완료되기 전에 현재 메서드가 계속 실행됩니다.
+#pragma warning restore CS4014
             return !_blockCommit;
         }
 
@@ -231,48 +241,106 @@ namespace XQLite.AddIn
             return !pulling;
         }
 
+        // ───────────────────── Excel UI 스레드에서 동기 실행 헬퍼 ─────────────────────
+        private static Task<T> RunOnExcel<T>(Func<T> fn)
+        {
+            var tcs = new TaskCompletionSource<T>();
+            ExcelAsyncUtil.QueueAsMacro(() =>
+            {
+                try { tcs.SetResult(fn()); }
+                catch (Exception ex) { tcs.SetException(ex); }
+            });
+            return tcs.Task;
+        }
+        private static Task RunOnExcel(Action fn)
+        {
+            var tcs = new TaskCompletionSource<object?>();
+            ExcelAsyncUtil.QueueAsMacro(() =>
+            {
+                try { fn(); tcs.SetResult(null); }
+                catch (Exception ex) { tcs.SetException(ex); }
+            });
+            return tcs.Task;
+        }
+
+        private sealed class ExcelSideInfo
+        {
+            public string Table = "";
+            public bool HasLocal;
+            public bool HasUsableHeader;
+        }
+
         private async Task RefreshCommitEnabled()
         {
             try
             {
                 var be = XqlAddIn.Backend as XqlGqlBackend;
                 var sheet = XqlAddIn.Sheet;
-                var app = ExcelDnaUtil.Application as Excel.Application;
-                if (be == null || sheet == null || app == null) { SetBlock(false); return; }
+                if (be == null || sheet == null) { SetBlock(false); return; }
 
-                if (app.ActiveSheet is not Excel.Worksheet ws) { SetBlock(false); return; }
-                var wb = ws.Parent as Excel.Workbook;
-                if (wb == null) { SetBlock(false); return; }
-
-                // 로컬 상태: .xql_state에 KV가 1줄 이상 있으면 '이미 연결된 워크북'
-                bool hasLocal = false;
-                try
+                // ① Excel UI 스레드에서 COM 안전하게 정보 수집
+                ExcelSideInfo info = await RunOnExcel(() =>
                 {
-                    var st = XqlSheet.EnsureStateSheet(wb);
-                    var ur = st.UsedRange;
-                    int rows = ur.Row + ur.Rows.Count - 1;
-                    hasLocal = rows > 1;
-                    XqlCommon.ReleaseCom(ur, st);
-                }
-                catch { hasLocal = false; } // 실패해도 '처음' 취급
+                    var app = ExcelDnaUtil.Application as Excel.Application;
+                    if (app == null) return new ExcelSideInfo();
+                    if (app.ActiveSheet is not Excel.Worksheet ws) return new ExcelSideInfo();
 
-                // 테이블명: SheetMeta.TableName 없으면 시트명
-                var sm = sheet.GetOrCreateSheet(ws.Name);
-                var table = string.IsNullOrWhiteSpace(sm.TableName) ? ws.Name : sm.TableName!;
+                    var wb = ws.Parent as Excel.Workbook;
+                    if (wb == null) return new ExcelSideInfo();
 
-                // 서버에 동일 테이블 존재 여부. 오류/미확정 = 보수적으로 활성(Commit 허용).
+                    bool hasLocal = false;
+                    try
+                    {
+                        var st = XqlSheet.EnsureStateSheet(wb);
+                        var ur = st.UsedRange;
+                        int rows = ur.Row + ur.Rows.Count - 1;
+                        hasLocal = rows > 1;
+                        XqlCommon.ReleaseCom(ur, st);
+                    }
+                    catch { hasLocal = false; }
+
+                    // 테이블명
+                    var sm = sheet.GetOrCreateSheet(ws.Name);
+                    var table = string.IsNullOrWhiteSpace(sm.TableName) ? ws.Name : sm.TableName!;
+
+                    // 헤더 준비도
+                    bool hasUsableHeader = false;
+                    Excel.Range? header = null;
+                    try
+                    {
+                        if (!XqlSheet.TryGetHeaderMarker(ws, out header))
+                            header = XqlSheet.GetHeaderRange(ws);
+
+                        if (header != null)
+                        {
+                            var names = XqlSheet.ComputeHeaderNames(header);
+                            bool allFallback = XqlSheet.IsFallbackLetterHeader(header);
+                            hasUsableHeader = !allFallback && names.Any(n => !string.IsNullOrWhiteSpace(n));
+                        }
+                    }
+                    catch { hasUsableHeader = false; }
+                    finally { XqlCommon.ReleaseCom(header); }
+
+                    return new ExcelSideInfo { Table = table, HasLocal = hasLocal, HasUsableHeader = hasUsableHeader };
+                }).ConfigureAwait(false);
+
+                // ② 서버 측 확인 (백그라운드 OK)
                 bool hasServer = false;
                 try
                 {
-                    var cols = await be.GetTableColumns(table).ConfigureAwait(false);
+                    var cols = await be.GetTableColumns(info.Table).ConfigureAwait(false);
                     hasServer = cols != null && cols.Count > 0;
                 }
                 catch { hasServer = false; }
 
-                // 서버엔 있는데 로컬은 '처음'일 때만 Commit 잠금
-                SetBlock(hasServer && !hasLocal);
+                // ③ 최종 판정 반영은 매크로 큐에서
+                bool block = hasServer && !info.HasLocal && !info.HasUsableHeader;
+                await RunOnExcel(() => SetBlock(block)).ConfigureAwait(false);
             }
-            catch { SetBlock(false); } // 실패/미확정이면 활성
+            catch
+            {
+                SetBlock(false); // 실패/미확정이면 활성
+            }
         }
 
         private void SetBlock(bool block)
@@ -283,7 +351,14 @@ namespace XQLite.AddIn
                 changed = (_blockCommit != block);
                 _blockCommit = block;
             }
-            if (changed) _ribbon?.InvalidateControl("btnCommit");
+            if (changed)
+            {
+                // 리본 무효화는 항상 Excel UI 큐에서
+                ExcelAsyncUtil.QueueAsMacro(() =>
+                {
+                    try { _ribbon?.InvalidateControl("btnCommit"); } catch { }
+                });
+            }
         }
 
         // ───────────────────────── 동작(Commands) ─────────────────────────
@@ -539,9 +614,5 @@ namespace XQLite.AddIn
                 }
             }
         }
-
-        // ───────────────────────── Drop Columns 토글 (설정 위임) ─────────────────────────
-        public bool DropCols_GetPressed(IRibbonControl _) => XqlConfig.DropColumnsOnCommit;
-        public void DropCols_OnToggle(IRibbonControl _, bool pressed) => XqlConfig.DropColumnsOnCommit = pressed;
     }
 }

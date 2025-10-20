@@ -126,7 +126,7 @@ namespace XQLite.AddIn
                     int colOffset = colIndex;
                     return XqlSheet.ColumnKey(ws.Name, tableName, hRow, hCol, colOffset, headerName!);
                 }
-                finally { XqlCommon.ReleaseCom(headerCell, lo, ws, rng); }
+                finally { XqlCommon.ReleaseCom(headerCell, rng, lo, ws); }
             });
             if (string.IsNullOrEmpty(key)) return false;
             try { await _backend.AcquireLock(key!, _nickname).ConfigureAwait(false); return true; }
@@ -157,7 +157,7 @@ namespace XQLite.AddIn
             }
             finally
             {
-                XqlCommon.ReleaseCom(lo, ws, rng);
+                XqlCommon.ReleaseCom(rng, lo, ws);
             }
         }
 
@@ -182,7 +182,7 @@ namespace XQLite.AddIn
                     int colOffset = rng.Column - hCol;
                     return (ws.Name, XqlSheet.CellKey(ws.Name, tableName, hRow, hCol, rowOffset, colOffset));
                 }
-                finally { XqlCommon.ReleaseCom(lo, ws, rng); }
+                finally { XqlCommon.ReleaseCom(rng, lo, ws); }
             })!;
         }
 

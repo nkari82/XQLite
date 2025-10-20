@@ -1337,7 +1337,7 @@ namespace XQLite.AddIn
         }
 
         // 헤더: 마커 → (선택 기반) ResolveHeader → Fallback(GetHeaderRange) 순서로 결정
-        private static Excel.Range? GetHeaderOrFallback(Excel.Worksheet ws)
+        internal static Excel.Range? GetHeaderOrFallback(Excel.Worksheet ws)
         {
             if (XqlSheet.TryGetHeaderMarker(ws, out var hdr)) return hdr;
             Excel.Range? sel = null; Excel.Range? guess = null;
