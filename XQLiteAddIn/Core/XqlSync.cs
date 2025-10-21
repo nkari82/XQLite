@@ -1,5 +1,4 @@
 ﻿// XqlSync.cs  (ExcelPatchApplier 포함 버전)
-using EnvDTE;
 using ExcelDna.Integration;
 using Newtonsoft.Json.Linq;
 using System;
@@ -27,7 +26,6 @@ namespace XQLite.AddIn
             public DateTime LastMetaUtc { get; set; } = DateTime.MinValue;
         }
 
-
         private readonly int _pushIntervalMs;
         private readonly int _pullIntervalMs;
 
@@ -51,7 +49,7 @@ namespace XQLite.AddIn
         private volatile bool _started;
         private volatile bool _disposed;
 
-        private const int UPSERT_CHUNK = 512;   // 1회 전송 셀 수
+        private const int UPSERT_CHUNK = 512;    // 1회 전송 셀 수
         private const int UPSERT_SLICE_MS = 250; // 한번에 잡는 시간
         private const int LAST_PUSHED_MAX = 100_000;
         private readonly LinkedList<string> _lruKeys = new();
@@ -90,7 +88,7 @@ namespace XQLite.AddIn
             _pushTimer.Change(_pushIntervalMs, _pushIntervalMs);
             _pullTimer.Change(_pullIntervalMs, _pullIntervalMs);
 
-            // ✅ 구독 시작은 동기 메서드 사용
+            // 서버 이벤트 구독(동기 진입, 내부에서 별도 스레드)
             _backend.StartSubscription(OnServerEvent, MaxRowVersion);
         }
 
@@ -129,14 +127,14 @@ namespace XQLite.AddIn
 
         public bool TryDequeueConflict(out Conflict c) => _conflicts.TryDequeue(out c);
 
-        // ⬇️ 초기화 진입점 (워크북이 열릴 때 한 번 호출)
+        // 초기화 진입점 (워크북 오픈 시 1회)
         public void InitPersistentState(string workbookFullName, string? project = null)
         {
             _workbookFullName = workbookFullName;
             var wbName = Path.GetFileNameWithoutExtension(workbookFullName) ?? "wb";
 
             var proj = (project ?? XqlConfig.Project ?? "").Trim();
-            if (string.IsNullOrEmpty(proj)) proj = wbName;           // ✅ 비면 워크북명
+            if (string.IsNullOrEmpty(proj)) proj = wbName; // 비면 워크북명으로
 
             _state = new PersistentState
             {
@@ -147,11 +145,10 @@ namespace XQLite.AddIn
             };
 
             // 워크북에서 K/V 읽기 (UI 스레드에서 안전하게)
-            var loaded = new Dictionary<string, string>(StringComparer.Ordinal);
-            var done = new ManualResetEventSlim(false);
-            ExcelAsyncUtil.QueueAsMacro(() =>
+            Dictionary<string, string> loaded = new(StringComparer.Ordinal);
+            try
             {
-                try
+                loaded = XqlCommon.OnExcelThreadAsync(() =>
                 {
                     var app = (Excel.Application)ExcelDnaUtil.Application;
                     Excel.Workbook? wb = null;
@@ -167,15 +164,16 @@ namespace XQLite.AddIn
                             finally { if (!ReferenceEquals(wb, w)) XqlCommon.ReleaseCom(w); }
                         }
                         wb ??= app.ActiveWorkbook;
-                        if (wb != null)
-                            loaded = XqlSheet.StateReadAll(wb);
+                        return wb != null ? XqlSheet.StateReadAll(wb) : new Dictionary<string, string>(StringComparer.Ordinal);
                     }
                     finally { XqlCommon.ReleaseCom(wb); }
-                }
-                catch { }
-                finally { done.Set(); }
-            });
-            done.Wait(1000); // Excel 바쁘면 그냥 빈 상태로 진행
+                }).GetAwaiter().GetResult();
+            }
+            catch
+            {
+                // Excel이 바쁜 경우 등 — 빈 상태로 진행
+                loaded = new Dictionary<string, string>(StringComparer.Ordinal);
+            }
 
             // 값 반영
             if (loaded.TryGetValue("last_max_row_version", out var s) && long.TryParse(s, out var l))
@@ -205,7 +203,6 @@ namespace XQLite.AddIn
                         PersistState();
                     }
                     catch { }
-                    finally { }
                 });
             }
         }
@@ -230,7 +227,7 @@ namespace XQLite.AddIn
                 var since = sinceOverride ?? (_forceFullPull ? 0 : MaxRowVersion);
                 var pr = await _backend.PullRows(since, _cts.Token).ConfigureAwait(false);
 
-                // ★ 초기 상태: 패치가 없고 로컬 max==0 이면 헤더만이라도 부트스트랩
+                // 초기 상태: 패치가 없고 로컬 max==0 이면 헤더 부트스트랩
                 if ((pr.Patches == null || pr.Patches.Count == 0) && (since == 0 || MaxRowVersion == 0))
                 {
                     await ApplyBootstrapAsync(pr).ConfigureAwait(false);
@@ -239,7 +236,7 @@ namespace XQLite.AddIn
                     return;
                 }
 
-                // (기존) 패치 적용 경로 …
+                // 증분 패치 적용
                 await ApplyIncrementalPatches(pr).ConfigureAwait(false);
 
                 if (pr.MaxRowVersion > 0)
@@ -314,8 +311,8 @@ namespace XQLite.AddIn
                         {
                             var infos = await _backend.GetTableColumns(tname!).ConfigureAwait(false);
                             cols = infos.Select(i => (i.name ?? "").Trim())
-                                                                    .Where(s => s.Length > 0)
-                                                                    .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                                        .Where(s => s.Length > 0)
+                                        .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
                         }
                         catch { /* ignore */ }
                     }
@@ -326,14 +323,10 @@ namespace XQLite.AddIn
                     if (!cols.Any(c => c.Equals(key, StringComparison.OrdinalIgnoreCase)))
                         cols.Insert(0, key);
 
-                    cols = cols
-                           .Where(s => !string.IsNullOrWhiteSpace(s))
-                           .Distinct(StringComparer.OrdinalIgnoreCase)
-                           .ToList();
-
-                    // 중복/빈 제거
                     cols = cols.Where(s => !string.IsNullOrWhiteSpace(s))
-                                                   .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                               .Distinct(StringComparer.OrdinalIgnoreCase)
+                               .ToList();
+
                     if (cols.Count > 0) schema[tname!] = cols;
                 }
             }
@@ -350,8 +343,8 @@ namespace XQLite.AddIn
                     {
                         var infos = await _backend.GetTableColumns(tname!).ConfigureAwait(false);
                         cols = infos.Select(i => (i.name ?? "").Trim())
-                                                            .Where(s => s.Length > 0)
-                                                            .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                                    .Where(s => s.Length > 0)
+                                    .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
                     }
                     catch { /* ignore */ }
 
@@ -374,7 +367,7 @@ namespace XQLite.AddIn
         private Task ApplyIncrementalPatches(PullResult pr)
         {
             if (pr?.Patches is { Count: > 0 })
-                XqlSheetView.ApplyPlanAndPatches(null, pr.Patches); // ← 내부에서 InternalApplyCore 호출
+                XqlSheetView.ApplyPlanAndPatches(null, pr.Patches); // 내부에서 UI 스레드 마샬링
             return Task.CompletedTask;
         }
 
@@ -424,30 +417,28 @@ namespace XQLite.AddIn
                     ["last_meta_utc"] = (_state.LastMetaUtc == DateTime.MinValue ? "" : _state.LastMetaUtc.ToString("o")),
                 };
 
-                ExcelAsyncUtil.QueueAsMacro(() =>
+                // UI 스레드에서만 상태 기록
+                _ = XqlCommon.OnExcelThreadAsync(() =>
                 {
+                    var app = (Excel.Application)ExcelDnaUtil.Application;
+                    Excel.Workbook? wb = null;
                     try
                     {
-                        var app = (Excel.Application)ExcelDnaUtil.Application;
-                        Excel.Workbook? wb = null;
-                        try
+                        foreach (Excel.Workbook w in app.Workbooks)
                         {
-                            foreach (Excel.Workbook w in app.Workbooks)
+                            try
                             {
-                                try
-                                {
-                                    if (string.Equals(w.FullName, _workbookFullName, StringComparison.OrdinalIgnoreCase))
-                                    { wb = w; break; }
-                                }
-                                finally { if (!ReferenceEquals(wb, w)) XqlCommon.ReleaseCom(w); }
+                                if (string.Equals(w.FullName, _workbookFullName, StringComparison.OrdinalIgnoreCase))
+                                { wb = w; break; }
                             }
-                            wb ??= app.ActiveWorkbook;
-                            if (wb != null)
-                                XqlSheet.StateSetMany(wb, kv);
+                            finally { if (!ReferenceEquals(wb, w)) XqlCommon.ReleaseCom(w); }
                         }
-                        finally { XqlCommon.ReleaseCom(wb); }
+                        wb ??= app.ActiveWorkbook;
+                        if (wb != null)
+                            XqlSheet.StateSetMany(wb, kv);
                     }
-                    catch { }
+                    finally { XqlCommon.ReleaseCom(wb); }
+                    return 0;
                 });
             }
             catch { }
@@ -457,7 +448,6 @@ namespace XQLite.AddIn
         {
             if (!_started || _disposed) return;
 
-            // 재진입 방지용 비동기 락(아래 #2 참고)이 있으면 lock 제거 가능
             try
             {
                 if (!_pushSem.Wait(0)) return;
@@ -490,7 +480,6 @@ namespace XQLite.AddIn
             finally { _pullSem.Release(); }
         }
 
-        // ⬇️ 교체
         private async Task FlushUpsertsCore()
         {
             try
@@ -515,7 +504,7 @@ namespace XQLite.AddIn
                     if (resp.Conflicts is { Count: > 0 })
                         foreach (var c in resp.Conflicts) PushConflict(c);
 
-                    // FlushUpsertsCore 내 성공 후 기록 교체
+                    // 성공 후 마지막 값 갱신
                     foreach (var e in batch) RememberPushed(Key(e), XqlCommon.Canonicalize(e.Value));
                 }
                 while (!_outbox.IsEmpty && XqlCommon.NowMs() < deadline);
@@ -533,7 +522,7 @@ namespace XQLite.AddIn
             if (resp.MaxRowVersion > 0)
                 XqlCommon.InterlockedMax(ref _maxRowVersion, resp.MaxRowVersion);
 
-            // ⬇️ 서버 패치를 엑셀에 적용 (UI 스레드 매크로 큐로 안전하게)
+            // 서버 패치를 엑셀에 적용 (내부에서 UI 스레드 마샬링)
             if (resp.Patches is { Count: > 0 })
                 XqlSheetView.ApplyPlanAndPatches(null, resp.Patches);
 
@@ -552,11 +541,12 @@ namespace XQLite.AddIn
                 if (ev.MaxRowVersion > 0)
                     XqlCommon.InterlockedMax(ref _maxRowVersion, ev.MaxRowVersion);
 
+                // 갭이 생기면 보정 Pull
                 if (ev.MaxRowVersion > before + 1)
                 {
-#pragma warning disable CS4014 // 이 호출을 대기하지 않으므로 호출이 완료되기 전에 현재 메서드가 계속 실행됩니다.
-                    PullSince(before); // 갭 보정
-#pragma warning restore CS4014 // 이 호출을 대기하지 않으므로 호출이 완료되기 전에 현재 메서드가 계속 실행됩니다.
+#pragma warning disable CS4014
+                    PullSince(before);
+#pragma warning restore CS4014
                 }
             }
             catch (Exception ex)

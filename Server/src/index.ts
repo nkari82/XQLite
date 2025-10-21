@@ -1083,3 +1083,7 @@ process.on('SIGINT', () => { console.log('SIGINT'); shutdown(0); });
 process.on('SIGTERM', () => { console.log('SIGTERM'); shutdown(0); });
 process.on('uncaughtException', (err) => { console.error('[uncaughtException]', err?.stack || err); });
 process.on('unhandledRejection', (reason) => { console.error('[unhandledRejection]', reason); });
+function rebuildTableWithAlters(bundle: DBBundle, table: string, info: { name: string; type: string | null; notnull: number; pk: number; }[], wants: Map<string, { toType?: string | null; toNotNull?: boolean | null; toCheck?: string | null; }>) {
+  throw new Error('Function not implemented.');
+}
+

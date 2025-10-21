@@ -99,15 +99,13 @@ namespace XQLite.AddIn
                     sm.Columns != null &&
                     sm.Columns.TryGetValue(colName, out var ct) && ct != null)
                 {
-                    // SheetMeta.ColumnMeta가 ToTooltip()을 제공한다면 그대로 활용
                     try { return ct.ToTooltip(); } catch { /* fall through */ }
-                    // 제공하지 않으면 최소 정보 구성 (Kind/Null/Check 등 프로젝트 모델에 맞춰 보강 가능)
                     return $"{ct.Kind} • {(ct.Nullable ? "NULL OK" : "NOT NULL")}";
                 }
             }
             catch { /* ignore */ }
 
-            return ColumnTooltipFallback(); // 폴백
+            return ColumnTooltipFallback();
         }
 
         private static string ColumnTooltipFallback() => "TEXT • NULL OK";
@@ -129,7 +127,7 @@ namespace XQLite.AddIn
                     if (string.IsNullOrEmpty(colName))
                         colName = XqlCommon.ColumnIndexToLetter(h.Column);
 
-                    tips[i] = ColumnTooltipFor(sm, colName!); // 아래 헬퍼 사용
+                    tips[i] = ColumnTooltipFor(sm, colName!);
                 }
                 finally { XqlCommon.ReleaseCom(h); }
             }
@@ -269,7 +267,6 @@ namespace XQLite.AddIn
             bool oldSU = true, oldEv = true;
             try
             {
-                // 화면/이벤트 잠시 OFF → 플리커 최소화
                 try { oldSU = app.ScreenUpdating; app.ScreenUpdating = false; } catch { }
                 try { oldEv = app.EnableEvents; app.EnableEvents = false; } catch { }
 
@@ -284,7 +281,6 @@ namespace XQLite.AddIn
                         if (!string.IsNullOrEmpty(text) && text.Length > 512)
                             text = text.Substring(0, 509) + "...";
 
-                        // 비워야 하면 삭제(이미 없으면 skip)
                         if (string.IsNullOrEmpty(text))
                         {
                             try { cell.Comment?.Delete(); } catch { }
@@ -294,11 +290,9 @@ namespace XQLite.AddIn
                         cmt = cell.Comment;
                         if (cmt != null)
                         {
-                            // 같다면 아무 것도 안 함(재그림 없음)
                             var cur = SafeCommentText(cmt);
                             if (string.Equals(cur, text, StringComparison.Ordinal)) continue;
 
-                            // 제자리 갱신 시도 → 실패하면 최후에 delete+add
                             try { cmt.Text(text); }
                             catch
                             {
@@ -308,7 +302,6 @@ namespace XQLite.AddIn
                         }
                         else
                         {
-                            // 없을 때만 Add(삼각형 신규 생성) → 플리커 횟수 최소화
                             try { cell.AddComment(text); } catch { /* ignore */ }
                         }
                     }
@@ -317,12 +310,10 @@ namespace XQLite.AddIn
             }
             finally
             {
-                // 원복은 실패해도 무시
                 try { app.EnableEvents = oldEv; } catch { }
                 try { app.ScreenUpdating = oldSU; } catch { }
             }
         }
-
 
         // 헤더 1행이 편집되면 툴팁 재적용
         public static void RefreshTooltipsIfHeaderEdited(Excel.Worksheet ws, Excel.Range target)
@@ -337,14 +328,12 @@ namespace XQLite.AddIn
 
             try
             {
-                // 1) 마커 기준 교차 검사
                 if (XqlSheet.TryGetHeaderMarker(ws, out marker))
                 {
                     inter = ws.Application.Intersect(marker, target);
                     isHeaderEdit = inter != null;
                 }
 
-                // 2) 마커가 없거나 교차 안되면, 표 헤더 교차로 한 번 더 확인
                 if (!isHeaderEdit)
                 {
                     lo = XqlSheet.FindListObjectContaining(ws, target);
@@ -359,25 +348,23 @@ namespace XQLite.AddIn
 
                 if (!isHeaderEdit) return;
 
-                // 3) Excel이 헤더 갱신을 끝낸 이후에 재적용 (UI 스레드 매크로 큐)
-                ExcelAsyncUtil.QueueAsMacro(() =>
+                _ = XqlCommon.OnExcelThreadAsync(() =>
                 {
                     Excel.Worksheet? ws2 = null; Excel.Range? header2 = null;
                     try
                     {
                         var app2 = (Excel.Application)ExcelDnaUtil.Application;
-                        // sheet 객체를 직접 들고오지 말고 이름으로 다시 획득 (COM 안정)
                         ws2 = XqlSheet.FindWorksheet(app2, sheetName);
-                        if (ws2 == null) return;
+                        if (ws2 == null) return (object?)null;
 
-                        // 새로 계산된 헤더 범위 확보 (마커 → 폴백 순)
                         if (!XqlSheet.TryGetHeaderMarker(ws2, out header2))
                             header2 = XqlSheet.GetHeaderRange(ws2);
 
                         var sm = sheetSvc.GetOrCreateSheet(sheetName);
                         ApplyHeaderUi(ws2, header2, sm, withValidation: true);
+                        return (object?)null;
                     }
-                    catch { /* 무음 */ }
+                    catch { return (object?)null; }
                     finally { XqlCommon.ReleaseCom(header2); XqlCommon.ReleaseCom(ws2); }
                 });
             }
@@ -401,9 +388,8 @@ namespace XQLite.AddIn
                         string? name = (h.Value2 as string)?.Trim();
                         if (string.IsNullOrEmpty(name)) name = XqlCommon.ColumnIndexToLetter(h.Column);
 
-                        // 표가 있으면 그 컬럼의 DataBodyRange에만 DV 적용
                         try { rng = lo.ListColumns[i]?.DataBodyRange; } catch { rng = null; }
-                        if (rng == null) rng = ColBelowToEnd(ws, h); // 표가 비어 있으면 폴백
+                        if (rng == null) rng = ColBelowToEnd(ws, h);
 
                         if (sm.Columns.TryGetValue(name!, out var ct))
                             ApplyValidationForKind(rng, ct.Kind);
@@ -415,7 +401,6 @@ namespace XQLite.AddIn
                 return;
             }
 
-            // ── 표 바깥(일반 범위) 폴백 ──
             for (int i = 1; i <= header.Columns.Count; i++)
             {
                 Excel.Range? h = null; Excel.Range? col = null;
@@ -425,7 +410,7 @@ namespace XQLite.AddIn
                     var name = (h.Value2 as string)?.Trim();
                     if (string.IsNullOrEmpty(name)) name = XqlCommon.ColumnIndexToLetter(h.Column);
 
-                    col = ColBelowToEnd(ws, h); // ✅ UsedRange 대신 시트 끝까지
+                    col = ColBelowToEnd(ws, h);
                     if (!string.IsNullOrEmpty(name) && sm.Columns.TryGetValue(name!, out var ct))
                         ApplyValidationForKind(col, ct.Kind);
                     else
@@ -436,7 +421,7 @@ namespace XQLite.AddIn
         }
 
         // ─────────────────────────────────────────────────────────────────
-        //  MarkTouchedCell: 서버 패치/중요 이벤트가 닿은 셀을 은은히 표시
+        //  MarkTouchedCell / MarkInvalidCell ...
         // ─────────────────────────────────────────────────────────────────
         public static void MarkTouchedCell(Excel.Range rg)
         {
@@ -445,13 +430,11 @@ namespace XQLite.AddIn
             {
                 var interior = rg.Interior;
                 interior.Pattern = Excel.XlPattern.xlPatternSolid;
-                // 연녹색 (0xCCFFCC) — 가독성 좋고 과하지 않음
                 interior.Color = 0x00CCFFCC;
             }
             catch { /* ignore */ }
         }
 
-        // 검증 실패 등 “주의” 셀 표시 (연한 붉은색)
         public static void MarkInvalidCell(Excel.Range rg)
         {
             if (rg == null) return;
@@ -459,35 +442,25 @@ namespace XQLite.AddIn
             {
                 var interior = rg.Interior;
                 interior.Pattern = Excel.XlPattern.xlPatternSolid;
-                // 연분홍 (OLE BGR): 0xCCCCFF
                 interior.Color = 0x00CCCCFF;
             }
             catch { /* ignore */ }
         }
 
-        // === 새로 추가: 우리 마크만 조건부 해제 ===
-        public static void TryClearInvalidMark(Excel.Range rg)
-        {
-            TryClearColor(rg, 0x00CCCCFF); // 연분홍
-        }
-        public static void TryClearTouchedMark(Excel.Range rg)
-        {
-            TryClearColor(rg, 0x00CCFFCC); // 연녹색
-        }
+        public static void TryClearInvalidMark(Excel.Range rg) => TryClearColor(rg, 0x00CCCCFF);
+        public static void TryClearTouchedMark(Excel.Range rg) => TryClearColor(rg, 0x00CCFFCC);
         private static void TryClearColor(Excel.Range rg, int colorBgr)
         {
             if (rg == null) return;
             try
             {
                 var it = rg.Interior;
-                // Color는 Variant로 오므로 안전 변환
                 int cur = Convert.ToInt32(it.Color);
                 if (cur == colorBgr)
-                    it.ColorIndex = Excel.XlColorIndex.xlColorIndexNone; // 사용자 색 보존
+                    it.ColorIndex = Excel.XlColorIndex.xlColorIndexNone;
             }
             catch { /* ignore */ }
         }
-
 
         public static void RecoverSummaryBegin()
         {
@@ -513,39 +486,30 @@ namespace XQLite.AddIn
 
         public static void RecoverSummaryShow(string? title = "Recover Summary")
         {
-            ExcelAsyncUtil.QueueAsMacro(() =>
+            _ = XqlCommon.OnExcelThreadAsync(() =>
             {
                 Excel.Application app = (Excel.Application)ExcelDnaUtil.Application;
                 Excel.Workbook? wb = null; Excel.Worksheet? ws = null;
                 Excel.Range? r = null;
                 try
                 {
-                    wb = app.ActiveWorkbook; if (wb == null) return;
+                    wb = app.ActiveWorkbook; if (wb == null) return (object?)null;
                     ws = FindOrCreateSheet(wb, "_XQL_Summary");
 
-                    // 시트 초기화(카드 영역만 깔끔하게)
                     ws.Cells.ClearContents();
                     ws.Cells.ClearFormats();
 
                     int tables = _sumTables.Count;
                     double elapsedMs = TicksToMs(System.Diagnostics.Stopwatch.GetTimestamp() - _sumStartTicks);
 
-                    // 카드 렌더
                     Put(ws, 1, 1, title!, bold: true, size: 16);
-                    Put(ws, 3, 1, "Tables");
-                    Put(ws, 3, 2, tables.ToString());
-                    Put(ws, 4, 1, "Batches");
-                    Put(ws, 4, 2, _sumBatches.ToString());
-                    Put(ws, 5, 1, "Affected Rows");
-                    Put(ws, 5, 2, _sumAffected.ToString());
-                    Put(ws, 6, 1, "Conflicts");
-                    Put(ws, 6, 2, _sumConflicts.ToString());
-                    Put(ws, 7, 1, "Errors");
-                    Put(ws, 7, 2, _sumErrors.ToString());
-                    Put(ws, 8, 1, "Elapsed (ms)");
-                    Put(ws, 8, 2, elapsedMs.ToString("0"));
+                    Put(ws, 3, 1, "Tables"); Put(ws, 3, 2, tables.ToString());
+                    Put(ws, 4, 1, "Batches"); Put(ws, 4, 2, _sumBatches.ToString());
+                    Put(ws, 5, 1, "Affected Rows"); Put(ws, 5, 2, _sumAffected.ToString());
+                    Put(ws, 6, 1, "Conflicts"); Put(ws, 6, 2, _sumConflicts.ToString());
+                    Put(ws, 7, 1, "Errors"); Put(ws, 7, 2, _sumErrors.ToString());
+                    Put(ws, 8, 1, "Elapsed (ms)"); Put(ws, 8, 2, elapsedMs.ToString("0"));
 
-                    // 색상/강조
                     var box = ws.Range[ws.Cells[1, 1], ws.Cells[9, 3]];
                     try
                     {
@@ -557,38 +521,37 @@ namespace XQLite.AddIn
                     catch { }
                     finally { XqlCommon.ReleaseCom(box); }
 
-                    // 표준 컬럼 폭
-#pragma warning disable CS8602 // null 가능 참조에 대한 역참조입니다.
+#pragma warning disable CS8602
                     (ws.Columns["A:C"] as Excel.Range).AutoFit();
-#pragma warning restore CS8602 // null 가능 참조에 대한 역참조입니다.
-
-                    // 내부 함수
-                    static void Put(Excel.Worksheet w, int r0, int c0, string text, bool bold = false, int? size = null)
-                    {
-                        var cell = (Excel.Range)w.Cells[r0, c0];
-                        try
-                        {
-                            cell.Value2 = text;
-                            if (bold) cell.Font.Bold = true;
-                            if (size.HasValue) cell.Font.Size = size.Value;
-                        }
-                        finally { XqlCommon.ReleaseCom(cell); }
-                    }
+#pragma warning restore CS8602
                 }
                 catch { }
                 finally { XqlCommon.ReleaseCom(r); XqlCommon.ReleaseCom(ws); XqlCommon.ReleaseCom(wb); }
-            });
 
-            static double TicksToMs(long ticks)
-            {
-                double freq = System.Diagnostics.Stopwatch.Frequency;
-                return ticks * 1000.0 / freq;
-            }
+                return (object?)null;
+
+                static void Put(Excel.Worksheet w, int r0, int c0, string text, bool bold = false, int? size = null)
+                {
+                    var cell = (Excel.Range)w.Cells[r0, c0];
+                    try
+                    {
+                        cell.Value2 = text;
+                        if (bold) cell.Font.Bold = true;
+                        if (size.HasValue) cell.Font.Size = size.Value;
+                    }
+                    finally { XqlCommon.ReleaseCom(cell); }
+                }
+
+                static double TicksToMs(long ticks)
+                {
+                    double freq = System.Diagnostics.Stopwatch.Frequency;
+                    return ticks * 1000.0 / freq;
+                }
+            });
         }
 
         // ─────────────────────────────────────────────────────────────
-        // Conflict 워크시트에 행 추가 (Conflicts shape가 달라도 Reflection로 안전파싱)
-        // 컬럼: Timestamp | Table | RowKey | Column | Local | Server | Type | Message | Sheet | Address
+        // Conflict 워크시트에 행 추가
         // ─────────────────────────────────────────────────────────────
         public static void AppendConflicts(IEnumerable<object>? conflicts)
         {
@@ -596,7 +559,7 @@ namespace XQLite.AddIn
             var items = conflicts.ToList();
             if (items.Count == 0) return;
 
-            ExcelAsyncUtil.QueueAsMacro(() =>
+            _ = XqlCommon.OnExcelThreadAsync(() =>
             {
                 Excel.Application app = (Excel.Application)ExcelDnaUtil.Application;
                 Excel.Workbook? wb = null; Excel.Worksheet? ws = null;
@@ -604,10 +567,9 @@ namespace XQLite.AddIn
                 try
                 {
                     wb = app.ActiveWorkbook;
-                    if (wb == null) return;
+                    if (wb == null) return (object?)null;
                     ws = FindOrCreateSheet(wb, "_XQL_Conflicts");
 
-                    // 헤더 1회 보장
                     ur = ws.UsedRange as Excel.Range;
                     bool needHeader = (ur?.Cells?.Count ?? 0) <= 1 || ((ws.Cells[1, 1] as Excel.Range)?.Value2 == null);
                     XqlCommon.ReleaseCom(ur); ur = null;
@@ -616,13 +578,11 @@ namespace XQLite.AddIn
                         string[] headers = { "Timestamp", "Table", "RowKey", "Column", "Local", "Server", "Type", "Message", "Sheet", "Address" };
                         for (int i = 0; i < headers.Length; i++)
                             (ws.Cells[1, i + 1] as Excel.Range)!.Value2 = headers[i];
-                        // 간단 오토필터
                         Excel.Range hdr = ws.Range[ws.Cells[1, 1], ws.Cells[1, headers.Length]];
                         try { ws.ListObjects.Add(Excel.XlListObjectSourceType.xlSrcRange, hdr, Type.Missing, Excel.XlYesNoGuess.xlYes); } catch { }
                         XqlCommon.ReleaseCom(hdr);
                     }
 
-                    // 현재 마지막 행
                     ur = ws.UsedRange as Excel.Range;
                     int last = (ur?.Row ?? 1) + ((ur?.Rows?.Count ?? 1) - 1);
                     XqlCommon.ReleaseCom(ur); ur = null;
@@ -643,8 +603,7 @@ namespace XQLite.AddIn
                         string sh = Prop(cf, "Sheet");
                         string addr = Prop(cf, "Address");
 
-                        // 값 채우기
-#pragma warning disable CS8602 // null 가능 참조에 대한 역참조입니다.
+#pragma warning disable CS8602
                         (row.Cells[1, 1] as Excel.Range).Value2 = ts;
                         (row.Cells[1, 2] as Excel.Range).Value2 = tbl;
                         (row.Cells[1, 3] as Excel.Range).Value2 = rk;
@@ -655,9 +614,8 @@ namespace XQLite.AddIn
                         (row.Cells[1, 8] as Excel.Range).Value2 = msg;
                         (row.Cells[1, 9] as Excel.Range).Value2 = sh;
                         (row.Cells[1, 10] as Excel.Range).Value2 = addr;
-#pragma warning restore CS8602 // null 가능 참조에 대한 역참조입니다.
+#pragma warning restore CS8602
 
-                        // 약한 색 (주의 = 연분홍)
                         try
                         {
                             var interior = row.Interior;
@@ -666,7 +624,6 @@ namespace XQLite.AddIn
                         }
                         catch { }
 
-                        // 대상 셀 하이퍼링크 (가능할 때)
                         if (!string.IsNullOrWhiteSpace(sh) && !string.IsNullOrWhiteSpace(addr))
                         {
                             try
@@ -686,15 +643,16 @@ namespace XQLite.AddIn
                 {
                     XqlCommon.ReleaseCom(row); XqlCommon.ReleaseCom(ur); XqlCommon.ReleaseCom(ws); XqlCommon.ReleaseCom(wb);
                 }
-            });
 
-            // —— 로컬 헬퍼
-            static string Prop(object o, string name)
-                => Convert.ToString(PropObj(o, name), CultureInfo.InvariantCulture) ?? "";
-            static object? PropObj(object o, string name)
-                => o.GetType().GetProperty(name, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase)?.GetValue(o);
-            static string ToStr(object? v)
-                => Convert.ToString(v, CultureInfo.InvariantCulture) ?? "";
+                return (object?)null;
+
+                static string Prop(object o, string name)
+                    => Convert.ToString(PropObj(o, name), CultureInfo.InvariantCulture) ?? "";
+                static object? PropObj(object o, string name)
+                    => o.GetType().GetProperty(name, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase)?.GetValue(o);
+                static string ToStr(object? v)
+                    => Convert.ToString(v, CultureInfo.InvariantCulture) ?? "";
+            });
         }
 
         public readonly struct ExcelBatchScope : IDisposable
@@ -742,9 +700,6 @@ namespace XQLite.AddIn
         }
 
         // ───────────────────────── 통합 엔트리: 헤더(plan) + 행 패치(patches) 한 번에 적용
-        // - 비동기(논블록): 즉시 return, 실제 작업은 Excel 매크로 큐에서 수행
-        // - plan: 시트명 → 컬럼명 목록
-        // - patches: RowPatch 리스트
         public static void ApplyPlanAndPatches(
             IReadOnlyDictionary<string, List<string>>? plan,
             IReadOnlyList<RowPatch>? patches)
@@ -752,13 +707,12 @@ namespace XQLite.AddIn
             if ((plan == null || plan.Count == 0) && (patches == null || patches.Count == 0))
                 return;
 
-            ExcelAsyncUtil.QueueAsMacro(() =>
+            _ = XqlCommon.OnExcelThreadAsync(() =>
             {
                 var app = (Excel.Application)ExcelDnaUtil.Application;
-                if (app == null) return;
-                using var _ = new ExcelBatchScope(app); // 화면/이벤트/계산 OFF → ON (한 번)
+                if (app == null) return (object?)null;
+                using var _ = new ExcelBatchScope(app);
 
-                // 1) 헤더 구성(있을 때만) — 공용 헬퍼로 정리
                 if (plan is { Count: > 0 })
                 {
                     foreach (var (table, cols0) in plan)
@@ -771,18 +725,17 @@ namespace XQLite.AddIn
                     }
                 }
 
-                // 2) 행 패치(있을 때만) — 하나의 엔진 경로만 사용
                 if (patches is { Count: > 0 })
                 {
                     InternalApplyCore(app, patches);
-                    AppendFingerprintsForPatches(app, patches); // 지문 기록은 항상 같은 위치에서
+                    AppendFingerprintsForPatches(app, patches);
                 }
+
+                return (object?)null;
             });
         }
 
-        // ───────────────────────── 패치 엔진(단일 진입점)
-        //  - 테이블별 그룹 → 워크시트/헤더/메타 확보 → 필요 시 헤더 자동 정렬/갱신
-        //  - 키 기반 행 찾기/추가/삭제 + 셀 값 쓰기
+        // ───────────────────────── 패치 엔진
         private static void InternalApplyCore(Excel.Application app, IReadOnlyList<RowPatch> patches)
         {
             foreach (var grp in patches.GroupBy(p => p.Table, StringComparer.Ordinal))
@@ -790,20 +743,16 @@ namespace XQLite.AddIn
                 Excel.Worksheet? ws = null; Excel.Range? header = null; Excel.ListObject? lo = null;
                 try
                 {
-                    // 1) 테이블 → 시트/메타
                     var smeta = default(XqlSheet.Meta);
                     ws = XqlSheet.FindWorksheetByTable(app, grp.Key, out smeta);
                     if (ws == null || smeta == null) continue;
 
-                    // 2) 헤더 확보(표 헤더 우선, 없으면 1행)
                     lo = XqlSheet.FindListObjectByTable(ws, grp.Key);
                     header = lo?.HeaderRowRange ?? XqlSheet.GetHeaderRange(ws);
                     if (header == null) continue;
 
-                    // 현재 헤더명
                     var headers = XqlSheet.ComputeHeaderNames(header);
 
-                    // 서버 패치에 등장한 컬럼 + 키열 보장
                     var serverCols = new HashSet<string>(StringComparer.Ordinal);
                     foreach (var p in grp)
                     {
@@ -815,7 +764,6 @@ namespace XQLite.AddIn
                     var keyName = string.IsNullOrWhiteSpace(smeta.KeyColumn) ? "id" : smeta.KeyColumn!;
                     serverCols.Add(keyName);
 
-                    // 3) 헤더가 비었거나, A/B/C… 폴백이거나, 필요한 컬럼이 빠졌다면 → 즉시 정렬/갱신
                     bool needCreateHeader =
                         headers.Count == 0 ||
                         XqlSheet.IsFallbackLetterHeader(header) ||
@@ -823,27 +771,22 @@ namespace XQLite.AddIn
 
                     if (needCreateHeader && serverCols.Count > 0)
                     {
-                        // 키 우선 + 나머지 정렬(안정적)
                         var ordered = new List<string>(serverCols.Count);
                         if (serverCols.Contains(keyName)) ordered.Add(keyName);
                         ordered.AddRange(serverCols.Where(c => !string.Equals(c, keyName, StringComparison.Ordinal))
                                                    .OrderBy(c => c, StringComparer.Ordinal));
 
-                        // 공용 헬퍼로 헤더 교체 + 메타/마커/UI 동기화
                         header = UpdateHeaderToColumns(ws, header, smeta, grp.Key, ordered);
                         headers = ordered;
                     }
                     if (headers.Count == 0) continue;
 
-                    // (최소) 메타 컬럼 보장
                     try { XqlAddIn.Sheet!.EnsureColumns(ws.Name, serverCols.ToArray()); } catch { }
 
-                    // 4) 키열/데이터 시작행 계산
                     int keyIdx1 = XqlSheet.FindKeyColumnIndex(headers, smeta.KeyColumn); // 1-based
                     int keyAbsCol = header.Column + keyIdx1 - 1;
                     int firstDataRow = header.Row + 1;
 
-                    // 5) 각 패치 적용
                     foreach (var patch in grp)
                     {
                         try
@@ -868,10 +811,8 @@ namespace XQLite.AddIn
             }
         }
 
+        // ───────────────────────── 공용 헬퍼
 
-        // ───────────────────────── 공용 헬퍼 (중복 제거)
-
-        // 1) 테이블용 헤더를 보장(없으면 생성/정렬); 메타/마커/UI/캐시까지 한 번에
         private static Excel.Range UpdateHeaderToColumns(
             Excel.Worksheet ws,
             Excel.Range oldHeader,
@@ -879,18 +820,15 @@ namespace XQLite.AddIn
             string tableName,
             IList<string> columns)
         {
-            // 새 헤더 영역 결정(1행, columns.Count 너비)
             var start = (Excel.Range)ws.Cells[oldHeader.Row, oldHeader.Column];
             var end = (Excel.Range)ws.Cells[oldHeader.Row, oldHeader.Column + columns.Count - 1];
             var newHeader = ws.Range[start, end];
             XqlCommon.ReleaseCom(start, end);
 
-            // 값 채우기(배열 한 번에)
             var arr = new object[1, columns.Count];
             for (int i = 0; i < columns.Count; i++) arr[0, i] = columns[i] ?? "";
             newHeader.Value2 = arr;
 
-            // 메타/마커/UI 동기화
             XqlAddIn.Sheet!.EnsureColumns(ws.Name, columns);
             XqlSheet.SetHeaderMarker(ws, newHeader);
             ApplyHeaderUi(ws, newHeader, smeta, withValidation: true);
@@ -900,7 +838,6 @@ namespace XQLite.AddIn
             return newHeader;
         }
 
-        // 2) 계획(plan) 기반으로 시트/헤더를 보장하는 보조(최초 풀에서 사용)
         private static void EnsureHeaderForTable(Excel.Application app, string table, List<string> columns)
         {
             Excel.Worksheet? ws = null; Excel.Range? header = null;
@@ -912,15 +849,13 @@ namespace XQLite.AddIn
                     var sheets = app.Worksheets;
                     var last = (Excel.Worksheet)sheets[sheets.Count];
                     ws = (Excel.Worksheet)sheets.Add(After: last);
-                    try { ws.Name = table; } catch { /* Excel이 유니크 이름으로 바꿀 수 있음 */ }
+                    try { ws.Name = table; } catch { }
                     XqlCommon.ReleaseCom(last, sheets);
                 }
 
-                // 기존 헤더 또는 1행 영역
                 header = XqlSheet.GetHeaderRange(ws);
                 var sm = XqlAddIn.Sheet!.GetOrCreateSheet(ws.Name);
 
-                // 기존 헤더가 다르면 갱신, 없으면 생성
                 var curr = XqlSheet.ComputeHeaderNames(header);
                 if (curr.Count != columns.Count || !curr.SequenceEqual(columns))
                 {
@@ -928,17 +863,15 @@ namespace XQLite.AddIn
                 }
                 else
                 {
-                    // 동일하더라도 UI/마커/메타는 보장
                     XqlAddIn.Sheet!.EnsureColumns(ws.Name, columns);
                     XqlSheet.SetHeaderMarker(ws, header);
                     ApplyHeaderUi(ws, header, sm, withValidation: true);
-                    RegisterTableSheet(sm.TableName, ws.Name);
+                    RegisterTableSheet(table, ws.Name); // 🔧 FIX: sm.TableName → table
                 }
             }
             finally { XqlCommon.ReleaseCom(header, ws); }
         }
 
-        // 3) Fingerprint(지문) 기록을 한 곳에서만 수행(ApplyOnUiThread/PlanAndPatches 공용)
         private static void AppendFingerprintsForPatches(Excel.Application app, IReadOnlyList<RowPatch> patches)
         {
             try
@@ -981,8 +914,6 @@ namespace XQLite.AddIn
             catch { /* 무음 */ }
         }
 
-        // === 보조 메서드들 ===
-
         // XqlSheet에서 캐시를 활용할 수 있게 얇은 접근자 제공
         internal static bool TryGetCachedSheetForTable(string table, out string sheetName)
             => _tableToSheet.TryGetValue(table, out sheetName!);
@@ -993,7 +924,6 @@ namespace XQLite.AddIn
                 _tableToSheet[table] = sheetName;
         }
 
-        // header가 같으면 캐시된 uid 맵 반환
         private static Dictionary<string, string> GetUidMapCached(Excel.Worksheet ws, Excel.Range header)
         {
             string addr;
@@ -1007,13 +937,11 @@ namespace XQLite.AddIn
             return map;
         }
 
-        // 헤더 변경 후 호출 (컬럼 추가/삭제/이동/이름변경 등)
         public static void InvalidateHeaderCache(string sheetName)
         {
             _hdrCache.TryRemove(sheetName, out _);
         }
 
-        // Commit/스키마 동기화 등에서 테이블과 실제 시트를 등록
         public static void RegisterTableSheet(string table, string sheetName)
         {
             if (!string.IsNullOrWhiteSpace(table) && !string.IsNullOrWhiteSpace(sheetName))
@@ -1051,8 +979,6 @@ namespace XQLite.AddIn
                 var colName = headers[c];
                 if (string.IsNullOrWhiteSpace(colName)) continue;
 
-                // 🔧 기존: 메타에 없으면 continue → 값이 안 써짐
-                // 🔁 변경: 메타에 없으면 기본 타입(TEXT/NULL OK)으로 즉시 등록하고 진행
                 if (!meta.Columns.ContainsKey(colName))
                 {
                     try
@@ -1063,7 +989,7 @@ namespace XQLite.AddIn
                             Nullable = true
                         });
                     }
-                    catch { /* 무시하고 계속 씀 */ }
+                    catch { }
                 }
 
                 if (!cells.TryGetValue(colName, out var val)) continue;
@@ -1071,7 +997,7 @@ namespace XQLite.AddIn
                 Excel.Range? rg = null;
                 try
                 {
-                    rg = (Excel.Range)ws.Cells[row, header.Column + c]; // 절대열 기준
+                    rg = (Excel.Range)ws.Cells[row, header.Column + c];
                     if (val == null) { rg.Value2 = null; continue; }
 
                     switch (val)
@@ -1088,7 +1014,6 @@ namespace XQLite.AddIn
                             break;
                     }
 
-                    // 시각적 피드백(연녹색)
                     MarkTouchedCell(rg);
                 }
                 catch (Exception ex)
@@ -1152,12 +1077,10 @@ namespace XQLite.AddIn
             }
         }
 
-        // ClearHeaderUi(...)
         private static void ClearHeaderUi(Excel.Worksheet ws, Excel.Range? header, bool removeMarker = false)
         {
             if (header == null) header = XqlSheet.GetHeaderRange(ws);
 
-            // 1) 헤더 툴팁(코멘트) 제거
             foreach (Excel.Range cell in header.Cells)
             {
                 try
@@ -1167,7 +1090,6 @@ namespace XQLite.AddIn
                 finally { XqlCommon.ReleaseCom(cell); }
             }
 
-            // 2) 헤더 테두리/내부선 제거
             try
             {
                 var bs = header.Borders;
@@ -1186,7 +1108,6 @@ namespace XQLite.AddIn
             }
             catch { }
 
-            // 3) 헤더 아래 열 전체의 데이터 유효성 제거 (완전 초기화)
             try
             {
                 foreach (Excel.Range h in header.Cells)
@@ -1199,7 +1120,6 @@ namespace XQLite.AddIn
                         col = ws.Range[first, last];
                         try { col.Validation.Delete(); } catch { }
 
-                        // 우리 마크(연녹색/연분홍)만 조건부로 제거
                         foreach (Excel.Range c in col.Cells)
                         {
                             try { XqlSheetView.TryClearInvalidMark(c); XqlSheetView.TryClearTouchedMark(c); }
@@ -1225,14 +1145,11 @@ namespace XQLite.AddIn
             return rng;
         }
 
-        // Excel의 DV는 일부 타입(TEXT/JSON 등)엔 굳이 깔지 않는다.
-        // 아래 로직은 '규칙을 실제로 Add한 경우에만' 속성을 세팅하여 0x800A03EC를 방지한다.
         private static void ApplyValidationForKind(Excel.Range rng, XqlSheet.ColumnKind kind)
         {
             Excel.Validation? v = null;
             try
             {
-                // 빈/다중 영역 스킵 (DV 예외 방지)
                 try
                 {
                     if (rng == null) return;
@@ -1241,14 +1158,12 @@ namespace XQLite.AddIn
                 }
                 catch { /* ignore */ }
 
-                // 기존 규칙 제거(잔존 규칙 때문에 Add 실패 방지)
                 try { rng.Validation.Delete(); } catch { }
 
                 v = rng.Validation;
 
                 bool added = false;
 
-                // 지역설정: 리스트 구분자(, 또는 ;)
                 string listSep = ",";
                 try
                 {
@@ -1261,7 +1176,6 @@ namespace XQLite.AddIn
                 switch (kind)
                 {
                     case XqlSheet.ColumnKind.Int:
-                        // 안전한 32bit 정수 범위(문자열로 전달해도 OK)
                         v.Add(
                             Excel.XlDVType.xlValidateWholeNumber,
                             Excel.XlDVAlertStyle.xlValidAlertStop,
@@ -1274,8 +1188,6 @@ namespace XQLite.AddIn
                         break;
 
                     case XqlSheet.ColumnKind.Real:
-                        // Excel이 싫어하는 ±1.79e308 대신 ±1e307로 클램프 (안전)
-                        // 문자열로 전달(=수식) 대신 상수로도 되지만 로캘 영향 줄이려 문자열 사용
                         v.Add(
                             Excel.XlDVType.xlValidateDecimal,
                             Excel.XlDVAlertStyle.xlValidAlertStop,
@@ -1288,7 +1200,6 @@ namespace XQLite.AddIn
                         break;
 
                     case XqlSheet.ColumnKind.Bool:
-                        // TRUE/FALSE 목록 — 로캘별 리스트 구분자 사용
                         v.Add(
                             Excel.XlDVType.xlValidateList,
                             Excel.XlDVAlertStyle.xlValidAlertStop,
@@ -1300,7 +1211,6 @@ namespace XQLite.AddIn
                         break;
 
                     case XqlSheet.ColumnKind.Date:
-                        // 지역화된 함수명 문제 회피: DateTime 값을 직접 전달
                         var dmin = new DateTime(1900, 1, 1);
                         var dmax = new DateTime(9999, 12, 31);
                         v.Add(
@@ -1314,7 +1224,6 @@ namespace XQLite.AddIn
                         added = true;
                         break;
 
-                    // TEXT/JSON/ANY 등은 DV 미적용 (서버/런타임 검증으로 처리)
                     default:
                         added = false;
                         break;
@@ -1328,7 +1237,6 @@ namespace XQLite.AddIn
             }
             catch
             {
-                // 병합/시트 보호/특수 범위 등으로 실패할 수 있음 — 조용히 무시
             }
             finally
             {
@@ -1336,7 +1244,6 @@ namespace XQLite.AddIn
             }
         }
 
-        // 헤더: 마커 → (선택 기반) ResolveHeader → Fallback(GetHeaderRange) 순서로 결정
         internal static Excel.Range? GetHeaderOrFallback(Excel.Worksheet ws)
         {
             if (XqlSheet.TryGetHeaderMarker(ws, out var hdr)) return hdr;
@@ -1350,7 +1257,6 @@ namespace XQLite.AddIn
             finally { XqlCommon.ReleaseCom(sel); /* guess는 반환 */ }
         }
 
-        // 선택/추정된 헤더가 실제로 이동된 경우 마커를 새 위치로 동기화
         private static void RebindMarkerIfMoved(Excel.Worksheet ws, Excel.Range candidate)
         {
             if (XqlSheet.TryGetHeaderMarker(ws, out var old))
@@ -1364,50 +1270,46 @@ namespace XQLite.AddIn
             }
         }
 
-        // ── [NEW] 헤더 UI(툴팁+보더+검증) 한 번에 적용
         internal static void ApplyHeaderUi(Excel.Worksheet ws, Excel.Range header, XqlSheet.Meta sm, bool withValidation)
         {
             if (ws == null || header == null || sm == null) return;
 
-            // 툴팁 + 보더
             var tips = BuildHeaderTooltips(sm, header);
             SetHeaderTooltips(header, tips);
             ApplyHeaderOutlineBorder(header);
 
-            // 데이터 검증(옵션): 열 끝까지, 표 유무 무관
             if (withValidation)
                 ApplyDataValidationForHeader(ws, header, sm);
         }
 
-        // Excel 내부가 헤더를 재구성하는 타이밍을 기다렸다가 재적용(디바운스)
         private static void EnqueueReapplyHeaderUi(string sheetName, bool withValidation)
         {
             string key = $"{sheetName}:{withValidation}";
             lock (_reapplyLock)
             {
-                if (!_reapplyPending.Add(key)) return; // 이미 대기 중이면 무시
+                if (!_reapplyPending.Add(key)) return;
             }
 
-            // 약간 기다렸다가 메인 스레드에서 일괄 재적용 → 깜빡임 최소
             Task.Run(async () =>
             {
-                await Task.Delay(150).ConfigureAwait(false); // 80~150ms 권장
+                await Task.Delay(150).ConfigureAwait(false);
 
-                ExcelAsyncUtil.QueueAsMacro(() =>
+                _ = XqlCommon.OnExcelThreadAsync(() =>
                 {
                     Excel.Worksheet? ws2 = null; Excel.Range? h2 = null;
                     try
                     {
                         var app2 = (Excel.Application)ExcelDnaUtil.Application;
                         ws2 = XqlSheet.FindWorksheet(app2, sheetName);
-                        if (ws2 == null) return;
+                        if (ws2 == null) return (object?)null;
 
                         if (!XqlSheet.TryGetHeaderMarker(ws2, out h2))
                             h2 = XqlSheet.GetHeaderRange(ws2);
-                        if (h2 == null) return;
+                        if (h2 == null) return (object?)null;
 
                         var sm = XqlAddIn.Sheet!.GetOrCreateSheet(sheetName);
-                        ApplyHeaderUi(ws2, h2, sm, withValidation); // 툴팁+보더(+검증)
+                        ApplyHeaderUi(ws2, h2, sm, withValidation);
+                        return (object?)null;
                     }
                     finally
                     {

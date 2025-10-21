@@ -1,4 +1,6 @@
 ﻿// XqlCommon.cs
+using ExcelDna.Integration;
+using ExcelDna.Integration.CustomUI;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -6,10 +8,11 @@ using System.Globalization;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
-using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using Excel = Microsoft.Office.Interop.Excel;
 
 
@@ -17,8 +20,87 @@ namespace XQLite.AddIn
 {
     internal static class XqlCommon
     {
-        // XqlCommon.cs (공용으로 쓰고 싶다면)
 
+        private static int _excelMainThreadId = -1;
+
+        static XqlCommon()
+        {
+            ExcelAsyncUtil.QueueAsMacro(() =>
+            {
+                try { _excelMainThreadId = Thread.CurrentThread.ManagedThreadId; }
+                catch {}
+            });
+        }
+
+        /// <summary>
+        /// Excel UI 쓰레드에서 동기 작업을 실행하고 결과를 Task로 돌려준다.
+        /// (work 안에서는 반드시 COM 개체를 ReleaseCom로 정리할 것)
+        /// </summary>
+
+        public static bool IsExcelMainThread()
+        {
+            return Thread.CurrentThread.ManagedThreadId == _excelMainThreadId;
+        }
+
+        public static Task<T> OnExcelThreadAsync<T>(
+            Func<T> work,
+            int? timeoutMs = null,
+            CancellationToken ct = default)
+        {
+            if (work == null) throw new ArgumentNullException(nameof(work));
+
+            // UI thread면 즉시 수행(가장 빠른 경로)
+            if (IsExcelMainThread())
+            {
+                try { return Task.FromResult(work()); }
+                catch (Exception ex) { return Task.FromException<T>(ex); }
+            }
+
+            var tcs = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            // timeout / cancel
+            CancellationTokenSource? cts = null;
+            var token = ct;
+            if (timeoutMs is int ms && ms > 0)
+            {
+                cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                cts.CancelAfter(ms);
+                token = cts.Token;
+            }
+            var reg = token.CanBeCanceled ? token.Register(() => tcs.TrySetCanceled(token)) : default;
+
+            // 완료 후 정리
+            tcs.Task.ContinueWith(_ => { try { reg.Dispose(); } catch { } try { cts?.Dispose(); } catch { } },
+                                  TaskScheduler.Default);
+
+            try
+            {
+                ExcelAsyncUtil.QueueAsMacro(() =>
+                {
+                    if (token.IsCancellationRequested || tcs.Task.IsCompleted) return;
+
+                    try
+                    {
+                        var r = work();
+                        tcs.TrySetResult(r);
+                    }
+                    catch (Exception ex)
+                    {
+                        tcs.TrySetException(ex);
+                    }
+                });
+            }
+            catch (Exception qex)
+            {
+                tcs.TrySetException(qex);
+            }
+
+            return tcs.Task;
+        }
+
+        public static Task OnExcelThreadAsync(Action work, int? timeoutMs = null, CancellationToken ct = default)
+            => OnExcelThreadAsync<object?>(() => { work(); return null; }, timeoutMs, ct);
+        
         public static long NowMs() => (Stopwatch.GetTimestamp() * 1000L) / Stopwatch.Frequency;
 
 
@@ -67,46 +149,21 @@ namespace XQLite.AddIn
             return s;
         }
 
-        internal static void ReleaseCom(params object?[] objs)
+        public static void ReleaseCom(params object?[] objs)
         {
             foreach (var o in objs)
             {
                 try
                 {
-                    if (o != null && Marshal.IsComObject(o)) Marshal.FinalReleaseComObject(o);
+                    if (o == null) continue;
+                    if (!Marshal.IsComObject(o)) continue;
+                    // 여러 번 Release 호출돼도 0 미만으로 내려가는 일은 없습니다.
+                    Marshal.FinalReleaseComObject(o);
                 }
-                catch { /* ignore */ }
+                catch (COMException) { /* Excel 종료/분리 중 */ }
+                catch (InvalidComObjectException) { /* RCW 분리됨 */ }
+                catch { /* no-op */ }
             }
-        }
-
-        public static void SafeReleaseCom(params object?[] objs)
-        {
-            foreach (var o in objs)
-            {
-                if (o == null) continue;
-                try
-                {
-                    // Excel Interop 객체만 대상
-                    if (Marshal.IsComObject(o))
-                    {
-                        // 모든 RC 해제 (가끔 2 이상)
-                        int rc;
-                        do { rc = Marshal.ReleaseComObject(o); }
-                        while (rc > 0);
-                    }
-                }
-                catch (COMException)
-                {
-                    // Excel이 "사용 중"일 때 던지는 예외 포함 — 전부 무시
-                }
-                catch
-                {
-                    // 어떤 예외도 삼킴
-                }
-            }
-            // 여기서 GC 호출은 선택 — 빈도 높지 않게만
-            // GC.Collect();
-            // GC.WaitForPendingFinalizers();
         }
 
         internal static string CreateTempDir(string prefix)
