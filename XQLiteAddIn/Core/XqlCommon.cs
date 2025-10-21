@@ -380,5 +380,49 @@ namespace XQLite.AddIn
             };
             return s.Normalize(NormalizationForm.FormC);
         }
+
+        // 숫자/일반용 Clamp (generic)
+        public static T Clamp<T>(T value, T min, T max) where T : IComparable<T>
+        {
+            if (min.CompareTo(max) > 0) (min, max) = (max, min); // 잘못 준 경우 보정
+            if (value.CompareTo(min) < 0) return min;
+            if (value.CompareTo(max) > 0) return max;
+            return value;
+        }
+
+        // Excel 셀의 값/서식 조합으로 DateTime 가능성 판정
+        internal static bool IsExcelDateTimeLikely(Excel.Range c)
+        {
+            try
+            {
+                if (c == null) return false;
+                var v = c.Value2;
+
+                // 값이 숫자(OA Date로 해석 가능)인지 확인
+                if (v is double d)
+                {
+                    // 흔한 날짜 범위 (1900-01-01 ~ 9999-12-31 근사)
+                    // Excel OA: 1 = 1899-12-31, 2 = 1900-01-01, ... (윤년 버그 고려 여유 범위)
+                    if (d >= -657434 && d <= 2958465) // DateTime.OADate 허용범위
+                        return true;
+                }
+
+                // 날짜/시간 서식 여부 체크(영문/로컬)
+                string? nf = null, nfl = null;
+                try { nf = Convert.ToString(c.NumberFormat); } catch { }
+                try { nfl = Convert.ToString(c.NumberFormatLocal); } catch { }
+                string s = ((nf ?? "") + ";" + (nfl ?? "")).ToLowerInvariant();
+
+                // 전형적인 날짜/시간 토큰 포함 여부 (m/d/y/h/s 등)
+                if (s.Contains("yy") || s.Contains("yyyy") || s.Contains("m/") || s.Contains("mm") ||
+                    s.Contains("dd") || s.Contains("d ") || s.Contains("h:") || s.Contains("hh") ||
+                    s.Contains("ampm") || s.Contains("오전") || s.Contains("오후"))
+                    return true;
+
+                return false;
+            }
+            catch { return false; }
+        }
+
     }
 }

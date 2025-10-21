@@ -10,6 +10,7 @@ using System.Reflection;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using XQLite.AddIn;
+using static XQLite.AddIn.XqlSchemaForm;
 using static XQLite.AddIn.XqlSheet;
 using Excel = Microsoft.Office.Interop.Excel;
 using MessageBox = System.Windows.Forms.MessageBox;
@@ -65,9 +66,20 @@ namespace XQLite.AddIn
                     return false;
                 }
 
-                // 메타 동기화
+                // 메타 동기화 + ID 1열 강제
                 var names = BuildHeaderNames(candidate);
                 var sm = sheet.GetOrCreateSheet(ws.Name);
+
+                // 항상 KeyColumn = "id" 보장
+                if (string.IsNullOrWhiteSpace(sm.KeyColumn) || !string.Equals(sm.KeyColumn, "id", StringComparison.OrdinalIgnoreCase))
+                {
+                    sm.KeyColumn = "id";
+                }
+
+                // 헤더에 id가 맨 앞에 오도록 열 자체를 정렬(필요 시 이동/추가)
+                candidate = EnsureIdIsFirst(ws, candidate, sm, names, reorderData: true);
+                // 최종 이름 재수집
+                names = BuildHeaderNames(candidate);
                 sheet.EnsureColumns(ws.Name, names);
 
                 // UI/검증 한 번에
@@ -148,6 +160,9 @@ namespace XQLite.AddIn
 
                 var sheet = XqlAddIn.Sheet!;
                 var sm = sheet.GetOrCreateSheet(ws.Name);
+
+                // 갱신 시에도 id를 1열로 유지(필요 시 열 이동)
+                header = EnsureIdIsFirst(ws, header, sm, BuildHeaderNames(header), reorderData: true);
 
                 ApplyHeaderUi(ws, header, sm, withValidation: true);
 
@@ -391,16 +406,31 @@ namespace XQLite.AddIn
                         try { rng = lo.ListColumns[i]?.DataBodyRange; } catch { rng = null; }
                         if (rng == null) rng = ColBelowToEnd(ws, h);
 
-                        if (sm.Columns.TryGetValue(name!, out var ct))
-                            ApplyValidationForKind(rng, ct.Kind);
+                        // 🔒 KeyColumn(id) 잠금 + 입력 금지
+                        if (!string.IsNullOrWhiteSpace(sm.KeyColumn) &&
+                            string.Equals(name, sm.KeyColumn, StringComparison.OrdinalIgnoreCase))
+                        {
+                            LockIdColumn(ws, rng);
+                            ApplyIdBlockedValidation(rng);
+                        }
                         else
-                            try { rng.Validation.Delete(); } catch { /* clean only */ }
+                        {
+                            // 일반 컬럼은 타입별 DV
+                            if (sm.Columns.TryGetValue(name!, out var ct))
+                                ApplyValidationForKind(rng, ct.Kind);
+                            else
+                                try { rng.Validation.Delete(); } catch { /* clean only */ }
+                            try { rng.Locked = false; } catch { }
+                        }
                     }
                     finally { XqlCommon.ReleaseCom(h); XqlCommon.ReleaseCom(rng); }
                 }
+                // 시트 보호: UI에서만 잠금 적용(매크로는 허용)
+                EnsureSheetProtectedUiOnly(ws);
                 return;
             }
 
+            // ── 표 바깥(일반 범위) 폴백 ──
             for (int i = 1; i <= header.Columns.Count; i++)
             {
                 Excel.Range? h = null; Excel.Range? col = null;
@@ -410,14 +440,25 @@ namespace XQLite.AddIn
                     var name = (h.Value2 as string)?.Trim();
                     if (string.IsNullOrEmpty(name)) name = XqlCommon.ColumnIndexToLetter(h.Column);
 
-                    col = ColBelowToEnd(ws, h);
-                    if (!string.IsNullOrEmpty(name) && sm.Columns.TryGetValue(name!, out var ct))
-                        ApplyValidationForKind(col, ct.Kind);
+                    col = ColBelowToEnd(ws, h); // ✅ UsedRange 대신 시트 끝까지
+                    if (!string.IsNullOrEmpty(sm.KeyColumn) &&
+                        string.Equals(name, sm.KeyColumn, StringComparison.OrdinalIgnoreCase))
+                    {
+                        LockIdColumn(ws, col);
+                        ApplyIdBlockedValidation(col);
+                    }
                     else
-                        try { col.Validation.Delete(); } catch { /* clean only */ }
+                    {
+                        if (!string.IsNullOrEmpty(name) && sm.Columns.TryGetValue(name!, out var ct))
+                            ApplyValidationForKind(col, ct.Kind);
+                        else
+                            try { col.Validation.Delete(); } catch { /* clean only */ }
+                        try { col.Locked = false; } catch { }
+                    }
                 }
                 finally { XqlCommon.ReleaseCom(h, col); }
             }
+            EnsureSheetProtectedUiOnly(ws);
         }
 
         // ─────────────────────────────────────────────────────────────────
@@ -814,22 +855,33 @@ namespace XQLite.AddIn
         // ───────────────────────── 공용 헬퍼
 
         private static Excel.Range UpdateHeaderToColumns(
-            Excel.Worksheet ws,
-            Excel.Range oldHeader,
-            XqlSheet.Meta smeta,
-            string tableName,
-            IList<string> columns)
+             Excel.Worksheet ws,
+             Excel.Range oldHeader,
+             XqlSheet.Meta smeta,
+             string tableName,
+             IList<string> columns)
         {
+            // ✅ key(id) 1열 보장
+            string keyName = string.IsNullOrWhiteSpace(smeta.KeyColumn) ? "id" : smeta.KeyColumn!;
+            var cols = new List<string>(columns.Count + 1);
+            if (!columns.Any(c => c.Equals(keyName, StringComparison.OrdinalIgnoreCase)))
+                cols.Add(keyName);
+            cols.AddRange(columns.Where(c => !c.Equals(keyName, StringComparison.OrdinalIgnoreCase)));
+
+            // 새 헤더 영역 결정(1행, cols.Count 너비)
             var start = (Excel.Range)ws.Cells[oldHeader.Row, oldHeader.Column];
-            var end = (Excel.Range)ws.Cells[oldHeader.Row, oldHeader.Column + columns.Count - 1];
+            var end = (Excel.Range)ws.Cells[oldHeader.Row, oldHeader.Column + cols.Count - 1];
             var newHeader = ws.Range[start, end];
             XqlCommon.ReleaseCom(start, end);
 
-            var arr = new object[1, columns.Count];
-            for (int i = 0; i < columns.Count; i++) arr[0, i] = columns[i] ?? "";
+            // 값 채우기(배열 한 번에)
+            var arr = new object[1, cols.Count];
+            for (int i = 0; i < cols.Count; i++) arr[0, i] = cols[i] ?? "";
             newHeader.Value2 = arr;
 
-            XqlAddIn.Sheet!.EnsureColumns(ws.Name, columns);
+            // 메타/마커/UI 동기화
+            smeta.KeyColumn = keyName;
+            XqlAddIn.Sheet!.EnsureColumns(ws.Name, cols);
             XqlSheet.SetHeaderMarker(ws, newHeader);
             ApplyHeaderUi(ws, newHeader, smeta, withValidation: true);
             InvalidateHeaderCache(ws.Name);
@@ -1280,6 +1332,125 @@ namespace XQLite.AddIn
 
             if (withValidation)
                 ApplyDataValidationForHeader(ws, header, sm);
+        }
+
+        /// <summary>
+        /// 헤더/데이터를 실제로 재배치해서 'id'가 무조건 1열이 되도록 보장.
+        /// 기존 id 값이 있다면 그대로 보존. 없으면 1열에 'id' 열을 새로 추가.
+        /// </summary>
+        private static Excel.Range EnsureIdIsFirst(Excel.Worksheet ws, Excel.Range header, XqlSheet.Meta sm, IList<string> names, bool reorderData)
+        {
+            string keyName = string.IsNullOrWhiteSpace(sm.KeyColumn) ? "id" : sm.KeyColumn!;
+            int cols = header.Columns.Count;
+            int idIdx = -1;
+            for (int i = 0; i < names.Count; i++)
+                if (string.Equals(names[i], keyName, StringComparison.OrdinalIgnoreCase)) { idIdx = i + 1; break; } // 1-based
+
+            // 이미 1열이면 그대로
+            if (idIdx == 1) return header;
+
+            // 헤더에 없으면 1열에 새로 삽입
+            if (idIdx < 0)
+            {
+                // 1) 헤더 왼쪽에 1열 삽입
+                Excel.Range? firstCol = null;
+                try
+                {
+                    firstCol = (Excel.Range)ws.Columns[header.Column]; // 헤더의 첫 Col
+                    firstCol.Insert(Excel.XlInsertShiftDirection.xlShiftToRight);
+                }
+                catch { }
+                finally { XqlCommon.ReleaseCom(firstCol); }
+
+                // 2) 헤더 텍스트 'id'로 설정
+                Excel.Range? idCell = null;
+                try
+                {
+                    idCell = (Excel.Range)ws.Cells[header.Row, header.Column]; // 새 1열
+                    idCell.Value2 = keyName;
+                }
+                finally { XqlCommon.ReleaseCom(idCell); }
+
+                // 3) 헤더 Range 다시 계산(너비 +1)
+                var start = (Excel.Range)ws.Cells[header.Row, header.Column];
+                var end = (Excel.Range)ws.Cells[header.Row, header.Column + cols]; // +1
+                var newHeader = ws.Range[start, end];
+                XqlCommon.ReleaseCom(start, end);
+                return newHeader;
+            }
+
+            // 헤더에 있으나 1열이 아니면: 열 전체를 앞으로 이동(값 보존)
+            if (reorderData)
+            {
+                // idIdx(현재) → 1열로 이동
+                Excel.Range? idWhole = null; Excel.Range? dest = null;
+                try
+                {
+                    idWhole = ws.Range[
+                    ws.Cells[header.Row, header.Column + (idIdx - 1)],
+                    ws.Cells[ws.Rows.Count, header.Column + (idIdx - 1)]];
+
+                    dest = (Excel.Range)ws.Cells[header.Row, header.Column];
+                    idWhole.Cut(dest); // 앞으로 잘라붙이기
+                }
+                catch { /* 일부 환경에서 Cut이 막혀 있으면 포기(헤더명만 바꾸지 않음) */ }
+                finally { XqlCommon.ReleaseCom(idWhole, dest); }
+            }
+
+            // 이동 후 헤더 범위 재계산
+            int newCols = header.Columns.Count; // 동일
+            var s = (Excel.Range)ws.Cells[header.Row, header.Column];
+            var e = (Excel.Range)ws.Cells[header.Row, header.Column + newCols - 1];
+            var hdr2 = ws.Range[s, e];
+            XqlCommon.ReleaseCom(s, e);
+            return hdr2;
+        }
+
+        /// <summary>id 컬럼을 잠그고( Locked=true ) 입력은 Custom Validation으로 차단</summary>
+        private static void LockIdColumn(Excel.Worksheet ws, Excel.Range colData)
+        {
+            try
+            {
+                colData.Locked = true;
+            }
+            catch { }
+        }
+
+        /// <summary>Custom Validation으로 어떤 값도 허용하지 않음(=수정 불가). 빈 값은 그대로 둘 수 있게 하려면 필요시 수정.</summary>
+        private static void ApplyIdBlockedValidation(Excel.Range rng)
+        {
+            Excel.Validation? v = null;
+            try
+            {
+                try { rng.Validation.Delete(); } catch { }
+                v = rng.Validation;
+                // 항상 FALSE가 되도록: "=FALSE" → 사용자가 값을 입력하면 거부
+                v.Add(Excel.XlDVType.xlValidateCustom, Excel.XlDVAlertStyle.xlValidAlertStop, Type.Missing, "=FALSE");
+                v.ErrorTitle = "읽기 전용";
+                v.ErrorMessage = "ID 열은 서버에서 관리됩니다.";
+                v.ShowError = true;
+                v.IgnoreBlank = true; // 비어있는 셀은 그대로 둘 수 있음
+            }
+            catch { }
+            finally { XqlCommon.ReleaseCom(v); }
+        }
+
+        /// <summary>시트를 UI 한정으로 보호(UserInterfaceOnly=TRUE). 정렬/필터는 허용.</summary>
+        private static void EnsureSheetProtectedUiOnly(Excel.Worksheet ws)
+        {
+            try
+            {
+                // 이미 보호 중이면 그대로 두되, 가능한 옵션만 보정
+                bool protectedNow = false;
+                try { protectedNow = ws.ProtectContents; } catch { }
+                if (!protectedNow)
+                {
+                    ws.Protect(Password: Type.Missing, DrawingObjects: false, Contents: true, Scenarios: false,
+                    UserInterfaceOnly: true, AllowFormattingCells: true, AllowFormattingColumns: true,
+                    AllowFiltering: true, AllowSorting: true);
+                }
+            }
+            catch { /* 보호 실패는 무시(회사 정책/공유통합문서 등) */ }
         }
 
         private static void EnqueueReapplyHeaderUi(string sheetName, bool withValidation)

@@ -68,13 +68,137 @@ namespace XQLite.AddIn
             Stop();
         }
 
-        // ========= 명령(리본/메뉴) =========
+        // 베스트: 행 단위 커밋
+        // - 기존행(id 있음) → upsertRows
+        // - 신규행(id 없음) → upsertCells(임시키 포함) → assigned로 id 반영
         public async void Cmd_CommitSync()
         {
             try
             {
-                await EnsureActiveSheetSchema();             // 헤더 → 서버 스키마 동기화
-                await _sync.FlushUpsertsNow(force: true);    // 변경된 셀만 즉시 업서트
+                var app = ExcelDnaUtil.Application as Excel.Application;
+                if (app == null) return;
+                var ws = app.ActiveSheet as Excel.Worksheet;
+                if (ws == null) return;
+
+                var sm = _sheet.GetOrCreateSheet(ws.Name);
+                var header = XqlSheetView.GetHeaderOrFallback(ws);
+                if (header == null) return;
+
+                var headers = XqlSheet.ComputeHeaderNames(header);
+                string keyName = string.IsNullOrWhiteSpace(sm.KeyColumn) ? "id" : sm.KeyColumn!;
+                int keyIdx1 = XqlSheet.FindKeyColumnIndex(headers, keyName); // 1-based
+                if (keyIdx1 <= 0) keyIdx1 = 1; // 방어: 항상 첫 열을 키로
+
+                int firstDataRow = header.Row + 1;
+                var used = ws.UsedRange;
+                int lastDataRow = used.Row + used.Rows.Count - 1;
+                if (lastDataRow < firstDataRow) return;
+
+                // 분기: 기존행/신규행
+                var rowsForUpsertRows = new List<Dictionary<string, object?>>();
+                var cellsForUpsertCells = new List<EditCell>();
+                var tempRowKeyToExcelRow = new Dictionary<string, int>(StringComparer.Ordinal);
+
+                for (int r = firstDataRow; r <= lastDataRow; r++)
+                {
+                    // 1) id (있으면 기존행)
+                    object? idVal = GetCell(ws, r, header.Column + keyIdx1 - 1);
+                    string idStr = XqlCommon.Canonicalize(idVal) ?? "";
+
+                    // 2) 전체 컬럼 값 수집
+                    var obj = new Dictionary<string, object?>(StringComparer.Ordinal);
+                    for (int i = 0; i < headers.Count; i++)
+                    {
+                        var col = headers[i];
+                        if (string.IsNullOrWhiteSpace(col)) continue;
+                        object? v = GetCell(ws, r, header.Column + i);
+                        if (col.Equals(keyName, StringComparison.OrdinalIgnoreCase))
+                        {
+                            if (!string.IsNullOrWhiteSpace(idStr))
+                                obj[keyName] = idStr;
+                            continue;
+                        }
+                        obj[col] = v is DateTime dt ? dt : v;
+                    }
+
+                    // 완전 빈 행 스킵: (id도 비고, 나머지도 all-null/empty)
+                    bool anyData = obj.Any(kv =>
+                        !kv.Key.Equals(keyName, StringComparison.OrdinalIgnoreCase) &&
+                        kv.Value != null &&
+                        !string.IsNullOrWhiteSpace(Convert.ToString(kv.Value)));
+                    if (!anyData && string.IsNullOrWhiteSpace(idStr)) continue;
+
+                    if (!string.IsNullOrWhiteSpace(idStr))
+                    {
+                        // 기존행 → upsertRows payload
+                        obj[keyName] = idStr;
+                        rowsForUpsertRows.Add(obj);
+                    }
+                    else
+                    {
+                        // 신규행 → upsertCells 묶음(임시키 부여)
+                        // temp key: "-<excelRow>"
+                        string tempKey = "-" + r.ToString();
+                        tempRowKeyToExcelRow[tempKey] = r;
+
+                        foreach (var kv in obj)
+                        {
+                            if (kv.Key.Equals(keyName, StringComparison.OrdinalIgnoreCase)) continue; // PK 제외
+                            // 비어있는 값은 null 전달(서버 TEXT 컬럼은 null 허용)
+                            var val = kv.Value;
+                            cellsForUpsertCells.Add(new EditCell(
+                                ws.Name,
+                                tempKey,
+                                kv.Key,
+                                val
+                            ));
+                        }
+                    }
+                }
+
+                // 서버 호출
+                if (XqlAddIn.Backend is IXqlBackend be)
+                {
+                    // 3-a) 기존행: upsertRows
+                    if (rowsForUpsertRows.Count > 0)
+                    {
+                        var resp = await be.UpsertRows(ws.Name, rowsForUpsertRows).ConfigureAwait(false);
+                        if (resp?.Errors is { Count: > 0 })
+                            XqlLog.Warn("Commit errors (upsertRows): " + string.Join("; ", resp.Errors));
+                    }
+
+                    // 3-b) 신규행: upsertCells (assigned 처리)
+                    if (cellsForUpsertCells.Count > 0)
+                    {
+                        var resp2 = await be.UpsertCells(cellsForUpsertCells).ConfigureAwait(false);
+                        if (resp2?.Errors is { Count: > 0 })
+                            XqlLog.Warn("Commit errors (upsertCells): " + string.Join("; ", resp2.Errors));
+
+                        // 서버가 발급한 id를 시트에 반영
+                        if (resp2?.Assigned != null && resp2.Assigned.Count > 0)
+                        {
+                            foreach (var a in resp2.Assigned)
+                            {
+                                if (a == null) continue;
+                                if (!string.Equals(a.Table, ws.Name, StringComparison.Ordinal)) continue;
+                                if (string.IsNullOrWhiteSpace(a.NewId)) continue;
+                                if (a.TempRowKey == null) continue;
+
+                                if (tempRowKeyToExcelRow.TryGetValue(a.TempRowKey, out var rowIdx))
+                                {
+                                    var keyCell = (Excel.Range)ws.Cells[rowIdx, header.Column + keyIdx1 - 1];
+                                    try { keyCell.Value2 = a.NewId; }
+                                    finally { XqlCommon.ReleaseCom(keyCell); }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 4) 최신 반영을 위해 Pull
+#pragma warning disable CS4014
+                _sync.PullSince(null);
+#pragma warning restore CS4014
             }
             catch (Exception ex)
             {
@@ -245,7 +369,6 @@ namespace XQLite.AddIn
         /// - Rename → Alter → Add → Drop 순으로 항상 실행(드랍 자동).
         /// - 빈 헤더는 "삭제 의도"로 해석(추가/유지 대상에서 제외).
         /// </summary>
-        // XqlExcelInterop.cs
         private async Task EnsureActiveSheetSchema()
         {
             if (XqlAddIn.Backend is not IXqlBackend be) return;
@@ -363,9 +486,9 @@ namespace XQLite.AddIn
             // 2-4) Drop (자동·안전 판단 — 키/관리필드 제외, 헤더에 없는 서버 컬럼만)
             {
                 var metaCols = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-        {
-            snap.Key!, "row_version", "updated_at", "deleted"
-        };
+                {
+                    snap.Key!, "row_version", "updated_at", "deleted"
+                };
                 var headerSet = new HashSet<string>(snap.HeaderNames!, StringComparer.OrdinalIgnoreCase);
 
                 var drop = serverCols
@@ -400,8 +523,6 @@ namespace XQLite.AddIn
         }
 
         // ======== 내부 유틸 ========
-        // XqlExcelInterop.cs 내부 (EnsureActiveSheetSchema 위나 아래 아무 위치 OK)
-        // XqlExcelInterop.cs 내
         private static List<string> NormalizeHeaderNamesWithLetters(Excel.Range header, IList<string> names)
         {
             if (header == null) throw new ArgumentNullException(nameof(header));
@@ -447,11 +568,11 @@ namespace XQLite.AddIn
                         }
                     }
 
-                    // ③ 완전 공백 방지 (혹시 모를 예외 케이스)
+                    // ③ 완전 공백 방지
                     if (string.IsNullOrWhiteSpace(s))
                         s = XqlCommon.ColumnIndexToLetter(cell.Column);
 
-                    // ④ 중복 방지(대소문자 무시): Foo, foo → Foo, Foo_2
+                    // ④ 중복 방지: Foo, foo → Foo, Foo_2
                     var name = s.Trim();
                     if (used.Contains(name))
                     {
@@ -565,6 +686,23 @@ namespace XQLite.AddIn
                 }
             }
             return list;
+        }
+
+        // 셀 값을 안전하게 가져오는 헬퍼(Value2 → Date/숫자/문자 정규화)
+        private static object? GetCell(Excel.Worksheet w, int row, int col)
+        {
+            Excel.Range? c = null;
+            try
+            {
+                c = (Excel.Range)w.Cells[row, col];
+                var v = c.Value2;
+                if (v == null) return null;
+                if (v is double d && XqlCommon.IsExcelDateTimeLikely(c))
+                    return DateTime.FromOADate(d);
+                return v;
+            }
+            catch { return null; }
+            finally { XqlCommon.ReleaseCom(c); }
         }
     }
 }

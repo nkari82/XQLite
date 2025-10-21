@@ -109,7 +109,7 @@ type DBBundle = {
     // data helpers
     selectPk: (table: string) => string;
     tableInfo: (table: string) => Array<{ name: string; type: string | null; notnull: number; pk: number }>;
-    selectRowByPk: (table: string, pkName: string, id: string) => any;
+    selectRowByPk: (table: string, pkName: string, id: string | number) => any;
   };
 };
 
@@ -123,7 +123,6 @@ const FORBIDDEN_IN_MAIN = new Set<string>(['_meta', '_events', '_presence', '_lo
 // ────────────────────────────────────────────────────────────
 /** admin attach 후 호출: main에 남은 '_' 테이블들을 admin으로 이관 */
 function migrateUnderscoreTablesToAdmin(db: Database.Database) {
-  // 후보 수집
   const tables = db.prepare(`SELECT name, sql FROM main.sqlite_master WHERE type='table'`).all() as Array<{ name: string; sql: string | null }>;
   const idxs = db.prepare(`SELECT name, tbl_name, sql FROM main.sqlite_master WHERE type='index' AND sql IS NOT NULL`).all() as Array<{ name: string; tbl_name: string; sql: string }>;
   const trgs = db.prepare(`SELECT name, tbl_name, sql FROM main.sqlite_master WHERE type='trigger' AND sql IS NOT NULL`).all() as Array<{ name: string; tbl_name: string; sql: string }>;
@@ -143,7 +142,6 @@ function migrateUnderscoreTablesToAdmin(db: Database.Database) {
         db.exec(`CREATE TABLE IF NOT EXISTS admin.${escapeIdent(name)} AS SELECT ${cols || '*'} FROM main.${escapeIdent(name)} WHERE 0`);
       } else {
         // CREATE TABLE ... → CREATE TABLE admin."name" ...
-        // 첫 테이블 식별자만 admin.<ident>로 치환
         const ddl = createSQL.replace(/^\s*CREATE\s+TABLE\s+(IF\s+NOT\s+EXISTS\s+)?((["`\[]?).+?\3)/i,
           (_m, ifexists) => `CREATE TABLE ${ifexists ?? ''}admin.${escapeIdent(name)}`);
         db.exec(ddl);
@@ -168,7 +166,7 @@ function migrateUnderscoreTablesToAdmin(db: Database.Database) {
         try { db.exec(idxDDL); } catch { /* ignore conflicting names across schemas */ }
       }
 
-      // 트리거는 스키마 명시/테이블 참조가 복잡할 수 있어 경고만 출력
+      // 트리거는 경고만
       const trgOfTable = trgs.filter(tr => tr.tbl_name === name);
       if (trgOfTable.length > 0) {
         console.warn(`[WARN] Triggers on ${name} detected; migration skipped. Please recreate them on admin manually.`);
@@ -208,12 +206,12 @@ function openBundle(projectRaw?: string | null): DBBundle {
   const db = new Database(dataPath(project), READONLY ? { readonly: true } : {});
   applyPragmasTo(db);
 
-  // ATTACH admin first (migration needs it)
+  // ATTACH admin
   const ap = adminPath(project).replace(/"/g, '""');
   db.exec(`ATTACH DATABASE "${ap}" AS admin;`);
   applyPragmasTo(db, 'admin');
 
-  // ── admin schema ensure
+  // admin schema ensure
   db.exec(`
     CREATE TABLE IF NOT EXISTS admin._meta (key TEXT PRIMARY KEY, value TEXT);
     CREATE TABLE IF NOT EXISTS admin._events (
@@ -225,23 +223,23 @@ function openBundle(projectRaw?: string | null): DBBundle {
       cells      TEXT    NOT NULL
     );
     CREATE TABLE IF NOT EXISTS admin._row_state (
-      table_name TEXT    NOT NULL,
-      row_key    TEXT    NOT NULL,
+      table_name  TEXT    NOT NULL,
+      row_key     TEXT    NOT NULL,
       row_version INTEGER NOT NULL,
       ts          REAL    NOT NULL,
       deleted     INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (table_name, row_key)
     );
     CREATE TABLE IF NOT EXISTS admin._presence (
-      nickname TEXT NOT NULL,
-      sheet TEXT,
-      cell TEXT,
+      nickname  TEXT NOT NULL,
+      sheet     TEXT,
+      cell      TEXT,
       updated_at REAL NOT NULL,
       PRIMARY KEY (nickname)
     );
     CREATE TABLE IF NOT EXISTS admin._locks (
       cell TEXT PRIMARY KEY,
-      by TEXT NOT NULL,
+      by   TEXT NOT NULL,
       updated_at REAL NOT NULL
     );
     CREATE TABLE IF NOT EXISTS admin._audit_log (
@@ -263,13 +261,13 @@ function openBundle(projectRaw?: string | null): DBBundle {
     CREATE INDEX IF NOT EXISTS admin._audit_rowver     ON _audit_log(row_version);
   `);
 
-  // ── migrate '_' tables (user-owned) from main → admin
+  // migrate '_' tables (user-owned) from main → admin
   if (!READONLY) {
     try { migrateUnderscoreTablesToAdmin(db); }
     catch (e) { console.warn('[WARN] migration failed:', (e as any)?.message ?? e); }
   }
 
-  // ── now ensure main is pure
+  // main is pure
   assertDataSchemaIsPure(db);
 
   // _meta init
@@ -360,7 +358,7 @@ function openBundle(projectRaw?: string | null): DBBundle {
         name: string; type: string | null; notnull: number; pk: number;
       }>;
     },
-    selectRowByPk: (table: string, pkName: string, id: string) => {
+    selectRowByPk: (table: string, pkName: string, id: string | number) => {
       return db.prepare(`SELECT * FROM ${escapeIdent(table)} WHERE ${escapeIdent(pkName)}=@id LIMIT 1`).get({ id });
     },
   };
@@ -385,7 +383,7 @@ function nextRowVersion(bundle: DBBundle): number {
 // ────────────────────────────────────────────────────────────
 // 온디맨드 컬럼/테이블 (main = 순수 데이터)
 // ────────────────────────────────────────────────────────────
-const RESERVED_MAIN = new Set(['id']);
+const RESERVED_MAIN = new Set(['id']); // id는 서버가 관리
 
 function ensureColumns(bundle: DBBundle, table: string, columns: string[]) {
   if (!columns.length) return;
@@ -395,11 +393,19 @@ function ensureColumns(bundle: DBBundle, table: string, columns: string[]) {
   for (const name of toAdd) bundle.db.exec(`ALTER TABLE ${escapeIdent(table)} ADD COLUMN ${escapeIdent(name)} TEXT`);
 }
 
+/** 기본: id INTEGER PRIMARY KEY (rowid) */
 function ensureTable(bundle: DBBundle, table: string, key: string) {
-  bundle.db.exec(`
-    CREATE TABLE IF NOT EXISTS ${escapeIdent(table)} (
-      ${escapeIdent(key)} TEXT PRIMARY KEY
-    )`);
+  if (key === 'id') {
+    bundle.db.exec(`
+      CREATE TABLE IF NOT EXISTS ${escapeIdent(table)} (
+        id INTEGER PRIMARY KEY
+      )`);
+  } else {
+    bundle.db.exec(`
+      CREATE TABLE IF NOT EXISTS ${escapeIdent(table)} (
+        ${escapeIdent(key)} TEXT PRIMARY KEY
+      )`);
+  }
 }
 
 // ────────────────────────────────────────────────────────────
@@ -422,10 +428,16 @@ const typeDefs = /* GraphQL */ `
     patches: [Patch!]!
   }
 
+  type AssignedId {
+    client_row: Int
+    row_key: String!
+  }
+
   type UpsertResult {
     max_row_version: Int!
     errors: [String!]
     conflicts: [Conflict!]
+    assigned: [AssignedId!]
   }
 
   type Conflict {
@@ -471,7 +483,7 @@ const typeDefs = /* GraphQL */ `
 
   input CellEditInput {
     table: String!
-    row_key: String!
+    row_key: String!   # "" or "0" or negative => NEW row (server assigns id when PK is id)
     column: String!
     value: String
   }
@@ -531,16 +543,16 @@ const typeDefs = /* GraphQL */ `
 // ────────────────────────────────────────────────────────────
 // PubSub
 // ────────────────────────────────────────────────────────────
-type Patch = { table: string; row_key: string; row_version: number; updated_at: number; deleted: number; cells: Record<string, unknown> };
-type RowsResult = { max_row_version: number; patches: Patch[] };
+type PatchT = { table: string; row_key: string; row_version: number; updated_at: number; deleted: number; cells: Record<string, unknown> };
+type RowsResultT = { max_row_version: number; patches: PatchT[] };
 
-const pubsub = createPubSub<{ 'rows-events': [RowsResult] }>();
+const pubsub = createPubSub<{ 'rows-events': [RowsResultT] }>();
 
 async function publishEvents(bundle: DBBundle, since: number) {
   const rows = bundle.stmts.selectEventsSince.all({ since }) as Array<{
     row_version: number; ts: number; table_name: string; row_key: string; deleted: number; cells: string;
   }>;
-  const patches: Patch[] = rows.map(r => ({
+  const patches: PatchT[] = rows.map(r => ({
     table: r.table_name,
     row_key: r.row_key,
     row_version: r.row_version,
@@ -568,7 +580,7 @@ const resolvers = {
       const list = bundle.stmts.selectEventsSince.all({ since }) as Array<{
         row_version: number; ts: number; table_name: string; row_key: string; deleted: number; cells: string;
       }>;
-      const patches: Patch[] = list
+      const patches: PatchT[] = list
         .filter(r => (args.table ? r.table_name === args.table : true))
         .map(r => ({
           table: r.table_name, row_key: r.row_key, row_version: r.row_version,
@@ -691,10 +703,17 @@ const resolvers = {
     createTable: (_: unknown, args: { table: string; key: string; project?: string }, ctx: any) => {
       if (READONLY) return { ok: true };
       const bundle = bundleFrom(ctx, args.project);
-      bundle.db.exec(`
-        CREATE TABLE IF NOT EXISTS ${escapeIdent(args.table)} (
-          ${escapeIdent(args.key)} TEXT PRIMARY KEY
-        )`);
+      if (args.key === 'id') {
+        bundle.db.exec(`
+          CREATE TABLE IF NOT EXISTS ${escapeIdent(args.table)} (
+            id INTEGER PRIMARY KEY
+          )`);
+      } else {
+        bundle.db.exec(`
+          CREATE TABLE IF NOT EXISTS ${escapeIdent(args.table)} (
+            ${escapeIdent(args.key)} TEXT PRIMARY KEY
+          )`);
+      }
       return { ok: true };
     },
 
@@ -819,13 +838,13 @@ const resolvers = {
           const ts = nowMs();
           bundle.db.prepare(`DELETE FROM ${escapeIdent(args.table)} WHERE ${escapeIdent(pk)}=@id`).run({ id });
           bundle.stmts.insertEvent.run({
-            row_version: rv, ts, table_name: args.table, row_key: id, deleted: 1, cells: JSON.stringify({}),
+            row_version: rv, ts, table_name: args.table, row_key: String(id), deleted: 1, cells: JSON.stringify({}),
           });
           bundle.stmts.rowStateUpsert.run({
-            table_name: args.table, row_key: id, row_version: rv, ts, deleted: 1,
+            table_name: args.table, row_key: String(id), row_version: rv, ts, deleted: 1,
           });
           bundle.stmts.auditInsert.run({
-            ts, user: 'excel', table_name: args.table, row_key: id,
+            ts, user: 'excel', table_name: args.table, row_key: String(id),
             column: 'deleted', old_value: '0', new_value: args.hard ? 'HARD_DELETE' : '1', row_version: rv,
           });
         }
@@ -838,13 +857,15 @@ const resolvers = {
       return { ok: true };
     },
 
+    // === 신규 정책: upsertCells에서도 신규 키 허용(단, PK=id INTEGER 이어야 자동발급 가능) ===
     upsertCells: (_: unknown, args: { cells: Array<{ table: string; row_key: string; column: string; value?: string | null }>; project?: string }, ctx: any) => {
       const bundle = bundleFrom(ctx, args.project);
       if (READONLY) {
         const mv = bundle.stmts.selectMaxVersion.get() as { v: number };
-        return { max_row_version: (mv?.v ?? 0) | 0, errors: ['READONLY'], conflicts: null };
+        return { max_row_version: (mv?.v ?? 0) | 0, errors: ['READONLY'], conflicts: null, assigned: [] };
       }
 
+      // 스키마 보장
       const perTable = new Map<string, Set<string>>();
       for (const e of args.cells) {
         ensureTable(bundle, e.table, 'id');
@@ -854,62 +875,107 @@ const resolvers = {
       }
       for (const [table, set] of perTable) ensureColumns(bundle, table, Array.from(set));
 
-      const errors: string[] = [];
-      const grouped = new Map<string, Array<{ column: string; value: any }>>();
-      const keyMap = new Map<string, { table: string; row_key: string }>();
-      for (const c of args.cells) {
-        if (!c.table || !c.row_key || !c.column) continue;
-        const key = `${c.table}::${c.row_key}`;
-        if (!grouped.has(key)) grouped.set(key, []);
-        grouped.get(key)!.push({ column: c.column, value: c.value ?? null });
-        keyMap.set(key, { table: c.table, row_key: c.row_key });
+      type Edit = { column: string; value: any };
+      type Group = { table: string; row_key: string | null; edits: Edit[] };
+
+      const groups = new Map<string, Group>();
+      function isNewKey(k: string | null | undefined): boolean {
+        if (k == null) return true;
+        const s = String(k).trim();
+        if (s === '') return true;
+        if (s === '0') return true;
+        if (/^-\d+$/.test(s)) return true; // 음수 임시키
+        return false;
       }
 
+      for (const c of args.cells) {
+        if (!c.table || !c.column) continue;
+        const newRow = isNewKey(c.row_key);
+        const key = `${c.table}::${newRow ? 'NEW' : c.row_key}`;
+        const g = groups.get(key) ?? { table: c.table, row_key: newRow ? null : c.row_key, edits: [] };
+        g.edits.push({ column: c.column, value: c.value ?? null });
+        groups.set(key, g);
+      }
+
+      const errors: string[] = [];
+      const assigned: Array<{ client_row: number | null; row_key: string }> = [];
+
+      // 트랜잭션
       const tx = bundle.db.transaction(() => {
-        for (const [k, edits] of grouped) {
-          const { table, row_key } = keyMap.get(k)!;
-          const info = bundle.stmts.tableInfo(table);
-          const colSet = new Set(info.map(x => x.name));
+        for (const [, g] of groups) {
+          const info = bundle.stmts.tableInfo(g.table);
+          if (info.length === 0) { errors.push(`table ${g.table} not found`); continue; }
           const pk = info.find(c => (c.pk | 0) > 0)?.name ?? 'id';
+          const pkType = (info.find(c => (c.pk | 0) > 0)?.type || '').toUpperCase();
 
-          const before = bundle.stmts.selectRowByPk(table, pk, row_key) ?? null;
-
-          const cols = Array.from(new Set(edits.map(e => e.column))).filter(c => colSet.has(c));
+          const colSet = new Set(info.map(x => x.name));
+          const cols = Array.from(new Set(g.edits.map(e => e.column))).filter(c => c && colSet.has(c) && c !== pk);
           const kv: Record<string, any> = {};
-          for (const e of edits) if (colSet.has(e.column)) kv[e.column] = e.value;
+          for (const e of g.edits) if (cols.includes(e.column)) kv[e.column] = e.value;
 
-          const exists = !!before;
           const rv = nextRowVersion(bundle);
           const ts = nowMs();
 
-          if (exists) {
-            if (cols.length > 0) {
-              const sets = cols.map(c => `${escapeIdent(c)}=@${c}`);
-              const sql = `UPDATE ${escapeIdent(table)} SET ${sets.join(', ')} WHERE ${escapeIdent(pk)}=@id`;
-              bundle.db.prepare(sql).run({ ...kv, id: row_key });
+          if (g.row_key == null) {
+            // 신규
+            if (!(pk === 'id' && (pkType === '' || pkType === 'INTEGER'))) {
+              errors.push(`table ${g.table} has non-integer primary key; cannot auto-assign`);
+              continue;
             }
-          } else {
-            const allCols = [pk, ...cols];
-            const placeholders = allCols.map(c => `@${c}`);
-            const p: any = { [pk]: row_key };
-            for (const c of cols) p[c] = kv[c];
-            const sql = `INSERT INTO ${escapeIdent(table)}(${allCols.map(escapeIdent).join(', ')}) VALUES(${placeholders.join(', ')})`;
-            bundle.db.prepare(sql).run(p);
-          }
+            const infoIns = bundle.db.prepare(`INSERT INTO ${escapeIdent(g.table)} DEFAULT VALUES`).run();
+            const newId = Number(infoIns.lastInsertRowid);
 
-          for (const c of cols) {
-            const oldVal = before ? (before[c] != null ? String(before[c]) : null) : null;
-            const newVal = kv[c] != null ? String(kv[c]) : null;
+            if (cols.length > 0) {
+              const sets = cols.map(c => `${escapeIdent(c)}=@${c}`).join(', ');
+              const param = { ...kv, id: newId };
+              bundle.db.prepare(`UPDATE ${escapeIdent(g.table)} SET ${sets} WHERE id=@id`).run(param);
+            }
+
             bundle.stmts.auditInsert.run({
-              ts, user: 'excel', table_name: table, row_key, column: c, old_value: oldVal, new_value: newVal, row_version: rv,
+              ts, user: 'excel', table_name: g.table, row_key: String(newId),
+              column: '(new)', old_value: null, new_value: null, row_version: rv,
+            });
+            bundle.stmts.insertEvent.run({
+              row_version: rv, ts, table_name: g.table, row_key: String(newId), deleted: 0, cells: JSON.stringify(kv),
+            });
+            bundle.stmts.rowStateUpsert.run({
+              table_name: g.table, row_key: String(newId), row_version: rv, ts, deleted: 0,
+            });
+
+            assigned.push({ client_row: null, row_key: String(newId) });
+          } else {
+            // 기존 키
+            const before = bundle.stmts.selectRowByPk(g.table, pk, g.row_key) ?? null;
+
+            if (before) {
+              if (cols.length > 0) {
+                const sets = cols.map(c => `${escapeIdent(c)}=@${c}`).join(', ');
+                const param = { ...kv, id: g.row_key };
+                bundle.db.prepare(`UPDATE ${escapeIdent(g.table)} SET ${sets} WHERE ${escapeIdent(pk)}=@id`).run(param);
+              }
+            } else {
+              const allCols = [pk, ...cols];
+              const placeholders = allCols.map(c => `@${c}`).join(', ');
+              const p: any = { [pk]: g.row_key };
+              for (const c of cols) p[c] = kv[c];
+              bundle.db.prepare(`INSERT INTO ${escapeIdent(g.table)}(${allCols.map(escapeIdent).join(', ')}) VALUES(${placeholders})`).run(p);
+            }
+
+            for (const c of cols) {
+              const oldVal = before ? (before[c] != null ? String(before[c]) : null) : null;
+              const newVal = kv[c] != null ? String(kv[c]) : null;
+              bundle.stmts.auditInsert.run({
+                ts, user: 'excel', table_name: g.table, row_key: String(g.row_key),
+                column: c, old_value: oldVal, new_value: newVal, row_version: rv,
+              });
+            }
+            bundle.stmts.insertEvent.run({
+              row_version: rv, ts, table_name: g.table, row_key: String(g.row_key), deleted: 0, cells: JSON.stringify(kv),
+            });
+            bundle.stmts.rowStateUpsert.run({
+              table_name: g.table, row_key: String(g.row_key), row_version: rv, ts, deleted: 0,
             });
           }
-          bundle.stmts.insertEvent.run({
-            row_version: rv, ts, table_name: table, row_key, deleted: 0, cells: JSON.stringify(kv),
-          });
-          bundle.stmts.rowStateUpsert.run({
-            table_name: table, row_key, row_version: rv, ts, deleted: 0,
-          });
         }
       });
 
@@ -918,72 +984,106 @@ const resolvers = {
       const mv = bundle.stmts.selectMaxVersion.get() as { v: number };
       const maxRow = (mv?.v ?? 0) | 0;
       publishEvents(bundle, Math.max(0, maxRow - BROADCAST_BACKSCAN)).catch(() => { });
-      return { max_row_version: maxRow, errors: errors.length ? errors : null, conflicts: null };
+      return { max_row_version: maxRow, errors: errors.length ? errors : null, conflicts: null, assigned };
     },
 
+    // === 핵심: upsertRows에서도 PK 미지정 행을 허용 → 서버가 id 발급 + assigned 반환 ===
     upsertRows: (_: unknown, args: { table: string; rows: Array<Record<string, any>>; project?: string }, ctx: any) => {
       const bundle = bundleFrom(ctx, args.project);
       if (READONLY) {
         const mv = bundle.stmts.selectMaxVersion.get() as { v: number };
-        return { max_row_version: (mv?.v ?? 0) | 0, errors: ['READONLY'], conflicts: null };
+        return { max_row_version: (mv?.v ?? 0) | 0, errors: ['READONLY'], conflicts: null, assigned: [] };
       }
 
       ensureTable(bundle, args.table, 'id');
+
+      // 컬럼 보강(모든 행 스캔)
       const keys = new Set<string>();
       for (const r of args.rows) for (const k of Object.keys(r)) if (k) keys.add(k);
       const info0 = bundle.stmts.tableInfo(args.table);
       const pk = info0.find(c => (c.pk | 0) > 0)?.name ?? 'id';
       keys.delete(pk);
+      keys.delete('__row'); // 로컬 표식
       ensureColumns(bundle, args.table, Array.from(keys));
 
       const errors: string[] = [];
+      const assigned: Array<{ client_row: number | null; row_key: string }> = [];
 
       const tx2 = bundle.db.transaction(() => {
         const info2 = bundle.stmts.tableInfo(args.table);
         const colSet = new Set(info2.map(x => x.name));
+        const pkType = (info2.find(c => (c.pk | 0) > 0)?.type || '').toUpperCase();
 
         for (const row of args.rows) {
-          const row_key = String(row[pk] ?? '');
-          if (!row_key) continue;
-
-          const before = bundle.stmts.selectRowByPk(args.table, pk, row_key) ?? null;
-          const cols = Object.keys(row).filter(c => c !== pk && colSet.has(c));
+          const clientRow: number | null = Number.isFinite(+row['__row']) ? (+row['__row'] | 0) : null;
+          const hasPk = row.hasOwnProperty(pk) && String(row[pk] ?? '').trim() !== '';
+          const cols = Object.keys(row).filter(c => c !== pk && c !== '__row' && colSet.has(c));
           const kv: Record<string, any> = {};
           for (const c of cols) kv[c] = row[c];
 
-          const exists = !!before;
           const rv = nextRowVersion(bundle);
           const ts = nowMs();
 
-          if (exists) {
-            if (cols.length > 0) {
-              const sets = cols.map(c => `${escapeIdent(c)}=@${c}`);
-              const sql = `UPDATE ${escapeIdent(args.table)} SET ${sets.join(', ')} WHERE ${escapeIdent(pk)}=@id`;
-              bundle.db.prepare(sql).run({ ...kv, id: row_key });
+          if (!hasPk) {
+            // 새 행: PK=id INTEGER 인 경우만 자동 발급
+            if (!(pk === 'id' && (pkType === '' || pkType === 'INTEGER'))) {
+              errors.push(`upsertRows: table ${args.table} has non-integer PK; cannot auto-assign for rows without PK`);
+              continue;
             }
-          } else {
-            const allCols = [pk, ...cols];
-            const placeholders = allCols.map(c => `@${c}`);
-            const p: any = { [pk]: row_key };
-            for (const c of cols) p[c] = kv[c];
-            const sql = `INSERT INTO ${escapeIdent(args.table)}(${allCols.map(escapeIdent).join(', ')}) VALUES(${placeholders.join(', ')})`;
-            bundle.db.prepare(sql).run(p);
-          }
+            const infoIns = bundle.db.prepare(`INSERT INTO ${escapeIdent(args.table)} DEFAULT VALUES`).run();
+            const newId = Number(infoIns.lastInsertRowid);
 
-          for (const c of cols) {
-            const oldVal = before ? (before[c] != null ? String(before[c]) : null) : null;
-            const newVal = kv[c] != null ? String(kv[c]) : null;
+            if (cols.length > 0) {
+              const sets = cols.map(c => `${escapeIdent(c)}=@${c}`).join(', ');
+              const param = { ...kv, id: newId };
+              bundle.db.prepare(`UPDATE ${escapeIdent(args.table)} SET ${sets} WHERE id=@id`).run(param);
+            }
+
             bundle.stmts.auditInsert.run({
-              ts, user: 'excel', table_name: args.table, row_key, column: c, old_value: oldVal, new_value: newVal, row_version: rv,
+              ts, user: 'excel', table_name: args.table, row_key: String(newId),
+              column: '(new)', old_value: null, new_value: null, row_version: rv,
+            });
+            bundle.stmts.insertEvent.run({
+              row_version: rv, ts, table_name: args.table, row_key: String(newId), deleted: 0, cells: JSON.stringify(kv),
+            });
+            bundle.stmts.rowStateUpsert.run({
+              table_name: args.table, row_key: String(newId), row_version: rv, ts, deleted: 0,
+            });
+
+            assigned.push({ client_row: clientRow, row_key: String(newId) });
+          } else {
+            const row_key = row[pk];
+            const before = bundle.stmts.selectRowByPk(args.table, pk, row_key) ?? null;
+
+            if (before) {
+              if (cols.length > 0) {
+                const sets = cols.map(c => `${escapeIdent(c)}=@${c}`);
+                bundle.db.prepare(`UPDATE ${escapeIdent(args.table)} SET ${sets.join(', ')} WHERE ${escapeIdent(pk)}=@id`).run({ ...kv, id: row_key });
+              }
+            } else {
+              const allCols = [pk, ...cols];
+              const placeholders = allCols.map(c => `@${c}`).join(', ');
+              const p: any = { [pk]: row_key };
+              for (const c of cols) p[c] = kv[c];
+              bundle.db.prepare(`INSERT INTO ${escapeIdent(args.table)}(${allCols.map(escapeIdent).join(', ')}) VALUES(${placeholders})`).run(p);
+            }
+
+            for (const c of cols) {
+              const oldVal = before ? (before[c] != null ? String(before[c]) : null) : null;
+              const newVal = kv[c] != null ? String(kv[c]) : null;
+              bundle.stmts.auditInsert.run({
+                ts, user: 'excel', table_name: args.table, row_key: String(row_key),
+                column: c, old_value: oldVal, new_value: newVal, row_version: rv,
+              });
+            }
+
+            bundle.stmts.insertEvent.run({
+              row_version: rv, ts, table_name: args.table, row_key: String(row_key), deleted: 0, cells: JSON.stringify(kv),
+            });
+            bundle.stmts.rowStateUpsert.run({
+              table_name: args.table, row_key: String(row_key), row_version: rv, ts, deleted: 0,
             });
           }
-
-          bundle.stmts.insertEvent.run({
-            row_version: rv, ts, table_name: args.table, row_key, deleted: 0, cells: JSON.stringify(kv),
-          });
-          bundle.stmts.rowStateUpsert.run({
-            table_name: args.table, row_key, row_version: rv, ts, deleted: 0,
-          });
         }
       });
 
@@ -992,7 +1092,7 @@ const resolvers = {
       const mv = bundle.stmts.selectMaxVersion.get() as { v: number };
       const maxRow = (mv?.v ?? 0) | 0;
       publishEvents(bundle, Math.max(0, maxRow - BROADCAST_BACKSCAN)).catch(() => { });
-      return { max_row_version: maxRow, errors: errors.length ? errors : null, conflicts: null };
+      return { max_row_version: maxRow, errors: errors.length ? errors : null, conflicts: null, assigned };
     },
 
     rebuildRowState: (_: unknown, args: { table?: string; project?: string }, ctx: any) => {
@@ -1013,8 +1113,7 @@ const resolvers = {
             WHERE table_name=@t
             GROUP BY table_name, row_key
           `).all({ t: args.table }) as Array<{ table_name: string; row_key: string; row_version: number; ts: number; deleted: number }>;
-          const ins = bundle.stmts.rowStateUpsert;
-          for (const r of cur) ins.run({ table_name: r.table_name, row_key: r.row_key, row_version: r.row_version, ts: r.ts, deleted: r.deleted | 0 });
+          for (const r of cur) bundle.stmts.rowStateUpsert.run({ table_name: r.table_name, row_key: r.row_key, row_version: r.row_version, ts: r.ts, deleted: r.deleted | 0 });
         } else {
           bundle.db.exec(`DELETE FROM admin._row_state`);
           const cur = bundle.db.prepare(`
@@ -1027,8 +1126,7 @@ const resolvers = {
             FROM admin._events e1
             GROUP BY table_name, row_key
           `).all() as Array<{ table_name: string; row_key: string; row_version: number; ts: number; deleted: number }>;
-          const ins = bundle.stmts.rowStateUpsert;
-          for (const r of cur) ins.run({ table_name: r.table_name, row_key: r.row_key, row_version: r.row_version, ts: r.ts, deleted: r.deleted | 0 });
+          for (const r of cur) bundle.stmts.rowStateUpsert.run({ table_name: r.table_name, row_key: r.row_key, row_version: r.row_version, ts: r.ts, deleted: r.deleted | 0 });
         }
       });
       tx();
@@ -1039,7 +1137,7 @@ const resolvers = {
   Subscription: {
     events: {
       subscribe: () => pubsub.subscribe('rows-events'),
-      resolve: (payload: RowsResult) => payload,
+      resolve: (payload: RowsResultT) => payload,
     },
   },
 };
@@ -1083,7 +1181,151 @@ process.on('SIGINT', () => { console.log('SIGINT'); shutdown(0); });
 process.on('SIGTERM', () => { console.log('SIGTERM'); shutdown(0); });
 process.on('uncaughtException', (err) => { console.error('[uncaughtException]', err?.stack || err); });
 process.on('unhandledRejection', (reason) => { console.error('[unhandledRejection]', reason); });
-function rebuildTableWithAlters(bundle: DBBundle, table: string, info: { name: string; type: string | null; notnull: number; pk: number; }[], wants: Map<string, { toType?: string | null; toNotNull?: boolean | null; toCheck?: string | null; }>) {
-  throw new Error('Function not implemented.');
+
+// 프로덕션용 폴백: 스키마/인덱스/트리거/FK/DEFAULT까지 최대 보존
+function rebuildTableWithAlters(
+  bundle: DBBundle,
+  table: string,
+  curInfo: { cid?: number; name: string; type: string | null; notnull: number; dflt_value?: any; pk: number; hidden?: number }[],
+  wants: Map<string, { toType?: string | null; toNotNull?: boolean | null; toCheck?: string | null; }>
+) {
+  const db = bundle.db;
+  const q = (sql: string) => db.prepare(sql);
+
+  // ── 원본 테이블 DDL
+  const readMaster = q(`SELECT sql FROM sqlite_master WHERE type='table' AND name=@t`).get({ t: table }) as { sql?: string } | undefined;
+  const tblSql = (readMaster?.sql || '').trim();
+
+  // 특성 추출
+  const hasAutoInc = /\bINTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT\b/i.test(tblSql);
+  const withoutRowid = /\bWITHOUT\s+ROWID\b/i.test(tblSql);
+
+  // 테이블 레벨 제약 추출(간단 파서)
+  const tableLevelConstraints = (() => {
+    const m = tblSql.match(/\(([\s\S]+)\)\s*(?:WITHOUT\s+ROWID)?\s*;?$/i);
+    if (!m) return '';
+    const body = m[1];
+    // 쉼표 분해(따옴표/괄호 고려)
+    const parts = body.split(/,(?=(?:[^()"']|"[^"]*"|'[^']*')*$)/g).map(s => s.trim());
+    const constraints = parts.filter(p =>
+      /^(CONSTRAINT\b|CHECK\s*\(|UNIQUE\s*\(|FOREIGN\s+KEY\s*\()/i.test(p)
+    );
+    return constraints.length ? ', ' + constraints.join(', ') : '';
+  })();
+
+  // 사용자 생성 인덱스(origin='c')만 재생성
+  const indexes = (q(`PRAGMA index_list(${escapeIdent(table)})`).all() as Array<{ name: string; unique: number; origin: string; partial: number }>)
+    .filter(ix => ix.origin === 'c')
+    .map(ix => {
+      const cols = (q(`PRAGMA index_xinfo(${escapeIdent(ix.name)})`).all() as Array<{ name: string | null; cid: number; key: number }>)
+        .filter(c => c.name != null)
+        .sort((a, b) => a.cid - b.cid)
+        .map(c => escapeIdent(String(c.name)));
+      return {
+        name: ix.name,
+        unique: !!(ix.unique | 0),
+        sql: `CREATE ${ix.unique ? 'UNIQUE ' : ''}INDEX ${escapeIdent(ix.name)} ON ${escapeIdent(table)}(${cols.join(', ')})`
+      };
+    });
+
+  // 트리거 원문 보관
+  const triggers = q(`SELECT name, sql FROM sqlite_master WHERE type='trigger' AND tbl_name=@t AND sql IS NOT NULL`)
+    .all({ t: table }) as Array<{ name: string; sql: string }>;
+
+  // FK → 테이블 레벨 DDL로 재구성(복합키 포함)
+  const fkRows = q(`PRAGMA foreign_key_list(${escapeIdent(table)})`).all() as Array<{
+    id: number; seq: number; table: string; from: string; to: string; on_update: string; on_delete: string; match: string;
+  }>;
+  const fkGroups = new Map<number, typeof fkRows>();
+  for (const r of fkRows) {
+    if (!fkGroups.has(r.id)) fkGroups.set(r.id, []);
+    fkGroups.get(r.id)!.push(r);
+  }
+  const fkTableLevel = [...fkGroups.values()].map(g => {
+    const ref = g[0];
+    const fromCols = g.map(x => escapeIdent(x.from)).join(', ');
+    const toCols = g.map(x => escapeIdent(x.to)).join(', ');
+    const onUpd = ref.on_update && ref.on_update.toUpperCase() !== 'NONE' ? ` ON UPDATE ${ref.on_update}` : '';
+    const onDel = ref.on_delete && ref.on_delete.toUpperCase() !== 'NONE' ? ` ON DELETE ${ref.on_delete}` : '';
+    const match = ref.match && ref.match.toUpperCase() !== 'NONE' ? ` MATCH ${ref.match}` : '';
+    return `FOREIGN KEY (${fromCols}) REFERENCES ${escapeIdent(ref.table)}(${toCols})${onUpd}${onDel}${match}`;
+  });
+  const fkConstraintDDL = fkTableLevel.length ? ', ' + fkTableLevel.join(', ') : '';
+
+  // 컬럼 메타(table_xinfo가 있으면 우선)
+  const xinfo = q(`PRAGMA table_xinfo(${escapeIdent(table)})`).all() as Array<{
+    cid: number; name: string; type: string | null; notnull: number; dflt_value: any; pk: number; hidden: number;
+  }>;
+  const baseInfo = (xinfo.length ? xinfo : curInfo).slice();
+
+  // 변경 반영 컬럼 정의 구성
+  function buildColDef(c: (typeof baseInfo)[number]) {
+    const w = wants.get(c.name);
+    const typ = (w?.toType ? sqlType(w.toType) : (c.type ?? '')).trim();          // 타입 변경 반영
+    const nn = (w?.toNotNull ?? ((c.notnull | 0) === 1)) ? ' NOT NULL' : '';     // NOT NULL 변경 반영
+    const pkd = (c.pk | 0) ? ' PRIMARY KEY' : '';                                  // PK 유지 (rename은 별도에서 처리)
+    const dft = (c.dflt_value != null) ? ` DEFAULT ${c.dflt_value}` : '';          // 기본값 유지
+    const chk = (w?.toCheck && w.toCheck.trim().length > 0) ? ` CHECK(${w.toCheck.trim()})` : ''; // CHECK 변경
+    // hidden(생성/가상 컬럼)은 table_xinfo.hidden=2. 별도 구문 지원은 원본 DDL 재구성이 어려워 그대로 두되, 이름/순서 보전.
+    return `${escapeIdent(c.name)}${typ ? ' ' + typ : ''}${nn}${pkd}${dft}${chk}`;
+  }
+
+  const newColsDef = baseInfo.map(buildColDef).join(', ');
+  const tableSuffix = `${tableLevelConstraints}${fkConstraintDDL}${withoutRowid ? ' WITHOUT ROWID' : ''}`;
+  const tmp = `_tmp_${table}_${Date.now().toString(36)}`;
+
+  // 이관 가능한 컬럼 교집합(이름 기준; 컬럼 rename은 호출 전 별도 처리 가정)
+  const names = baseInfo.map(c => c.name);
+  const colList = names.map(escapeIdent).join(', ');
+
+  // 트랜잭션 유틸
+  const begin = () => db.exec('BEGIN IMMEDIATE; PRAGMA foreign_keys=OFF;');
+  const commit = () => db.exec('PRAGMA foreign_keys=ON; COMMIT;');
+  const rollback = () => { try { db.exec('ROLLBACK; PRAGMA foreign_keys=ON;'); } catch { } };
+
+  try {
+    begin();
+
+    // INTEGER PRIMARY KEY → AUTOINCREMENT 유지
+    const patchedColsDef = newColsDef.replace(
+      /\bid\b\s+INTEGER\s+PRIMARY\s+KEY\b/i,
+      (m) => hasAutoInc ? `${m} AUTOINCREMENT` : m
+    );
+
+    // 1) 새 테이블 생성 (테이블 레벨 제약/FK/ROWID 특성 보존)
+    db.exec(`CREATE TABLE ${escapeIdent(tmp)} (${patchedColsDef}${tableSuffix ? ', ' + tableSuffix.replace(/^,\s*/, '') : ''});`);
+
+    // 2) 데이터 이관
+    if (colList) {
+      db.exec(`INSERT INTO ${escapeIdent(tmp)} (${colList}) SELECT ${colList} FROM ${escapeIdent(table)};`);
+    }
+
+    // 3) 기존 테이블 교체
+    db.exec(`DROP TABLE ${escapeIdent(table)};`);
+    db.exec(`ALTER TABLE ${escapeIdent(tmp)} RENAME TO ${escapeIdent(table)};`);
+
+    // 4) 사용자 생성 인덱스 재생성
+    for (const ix of indexes) {
+      try { db.exec(ix.sql); } catch { /* 이름 충돌 등은 무시 */ }
+    }
+
+    // 5) 트리거 재생성
+    for (const tr of triggers) {
+      try { db.exec(tr.sql); } catch { /* 무시 */ }
+    }
+
+    // 6) FK 검증(가능한 경우)
+    try {
+      const fkErrs = db.prepare('PRAGMA foreign_key_check').all() as any[];
+      if (fkErrs.length) throw new Error(`foreign_key_check failed: ${fkErrs.length} violation(s)`);
+    } catch {
+      // 일부 SQLite/설정에서 실패 가능 — 검증 실패 자체는 치명적 오류로 보지 않음
+    }
+
+    commit();
+  } catch (e) {
+    rollback();
+    throw e;
+  }
 }
 

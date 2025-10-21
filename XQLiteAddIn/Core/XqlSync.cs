@@ -118,6 +118,10 @@ namespace XQLite.AddIn
 
         public void EnqueueIfChanged(string table, string rowKey, string column, object? value)
         {
+            // PK(id)는 서버가 관리: 사용자의 직접 편집은 무시
+            if (!string.IsNullOrEmpty(column) && column.Equals("id", StringComparison.OrdinalIgnoreCase))
+                return;
+
             var e = new EditCell(Table: table, RowKey: rowKey, Column: column, Value: value);
             var k = Key(e);
             var norm = XqlCommon.Canonicalize(value);
