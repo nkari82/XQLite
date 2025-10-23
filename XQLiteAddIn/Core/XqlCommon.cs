@@ -424,5 +424,72 @@ namespace XQLite.AddIn
             catch { return false; }
         }
 
+
+        public readonly struct ExcelBatchScope : IDisposable
+        {
+            private readonly Excel.Application? _app;
+
+            // 캡처에 성공한 항목만 복구
+            private readonly bool _capEvents, _capScreen, _capAlerts;
+            private readonly bool _oldEvents, _oldScreen, _oldAlerts;
+
+            // Calculation은 값을 "읽지 않는다"
+            private readonly bool _calcTouched; // 수동 전환 성공 여부만 기억
+
+            public ExcelBatchScope(Excel.Application? app)
+            {
+                _app = app;
+
+                _oldEvents = _oldScreen = _oldAlerts = false;
+                _capEvents = _capScreen = _capAlerts = false;
+                _calcTouched = false;
+
+                if (app == null || app.Workbooks.Count == 0)
+                {
+                    _calcTouched = false;
+                    return;
+                }
+
+                // 1) 상태 캡처 (읽기 안전한 것만)
+                try { _oldEvents = app.EnableEvents; _capEvents = true; } catch { }
+                try { _oldScreen = app.ScreenUpdating; _capScreen = true; } catch { }
+                try { _oldAlerts = app.DisplayAlerts; _capAlerts = true; } catch { }
+
+                // 2) 배치 모드 진입 (가능한 것만)
+                try { app.EnableEvents = false; } catch { }
+                try { app.ScreenUpdating = false; } catch { }
+                try { app.DisplayAlerts = false; } catch { }
+
+                // Calculation은 "읽지 않고" 바로 수동으로 시도
+                try
+                {
+                    app.Calculation = Excel.XlCalculation.xlCalculationManual;
+                    _calcTouched = true; // 전환 성공
+                }
+                catch
+                {
+                    // 전환 실패: 만지지 않음(복구도 시도하지 않음)
+                    _calcTouched = false;
+                }
+            }
+
+            public void Dispose()
+            {
+                if (_app is null) return;
+
+                // 1) Calculation 복귀: 값을 읽어두지 않았으므로 '자동'으로만 되돌린다.
+                //    (수동 전환에 성공했을 때만 복귀 시도)
+                if (_calcTouched)
+                {
+                    try { _app.Calculation = Excel.XlCalculation.xlCalculationAutomatic; } catch { }
+                }
+
+                // 2) 나머지는 캡처 성공한 항목만 복구
+                try { if (_capAlerts) _app.DisplayAlerts = _oldAlerts; } catch { }
+                try { if (_capScreen) _app.ScreenUpdating = _oldScreen; } catch { }
+                try { if (_capEvents) _app.EnableEvents = _oldEvents; } catch { }
+            }
+        }
+
     }
 }
