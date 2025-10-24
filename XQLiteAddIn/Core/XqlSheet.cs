@@ -8,7 +8,6 @@ using System.Runtime.InteropServices;
 using static XQLite.AddIn.XqlCommon;
 using Excel = Microsoft.Office.Interop.Excel;
 
-
 namespace XQLite.AddIn
 {
     /// <summary>
@@ -298,7 +297,6 @@ namespace XQLite.AddIn
                     }
                     finally
                     {
-                        // SmartCom 기반: 열거 중 개별 해제 생략(Excel RCW 컬렉션 열거 안전)
                         if (!object.ReferenceEquals(match, w))
                         {
                             // no-op
@@ -340,7 +338,7 @@ namespace XQLite.AddIn
                 if (ws is null) continue;
                 if (string.Equals(ws.Name, sheetName, StringComparison.Ordinal))
                 {
-                    match = ws; // 반환용(해제 금지)
+                    match = ws;
                     break;
                 }
             }
@@ -357,7 +355,7 @@ namespace XQLite.AddIn
                 if (lo is null) continue;
                 if (string.Equals(lo.Name, listObjectName, StringComparison.Ordinal))
                 {
-                    match = lo; // 반환용(해제 금지)
+                    match = lo;
                     break;
                 }
             }
@@ -528,6 +526,9 @@ namespace XQLite.AddIn
             catch { return false; }
         }
 
+        /// <summary>
+        /// 리소스 키(col/cell)를 Range로 해석. ListObject가 없으면 헤더 마커 → 폴백 헤더로 앵커를 찾는다.
+        /// </summary>
         internal static bool TryResolve(
             Excel.Application app,
             RelDesc d,
@@ -542,17 +543,34 @@ namespace XQLite.AddIn
                 using var _ws = SmartCom<Excel.Worksheet>.Wrap(FindWorksheet(app, d.Sheet));
                 if (_ws.Value == null) return false;
 
-                // ListObject 탐색도 SmartCom으로 래핑
+                // 1) ListObject 있으면 우선 사용
                 using var _lo = SmartCom<Excel.ListObject>.Wrap(
                     FindListObject(_ws.Value, d.Table) ?? FindListObjectByTable(_ws.Value, d.Table));
-                if (_lo.Value == null || _lo.Value.HeaderRowRange == null) return false;
 
-                // 헤더 기준점
-                using var _hdr = XqlCommon.SmartCom<Excel.Range>.Wrap(_lo.Value.HeaderRowRange);
-                int anchorRow = _hdr.Value!.Row;
-                int anchorCol = _hdr.Value!.Column;
+                int anchorRow, anchorCol;
 
-                if (d.Kind == "col")
+                if (_lo.Value != null && _lo.Value.HeaderRowRange != null)
+                {
+                    using var _hdr = SmartCom<Excel.Range>.Wrap(_lo.Value.HeaderRowRange);
+                    anchorRow = _hdr.Value!.Row;
+                    anchorCol = _hdr.Value!.Column;
+                    lo = _lo.Detach();
+                }
+                else
+                {
+                    // 2) 헤더 마커 → 3) 폴백 헤더
+                    Excel.Range? hdr = null;
+                    if (TryGetHeaderMarker(_ws.Value, out var m)) hdr = m;
+                    hdr ??= GetHeaderRange(_ws.Value);
+
+                    using var _hdr = SmartCom<Excel.Range>.Wrap(hdr);
+                    if (_hdr.Value == null) return false;
+
+                    anchorRow = _hdr.Value.Row;
+                    anchorCol = _hdr.Value.Column;
+                }
+
+                if (string.Equals(d.Kind, "col", StringComparison.OrdinalIgnoreCase))
                 {
                     int col = anchorCol + d.ColOffset;
                     targetHeaderCol = col;
@@ -560,12 +578,10 @@ namespace XQLite.AddIn
                     using var _cell = SmartCom<Excel.Range>.Acquire(() =>
                         (Excel.Range)_ws.Value!.Cells[anchorRow, col]);
 
-                    // 호출자에게 소유권을 넘김(Detach) — 나머지는 using으로 정리됨
                     target = _cell.Detach();
-                    lo = _lo.Detach();
                     return target != null;
                 }
-                else if (d.Kind == "cell")
+                else if (string.Equals(d.Kind, "cell", StringComparison.OrdinalIgnoreCase))
                 {
                     int row = (anchorRow + 1) + d.RowOffset;   // 데이터 첫 행 = header+1
                     int col = anchorCol + d.ColOffset;
@@ -574,7 +590,6 @@ namespace XQLite.AddIn
                         (Excel.Range)_ws.Value!.Cells[row, col]);
 
                     target = _cell.Detach();
-                    lo = _lo.Detach();
                     return target != null;
                 }
 
@@ -582,7 +597,6 @@ namespace XQLite.AddIn
             }
             catch
             {
-                // 실패 시 out 매개변수는 이미 null
                 return false;
             }
         }

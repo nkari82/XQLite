@@ -1,4 +1,4 @@
-﻿// XqlExcelInterop.cs  — SmartCom<T> 적용 버전
+﻿// XqlExcelInterop.cs  — SmartCom<T> 적용 버전 (lastDataRow 계산 보강 + Commit 전/후 스키마 보장)
 using ExcelDna.Integration;
 using System;
 using System.Collections.Generic;
@@ -82,6 +82,9 @@ namespace XQLite.AddIn
                 using var ws = SmartCom<Excel.Worksheet>.Wrap(app.ActiveSheet as Excel.Worksheet);
                 if (ws?.Value == null) return;
 
+                // ✅ 0) 커밋 전에 항상 스키마부터(타입/이름 정규화 포함) 서버에 확정
+                await EnsureActiveSheetSchema().ConfigureAwait(false);
+
                 var sm = _sheet.GetOrCreateSheet(ws.Value.Name);
 
                 using var header = SmartCom<Excel.Range>.Wrap(XqlSheetView.GetHeaderOrFallback(ws.Value));
@@ -94,12 +97,14 @@ namespace XQLite.AddIn
 
                 int firstDataRow = header.Value.Row + 1;
 
-                using var used = SmartCom<Excel.Range>.Wrap(ws.Value.UsedRange);
-                // Address 터치로 안정화
-                try { _ = used?.Value?.Address[true, true, Excel.XlReferenceStyle.xlA1, false]; } catch { }
+                // ⚠ UsedRange만으로는 첫 입력 직후 갱신이 늦을 수 있어 보강 로직으로 최종 데이터 행을 산출한다.
+                int lastDataRow = GetLastDataRow(ws.Value, header.Value, firstDataRow, headers.Count);
 
-                int lastDataRow = (used?.Value?.Row ?? 1) + (used?.Value?.Rows.Count ?? 1) - 1;
-                if (lastDataRow < firstDataRow) return;
+                if (lastDataRow < firstDataRow)
+                {
+                    // 데이터가 전혀 없으면 커밋할 것이 없다.
+                    return;
+                }
 
                 // 분기: 기존행/신규행
                 var rowsForUpsertRows = new List<Dictionary<string, object?>>();
@@ -198,6 +203,9 @@ namespace XQLite.AddIn
 #pragma warning disable CS4014
                 _sync.PullSince(null);
 #pragma warning restore CS4014
+
+                // ✅ 5) 혹시라도 동시성으로 TEXT가 잠깐 만들어졌다면 여기서 한 번 더 스키마 보정
+                await EnsureActiveSheetSchema().ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -500,6 +508,67 @@ namespace XQLite.AddIn
         }
 
         // ======== 내부 유틸 ========
+
+        /// <summary>
+        /// UsedRange가 갱신되지 않아도 신뢰할 수 있게 마지막 데이터 행을 계산.
+        /// - 테이블(ListObject)이 있으면 DataBodyRange 기준
+        /// - 없으면 헤더 각 컬럼의 끝에서 위로(End[xlUp]) 스캔하여 최댓값
+        /// </summary>
+        private static int GetLastDataRow(Excel.Worksheet ws, Excel.Range header, int firstDataRow, int headerColCount)
+        {
+            if (ws == null || header == null) return firstDataRow - 1;
+
+            // 1) ListObject 우선
+            try
+            {
+                var lo = XqlSheet.FindListObjectContaining(ws, header);
+                var body = lo?.DataBodyRange;
+                if (body != null)
+                {
+                    int r = body.Row + body.Rows.Count - 1;
+                    return Math.Max(r, firstDataRow - 1);
+                }
+            }
+            catch { /* ignore */ }
+
+            // 2) 각 컬럼별로 End(xlUp) 스캔
+            int last = firstDataRow - 1;
+            for (int i = 0; i < Math.Max(1, headerColCount); i++)
+            {
+                try
+                {
+                    int absCol = header.Column + i;
+                    using var lastCell = SmartCom<Excel.Range>.Acquire(() => (Excel.Range)ws.Cells[ws.Rows.Count, absCol]);
+                    if (lastCell?.Value == null) continue;
+
+                    using var hit = SmartCom<Excel.Range>.Acquire(() => (Excel.Range)lastCell.Value.End[Excel.XlDirection.xlUp]);
+                    if (hit?.Value == null) continue;
+
+                    int candidate = hit.Value.Row;
+                    // 헤더행보다 위쪽이면 데이터가 없다는 뜻
+                    if (candidate < firstDataRow) continue;
+
+                    if (candidate > last) last = candidate;
+                }
+                catch { /* ignore per column */ }
+            }
+
+            // 3) 그래도 감지 못했으면 UsedRange 보조
+            if (last < firstDataRow)
+            {
+                try
+                {
+                    using var used = SmartCom<Excel.Range>.Wrap(ws.UsedRange);
+                    try { _ = used?.Value?.Address[true, true, Excel.XlReferenceStyle.xlA1, false]; } catch { }
+                    int usedLast = (used?.Value?.Row ?? 1) + (used?.Value?.Rows.Count ?? 1) - 1;
+                    last = Math.Max(last, usedLast);
+                }
+                catch { /* ignore */ }
+            }
+
+            return last;
+        }
+
         private static List<string> NormalizeHeaderNamesWithLetters(Excel.Range header, IList<string> names)
         {
             if (header == null) throw new ArgumentNullException(nameof(header));
@@ -521,8 +590,7 @@ namespace XQLite.AddIn
                         using var rep = SmartCom<Excel.Range>.Acquire(() => (Excel.Range)ma!.Value!.Cells[1, 1]);
                         if (rep?.Value != null)
                         {
-                            // rep로 교체
-                            cell.Detach(); // 원래 cell은 버리고
+                            cell.Detach();
                         }
                     }
                 }

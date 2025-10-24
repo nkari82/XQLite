@@ -122,10 +122,17 @@ namespace XQLite.AddIn
         }
 
         // 메타에 있으면 메타 기반, 없으면 폴백
+        // XqlSheetView.cs
         private static string ColumnTooltipFor(XqlSheet.Meta sm, string colName)
         {
             try
             {
+                if (string.Equals(colName, sm.KeyColumn, StringComparison.OrdinalIgnoreCase))
+                {
+                    // ✅ PK(id)는 항상 INTEGER • NOT NULL
+                    return "INTEGER • NOT NULL • PRIMARY KEY";
+                }
+
                 if (!string.IsNullOrWhiteSpace(colName) &&
                     sm.Columns != null &&
                     sm.Columns.TryGetValue(colName, out var ct) && ct != null)
@@ -138,6 +145,7 @@ namespace XQLite.AddIn
 
             return ColumnTooltipFallback();
         }
+
 
         private static string ColumnTooltipFallback() => "TEXT • NULL OK";
 
@@ -451,6 +459,7 @@ namespace XQLite.AddIn
                                             ? lo.ListColumns[i]?.DataBodyRange
                                             : ColBelowToEnd(ws, h.Value!));
 
+                // 헤더: id만 잠금, 그 외 Unlock
                 try { if (h.Value != null) h.Value.Locked = isIdCol; } catch { }
 
                 if (body.Value != null)
@@ -471,7 +480,8 @@ namespace XQLite.AddIn
                 }
             }
 
-            EnsureSheetProtectedUiOnly(ws);
+            // 보호 정책: 헤더/바디 모두 id만 잠금, 나머지는 자유
+            ApplyProtectionForHeaderAndIdOnly(ws, header, sm);
         }
 
         // ─────────────────────────────────────────────────────────────────
@@ -1127,38 +1137,61 @@ namespace XQLite.AddIn
 
         private static void ApplyValidationForKind(Excel.Range rng, XqlSheet.ColumnKind kind)
         {
-            using var vW = SmartCom<Validation>.Wrap(rng?.Validation);
+            if (rng == null) return;
+
+            // 다영역인 경우 Area별로 개별 적용
             try
             {
+                var areas = rng.Areas;
+                if (areas != null && areas.Count > 1)
+                {
+                    foreach (Excel.Range a in areas)
+                    {
+                        try { ApplyValidationForKind(a, kind); }
+                        finally { ReleaseCom(a); }
+                    }
+                    return;
+                }
+            }
+            catch { /* ignore */ }
+
+            using var wsW = SmartCom<Worksheet>.Wrap(rng.Worksheet);
+            var ws = wsW.Value;
+            bool needReprotect = false;
+            try
+            {
+                if (ws != null && ws.ProtectContents)
+                {
+                    needReprotect = true;
+                    ws.Unprotect(Type.Missing);
+                }
+            }
+            catch { /* ignore */ }
+
+            try
+            {
+                // 안전성 체크
                 try
                 {
-                    if (rng == null) return;
-                    if (rng.Areas != null && rng.Areas.Count > 1) return;
                     if ((long)rng.CountLarge == 0) return;
                 }
                 catch { /* ignore */ }
 
-                try { rng!.Validation?.Delete(); } catch { }
+                try { rng.Validation?.Delete(); } catch { }
+
+                using var vW = XqlCommon.SmartCom<Excel.Validation>.Wrap(rng.Validation);
+                if (vW.Value == null) return;
 
                 bool added = false;
-                string listSep = ",";
-
-                try
-                {
-                    var app = (Excel.Application)rng!.Application;
-                    var sepObj = app.International[Excel.XlApplicationInternational.xlListSeparator];
-                    if (sepObj is string s && !string.IsNullOrEmpty(s)) listSep = s;
-                }
-                catch { /* fallback , */ }
 
                 switch (kind)
                 {
                     case XqlSheet.ColumnKind.Int:
-                        vW.Value!.Add(
+                        vW.Value.Add(
                             Excel.XlDVType.xlValidateWholeNumber,
                             Excel.XlDVAlertStyle.xlValidAlertStop,
                             Excel.XlFormatConditionOperator.xlBetween,
-                            "-2147483648", "2147483647");
+                            (double)int.MinValue, (double)int.MaxValue);
                         vW.Value.IgnoreBlank = true;
                         vW.Value.ErrorTitle = "정수만 허용";
                         vW.Value.ErrorMessage = "이 열은 정수만 입력할 수 있습니다.";
@@ -1166,11 +1199,11 @@ namespace XQLite.AddIn
                         break;
 
                     case XqlSheet.ColumnKind.Real:
-                        vW.Value!.Add(
+                        vW.Value.Add(
                             Excel.XlDVType.xlValidateDecimal,
                             Excel.XlDVAlertStyle.xlValidAlertStop,
                             Excel.XlFormatConditionOperator.xlBetween,
-                            "=-1E+307", "=1E+307");
+                            -1e307, 1e307);
                         vW.Value.IgnoreBlank = true;
                         vW.Value.ErrorTitle = "실수만 허용";
                         vW.Value.ErrorMessage = "이 열은 실수/숫자만 입력할 수 있습니다.";
@@ -1178,7 +1211,15 @@ namespace XQLite.AddIn
                         break;
 
                     case XqlSheet.ColumnKind.Bool:
-                        vW.Value!.Add(
+                        string listSep = ",";
+                        try
+                        {
+                            var app = (Excel.Application)rng.Application;
+                            if (app.International[Excel.XlApplicationInternational.xlListSeparator] is string s && s.Length > 0)
+                                listSep = s;
+                        }
+                        catch { }
+                        vW.Value.Add(
                             Excel.XlDVType.xlValidateList,
                             Excel.XlDVAlertStyle.xlValidAlertStop,
                             Type.Missing, $"TRUE{listSep}FALSE", Type.Missing);
@@ -1189,9 +1230,9 @@ namespace XQLite.AddIn
                         break;
 
                     case XqlSheet.ColumnKind.Date:
-                        var dmin = new DateTime(1900, 1, 1);
-                        var dmax = new DateTime(9999, 12, 31);
-                        vW.Value!.Add(
+                        double dmin = new DateTime(1900, 1, 1).ToOADate();
+                        double dmax = new DateTime(9999, 12, 31).ToOADate();
+                        vW.Value.Add(
                             Excel.XlDVType.xlValidateDate,
                             Excel.XlDVAlertStyle.xlValidAlertStop,
                             Excel.XlFormatConditionOperator.xlBetween,
@@ -1209,11 +1250,25 @@ namespace XQLite.AddIn
 
                 if (added)
                 {
-                    try { vW.Value!.ShowError = true; } catch { }
-                    try { vW.Value!.ShowInput = false; } catch { }
+                    try { vW.Value.ShowError = true; } catch { }
+                    try { vW.Value.ShowInput = false; } catch { }
                 }
             }
-            catch { /* ignore */ }
+            finally
+            {
+                if (needReprotect && ws != null)
+                    try
+                    {
+                        // 보호 정책을 원복(헤더+ID만 잠금)
+                        using var headerW = SmartCom<Range>.Wrap(GetHeaderOrFallback(ws));
+                        var sm = XqlAddIn.Sheet?.GetOrCreateSheet(ws.Name);
+                        if (headerW.Value != null && sm != null)
+                            ApplyProtectionForHeaderAndIdOnly(ws, headerW.Value, sm);
+                        else
+                            EnsureSheetProtectedUiOnly(ws); // 폴백
+                    }
+                    catch { }
+            }
         }
 
         internal static Excel.Range? GetHeaderOrFallback(Excel.Worksheet ws)
@@ -1287,8 +1342,124 @@ namespace XQLite.AddIn
                     AllowFiltering: true,
                     AllowSorting: true
                 );
+                try { ws.EnableSelection = Excel.XlEnableSelection.xlUnlockedCells; } catch { }
             }
             catch { /* 무음 */ }
+        }
+
+        // ───────────────────────── 보호 정책: 헤더 + ID만 잠금, 나머지는 자유 ─────────────────────────
+        private static void ApplyProtectionForHeaderAndIdOnly(Excel.Worksheet ws, Excel.Range header, XqlSheet.Meta sm)
+        {
+            if (ws == null || header == null || sm == null) return;
+
+            try { ws.Unprotect(Type.Missing); } catch { }
+
+            // 1) 컬럼별로 잠금 결정: 헤더/바디 모두 id만 잠그고 나머지는 Unlock
+            int colCount = 0;
+            try { colCount = header.Columns.Count; } catch { colCount = 0; }
+            if (colCount <= 0) { EnsureSheetProtectedUiOnly(ws); return; }
+
+            int hdrCol0 = header.Column;
+            for (int i = 1; i <= colCount; i++)
+            {
+                using var h = SmartCom<Range>.Wrap((Excel.Range)header.Cells[1, i]);
+                string? name = null;
+                try { name = (h.Value?.Value2 as string)?.Trim(); } catch { }
+
+                bool isIdCol = !string.IsNullOrWhiteSpace(sm.KeyColumn) &&
+                               string.Equals(name, sm.KeyColumn, StringComparison.OrdinalIgnoreCase);
+
+                // 헤더도 id만 잠금
+                try { if (h.Value != null) h.Value.Locked = isIdCol; } catch { }
+
+                using var body = SmartCom<Range>.Wrap(ColBelowToEnd(ws, h.Value!));
+                if (body.Value == null) continue;
+
+                try
+                {
+                    if (isIdCol)
+                    {
+                        body.Value.Locked = true; // ID 전체 잠금
+                    }
+                    else
+                    {
+                        body.Value.Locked = false; // 나머지 자유
+                    }
+                }
+                catch { }
+            }
+
+            // 2) UI 전용 Protect + 선택은 Unlock 셀만
+            EnsureSheetProtectedUiOnly(ws);
+        }
+
+        // ───────────────────────── 미래 대비: 콜라보 락 반영 훅 ─────────────────────────
+        internal sealed class CollabLock
+        {
+            public string ResourceKey { get; set; } = ""; // "cell" 또는 "col" 키
+            public string Owner { get; set; } = "";       // 락 소유자(닉네임)
+        }
+
+        /// <summary>
+        /// 헤더/ID 기본 보호 위에 '다른 사용자'가 보유한 잠금만 추가 반영.
+        /// myOwner 가 지정되면 동일 소유자의 락은 무시.
+        /// </summary>
+        public static void ApplyCollabLocks(string sheetName, IEnumerable<CollabLock> locks, string? myOwner = null)
+        {
+            if (string.IsNullOrWhiteSpace(sheetName)) return;
+            var items = locks?.ToList() ?? new();
+
+            _ = XqlCommon.OnExcelThreadAsync(() =>
+            {
+                var app = (Excel.Application)ExcelDnaUtil.Application;
+                using var wsW = SmartCom<Excel.Worksheet>.Wrap(XqlSheet.FindWorksheet(app, sheetName));
+                if (wsW.Value == null) return (object?)null;
+
+                using var headerW = SmartCom<Excel.Range>.Wrap(GetHeaderOrFallback(wsW.Value));
+                var sm = XqlAddIn.Sheet?.GetOrCreateSheet(sheetName);
+                if (headerW.Value == null || sm == null) return (object?)null;
+
+                // 기본 보호(헤더+ID만 잠금) 재적용
+                ApplyProtectionForHeaderAndIdOnly(wsW.Value, headerW.Value, sm);
+
+                var foreignLocks = string.IsNullOrWhiteSpace(myOwner)
+                    ? items
+                    : items.Where(l => !string.Equals(l.Owner, myOwner, StringComparison.Ordinal)).ToList();
+
+                if (foreignLocks.Count == 0) return (object?)null;
+
+                try { wsW.Value.Unprotect(Type.Missing); } catch { }
+
+                foreach (var lk in foreignLocks)
+                {
+                    try
+                    {
+                        if (!XqlSheet.TryParse(lk.ResourceKey, out var desc)) continue;
+                        if (!XqlSheet.TryResolve(app, desc, out var target, out _, out _)) continue;
+                        using var tW = SmartCom<Excel.Range>.Wrap(target);
+
+                        if (tW.Value != null)
+                        {
+                            // 컬럼 락이면 바디 전체, 셀 락이면 해당 셀만
+                            if (string.Equals(desc.Kind, "col", StringComparison.OrdinalIgnoreCase))
+                            {
+                                using var first = SmartCom<Excel.Range>.Wrap((Excel.Range)tW.Value.Offset[1, 0]);
+                                using var last = SmartCom<Excel.Range>.Wrap((Excel.Range)wsW.Value.Cells[wsW.Value.Rows.Count, tW.Value.Column]);
+                                using var body = SmartCom<Excel.Range>.Wrap(wsW.Value.Range[first.Value, last.Value]);
+                                if (body.Value != null) body.Value.Locked = true;
+                            }
+                            else
+                            {
+                                tW.Value.Locked = true;
+                            }
+                        }
+                    }
+                    catch { /* ignore per lock */ }
+                }
+
+                EnsureSheetProtectedUiOnly(wsW.Value);
+                return (object?)null;
+            });
         }
     }
 }
