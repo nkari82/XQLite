@@ -1,4 +1,4 @@
-﻿// XqlSync.cs  (ExcelPatchApplier 포함 버전)
+﻿// XqlSync.cs  (ExcelPatchApplier 포함 버전, SmartCom 적용)
 using ExcelDna.Integration;
 using Newtonsoft.Json.Linq;
 using System;
@@ -10,6 +10,8 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Excel = Microsoft.Office.Interop.Excel;
+using static XQLite.AddIn.XqlCommon;
+using Microsoft.Office.Interop.Excel;
 
 namespace XQLite.AddIn
 {
@@ -99,10 +101,10 @@ namespace XQLite.AddIn
 
             try { _cts.Cancel(); } catch { }
 
-            _pushTimer.Change(Timeout.Infinite, Timeout.Infinite);
-            _pullTimer.Change(Timeout.Infinite, Timeout.Infinite);
+            try { _pushTimer.Change(Timeout.Infinite, Timeout.Infinite); } catch { }
+            try { _pullTimer.Change(Timeout.Infinite, Timeout.Infinite); } catch { }
 
-            _backend.StopSubscription();
+            try { _backend.StopSubscription(); } catch { }
         }
 
         public void Dispose()
@@ -112,6 +114,7 @@ namespace XQLite.AddIn
             try { Stop(); } catch { }
             try { _pushTimer.Dispose(); } catch { }
             try { _pullTimer.Dispose(); } catch { }
+            try { _cts.Dispose(); } catch { }
         }
 
         private static string Key(EditCell e) => $"{e.Table}\n{XqlCommon.ValueToString(e.RowKey)}\n{e.Column}";
@@ -148,29 +151,53 @@ namespace XQLite.AddIn
                 LastFullPullUtc = DateTime.MinValue
             };
 
-            // 워크북에서 K/V 읽기 (UI 스레드에서 안전하게)
-            Dictionary<string, string> loaded = new(StringComparer.Ordinal);
+            // 워크북에서 K/V 읽기 (UI 스레드에서 안전하게, SmartCom 사용)
+            Dictionary<string, string> loaded;
             try
             {
-                loaded = XqlCommon.OnExcelThreadAsync(() =>
+                loaded = OnExcelThreadAsync(() =>
                 {
-                    var app = (Excel.Application)ExcelDnaUtil.Application;
-                    Excel.Workbook? wb = null;
+                    using var appW = SmartCom<Excel.Application>.Wrap((Excel.Application)ExcelDnaUtil.Application);
+                    if (appW.Value == null) return new Dictionary<string, string>(StringComparer.Ordinal);
+
+                    using var booksW = SmartCom<Workbooks>.Wrap(appW.Value.Workbooks);
+                    Excel.Workbook? wbHit = null;
+
                     try
                     {
-                        foreach (Excel.Workbook w in app.Workbooks)
+                        int count = booksW.Value?.Count ?? 0;
+                        for (int i = 1; i <= count; i++)
                         {
+                            Excel.Workbook? cur = null;
                             try
                             {
-                                if (string.Equals(w.FullName, workbookFullName, StringComparison.OrdinalIgnoreCase))
-                                { wb = w; break; }
+                                cur = booksW.Value![i];
+                                if (string.Equals(cur.FullName, workbookFullName, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    wbHit = cur;  // 소유권 유지(반환 전까지 유지)
+                                    cur = null;   // 현 지역 참조는 방출
+                                    break;
+                                }
                             }
-                            finally { if (!ReferenceEquals(wb, w)) XqlCommon.ReleaseCom(w); }
+                            finally
+                            {
+                                // cur가 hit가 아니면 SmartCom이 아니므로 명시 해제 불가 → GC에 맡김
+                                // (여기서는 곧바로 루프 종료/반환하므로 추가 참조 없음)
+                            }
                         }
-                        wb ??= app.ActiveWorkbook;
-                        return wb != null ? XqlSheet.StateReadAll(wb) : new Dictionary<string, string>(StringComparer.Ordinal);
+
+                        if (wbHit == null)
+                            wbHit = appW.Value.ActiveWorkbook;
+
+                        return wbHit != null
+                            ? XqlSheet.StateReadAll(wbHit)
+                            : new Dictionary<string, string>(StringComparer.Ordinal);
                     }
-                    finally { XqlCommon.ReleaseCom(wb); }
+                    finally
+                    {
+                        // wbHit는 XqlSheet.StateReadAll 내부에서 필요한 범위만 접근 후 RCW 유지 필요 없음.
+                        // 별도 Release 없이 범위를 벗어나면 RCW는 GC로 회수됨(현 스코프에서 추가 참조 없음).
+                    }
                 }).GetAwaiter().GetResult();
             }
             catch
@@ -200,13 +227,15 @@ namespace XQLite.AddIn
                     {
                         var meta = await _backend.TryFetchServerMeta().ConfigureAwait(false);
                         var hash = meta?["schema_hash"]?.ToString();
-                        if (!string.IsNullOrWhiteSpace(hash) && !string.Equals(hash, _state.LastSchemaHash, StringComparison.Ordinal))
+                        if (!string.IsNullOrWhiteSpace(hash) &&
+                            !string.Equals(hash, _state.LastSchemaHash, StringComparison.Ordinal))
                             _forceFullPull = true;
+
                         _state.LastSchemaHash = hash;
                         _state.LastMetaUtc = DateTime.UtcNow;
                         PersistState();
                     }
-                    catch { }
+                    catch { /* ignore */ }
                 });
             }
         }
@@ -363,7 +392,7 @@ namespace XQLite.AddIn
 
             if (schema.Count == 0) return;
 
-            // 2) UI 스레드에서만 Excel 만지기
+            // 2) UI 스레드에서만 Excel 만지기 (내부에서 마샬링하므로 직접 RCW 접근 없음)
             XqlSheetView.ApplyPlanAndPatches(schema, pr?.Patches);
         }
 
@@ -421,31 +450,49 @@ namespace XQLite.AddIn
                     ["last_meta_utc"] = (_state.LastMetaUtc == DateTime.MinValue ? "" : _state.LastMetaUtc.ToString("o")),
                 };
 
-                // UI 스레드에서만 상태 기록
+                // UI 스레드에서만 상태 기록 (SmartCom 사용)
                 _ = XqlCommon.OnExcelThreadAsync(() =>
                 {
-                    var app = (Excel.Application)ExcelDnaUtil.Application;
-                    Excel.Workbook? wb = null;
+                    using var appW = SmartCom<Excel.Application>.Wrap((Excel.Application)ExcelDnaUtil.Application);
+                    if (appW.Value == null) return 0;
+
+                    using var booksW = SmartCom<Workbooks>.Wrap(appW.Value.Workbooks);
+                    Excel.Workbook? wbHit = null;
+
                     try
                     {
-                        foreach (Excel.Workbook w in app.Workbooks)
+                        int count = booksW.Value?.Count ?? 0;
+                        for (int i = 1; i <= count; i++)
                         {
+                            Excel.Workbook? cur = null;
                             try
                             {
-                                if (string.Equals(w.FullName, _workbookFullName, StringComparison.OrdinalIgnoreCase))
-                                { wb = w; break; }
+                                cur = booksW.Value![i];
+                                if (string.Equals(cur.FullName, _workbookFullName, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    wbHit = cur;
+                                    cur = null;
+                                    break;
+                                }
                             }
-                            finally { if (!ReferenceEquals(wb, w)) XqlCommon.ReleaseCom(w); }
+                            finally
+                            {
+                                // cur 로컬 참조는 여기서만 사용되었고 루프 계속 → 추가 처리 불필요
+                            }
                         }
-                        wb ??= app.ActiveWorkbook;
-                        if (wb != null)
-                            XqlSheet.StateSetMany(wb, kv);
+
+                        wbHit ??= appW.Value.ActiveWorkbook;
+                        if (wbHit != null)
+                            XqlSheet.StateSetMany(wbHit, kv);
                     }
-                    finally { XqlCommon.ReleaseCom(wb); }
+                    finally
+                    {
+                        // wbHit 참조는 StateSetMany 내에서만 사용되며, 이 스코프에서 더 이상 보유하지 않음
+                    }
                     return 0;
                 });
             }
-            catch { }
+            catch { /* ignore */ }
         }
 
         private void SafeFlushUpserts()

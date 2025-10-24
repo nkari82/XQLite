@@ -60,9 +60,9 @@ namespace XQLite.AddIn
             btnLockCol.Click += async (_, __) => await LockCurrentColumn();
             btnLockCell.Click += async (_, __) => await LockCurrentCell();
             btnUnlockAll.Click += async (_, __) => await UnlockMine();
-            btnJump.Click += (_, __) => JumpToSelected();
+            btnJump.Click += async (_, __) => await JumpToSelected();
 
-            lv.ItemActivate += (_, __) => JumpToSelected();
+            lv.ItemActivate += async (_, __) => await JumpToSelected();
 
             Load += (_, __) => RefreshList();
         }
@@ -122,7 +122,7 @@ namespace XQLite.AddIn
             catch (Exception ex) { Warn("Release error: " + ex.Message); }
         }
 
-        private void JumpToSelected()
+        private async Task JumpToSelected()
         {
             try
             {
@@ -130,7 +130,7 @@ namespace XQLite.AddIn
                 var key = lv.SelectedItems[0].SubItems[0].Text;
                 if (string.IsNullOrWhiteSpace(key)) return;
 
-                if (XqlCollab.TryJumpTo(key))
+                if (await XqlCollab.TryJumpToAsync(key))
                 {
                     Info("Jumped.");
                 }

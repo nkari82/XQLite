@@ -1,16 +1,13 @@
 ﻿using ExcelDna.Integration;
 using ExcelDna.Integration.CustomUI;
-using Microsoft.Office.Interop.Excel;
 using System;
-using System.Collections.Concurrent;
 using System.Linq;
-using System.Reflection;
 using System.Threading; // Interlocked / Volatile
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using static XQLite.AddIn.IXqlBackend;
-using Action = System.Action;
 using Excel = Microsoft.Office.Interop.Excel;
+using static XQLite.AddIn.XqlCommon;
 
 namespace XQLite.AddIn
 {
@@ -156,11 +153,11 @@ namespace XQLite.AddIn
             // ⬇️ Pull 진행 상태 변경 시 버튼 갱신
             try
             {
-                XqlAddIn.Sync?.PullStateChanged += pulling =>
-                ExcelAsyncUtil.QueueAsMacro(() =>
-                {
-                    try { _ribbon?.InvalidateControl("btnPull"); } catch { }
-                });
+                XqlAddIn.Sync?.PullStateChanged += _ =>
+                    ExcelAsyncUtil.QueueAsMacro(() =>
+                    {
+                        try { _ribbon?.InvalidateControl("btnPull"); } catch { }
+                    });
             }
             catch { /* ignore */ }
 
@@ -258,68 +255,58 @@ namespace XQLite.AddIn
                 var sheet = XqlAddIn.Sheet;
                 if (be == null || sheet == null) { SetBlock(false); return; }
 
-                // 1) UI 스냅샷: Excel/COM 접근은 전부 여기에서만
+                // 1) UI 스냅샷: Excel/COM 접근은 전부 여기에서만 (RCW 절대 보존/캐싱 금지)
                 var snap = await XqlCommon.OnExcelThreadAsync(() =>
                 {
                     var app = ExcelDnaUtil.Application as Excel.Application;
                     if (app == null) return new CommitSnapshot();
 
-                    Excel.Worksheet? ws = null;
-                    Excel.Workbook? wb = null;
-                    Excel.Range? stateUsed = null;
-                    Excel.Range? header = null;
+                    using var ws = SmartCom<Excel.Worksheet>.Wrap(app.ActiveSheet);
+                    if (ws?.Value == null) return new CommitSnapshot();
+
+                    using var wb = SmartCom<Excel.Workbook>.Wrap(ws.Value.Parent);
+                    if (wb?.Value == null) return new CommitSnapshot();
+
+                    // 로컬 상태( .xql_state ) 존재 여부 — UsedRange는 즉시 사용 즉시 해제
+                    bool hasLocal = false;
                     try
                     {
-                        ws = app.ActiveSheet as Excel.Worksheet;
-                        if (ws == null) return new CommitSnapshot();
-
-                        wb = ws.Parent as Excel.Workbook;
-                        if (wb == null) return new CommitSnapshot();
-
-                        // 로컬 상태( .xql_state 시트 ) 존재 여부
-                        bool hasLocal = false;
-                        try
+                        using var st = SmartCom<Excel.Worksheet>.Wrap(XqlSheet.EnsureStateSheet(wb.Value));
+                        using var ur = SmartCom<Excel.Range>.Wrap(st?.Value?.UsedRange);
+                        if (ur?.Value != null)
                         {
-                            var st = XqlSheet.EnsureStateSheet(wb);
-                            var ur = st.UsedRange; stateUsed = ur;
-                            int rows = ur.Row + ur.Rows.Count - 1;
+                            int rows = ur.Value.Row + ur.Value.Rows.Count - 1;
                             hasLocal = rows > 1;
-                            XqlCommon.ReleaseCom(st);
                         }
-                        catch { hasLocal = false; }
-
-                        // 헤더/사용 가능 헤더 판단
-                        bool hasUsableHeader = false;
-                        try
-                        {
-                            if (!XqlSheet.TryGetHeaderMarker(ws, out header))
-                                header = XqlSheet.GetHeaderRange(ws);
-
-                            if (header != null)
-                            {
-                                var names = XqlSheet.ComputeHeaderNames(header);
-                                bool allFallback = XqlSheet.IsFallbackLetterHeader(header);
-                                hasUsableHeader = !allFallback && names.Any(n => !string.IsNullOrWhiteSpace(n));
-                            }
-                        }
-                        catch { hasUsableHeader = false; }
-
-                        // 테이블명 추출(메타)
-                        var sm = XqlAddIn.Sheet!.GetOrCreateSheet(ws.Name);
-                        var table = string.IsNullOrWhiteSpace(sm.TableName) ? ws.Name : sm.TableName!;
-
-                        return new CommitSnapshot
-                        {
-                            WorkbookPresent = wb != null,
-                            TableName = table,
-                            HasLocal = hasLocal,
-                            HasUsableHeader = hasUsableHeader
-                        };
                     }
-                    finally
+                    catch { hasLocal = false; }
+
+                    // 헤더/사용 가능 헤더 판단 — Header Range도 즉시 해제
+                    bool hasUsableHeader = false;
+                    try
                     {
-                        XqlCommon.ReleaseCom(header, stateUsed, wb, ws);
+                        using var header = SmartCom<Excel.Range>.Wrap(
+                            XqlSheet.TryGetHeaderMarker(ws.Value, out var mk) ? mk : XqlSheet.GetHeaderRange(ws.Value));
+                        if (header?.Value != null)
+                        {
+                            var names = XqlSheet.ComputeHeaderNames(header.Value);
+                            bool allFallback = XqlSheet.IsFallbackLetterHeader(header.Value);
+                            hasUsableHeader = !allFallback && names.Any(n => !string.IsNullOrWhiteSpace(n));
+                        }
                     }
+                    catch { hasUsableHeader = false; }
+
+                    // 테이블명 추출(메타) — 문자열만 복사
+                    var sm = XqlAddIn.Sheet!.GetOrCreateSheet(ws.Value.Name);
+                    var table = string.IsNullOrWhiteSpace(sm.TableName) ? ws.Value.Name : sm.TableName!;
+
+                    return new CommitSnapshot
+                    {
+                        WorkbookPresent = true,
+                        TableName = table,
+                        HasLocal = hasLocal,
+                        HasUsableHeader = hasUsableHeader
+                    };
                 });
 
                 if (!snap.WorkbookPresent) { SetBlock(false); return; }
@@ -410,7 +397,7 @@ namespace XQLite.AddIn
                     ConnState.Degraded => "PersonaStatusBusy",
                     _ => "PersonaStatusOffline"
                 } ?? "PersonaStatusOffline";
-                return MsoImageHelper.Get(idMso, 32);
+                return XqlCommon.MsoImageHelper.Get(idMso, 32);
             }
             catch { return null; }
         }
@@ -505,7 +492,7 @@ namespace XQLite.AddIn
         // 컬럼 타입 변경 (메타 반영 + 툴팁/검증 갱신)
         public void OnSetType(IRibbonControl c)
         {
-            // CHANGED: 콜백이 비메인 스레드에서 호출되어도 안전하도록 UI 마샬링
+            // 콜백이 비메인 스레드에서 호출되어도 안전하도록 UI 마샬링
             _ = XqlCommon.OnExcelThreadAsync(() =>
             {
                 try
@@ -524,45 +511,41 @@ namespace XQLite.AddIn
                     };
 
                     var app = (Excel.Application)ExcelDnaUtil.Application;
-                    if (app.ActiveSheet is not Excel.Worksheet ws) return 0;
+                    using var ws = SmartCom<Excel.Worksheet>.Wrap(app.ActiveSheet as Excel.Worksheet);
+                    if (ws?.Value == null) return 0;
 
                     var sheet = XqlAddIn.Sheet;
                     if (sheet == null) { MessageBox.Show("MetaRegistry not ready.", "XQLite"); return 0; }
 
-                    Excel.Range? sel = app.Selection as Excel.Range;
-                    var header = XqlSheetView.ResolveHeader(ws, sel, sheet);
-                    if (header == null) { MessageBox.Show("헤더를 선택하거나 표 헤더에서 실행하세요.", "XQLite"); return 0; }
+                    using var sel = SmartCom<Excel.Range>.Wrap(app.Selection as Excel.Range);
+                    using var header = SmartCom<Excel.Range>.Wrap(XqlSheetView.ResolveHeader(ws.Value, sel?.Value, sheet));
+                    if (header?.Value == null) { MessageBox.Show("헤더를 선택하거나 표 헤더에서 실행하세요.", "XQLite"); return 0; }
 
-                    // 선택 헤더 셀 → 컬럼명
-                    var hit = sel != null ? ws.Application.Intersect(header, sel) : null;
-                    Excel.Range? cell = (Excel.Range)((hit != null && hit.Cells.Count >= 1) ? hit.Cells[1, 1] : header.Cells[1, 1]);
+                    using var hit = SmartCom<Excel.Range>.Wrap(sel?.Value != null ? SafeIntersect(ws.Value.Application, header.Value, sel.Value) : null);
+                    using var cell = SmartCom<Excel.Range>.Acquire(() =>
+                        (Excel.Range)((hit?.Value != null && hit.Value.Cells.Count >= 1) ? hit.Value.Cells[1, 1] : header.Value.Cells[1, 1]));
 
-                    try
+                    if (cell?.Value == null) return 0;
+
+                    var colName = (cell.Value.Value2 as string)?.Trim();
+                    if (string.IsNullOrEmpty(colName))
+                        colName = XqlCommon.ColumnIndexToLetter(cell.Value.Column); // 폴백
+
+                    if (string.IsNullOrEmpty(colName))
                     {
-                        var colName = (cell.Value2 as string)?.Trim();
-                        if (string.IsNullOrEmpty(colName))
-                            colName = XqlCommon.ColumnIndexToLetter(cell.Column); // 폴백
-
-                        if (string.IsNullOrEmpty(colName))
-                        {
-                            MessageBox.Show("컬럼명을 찾을 수 없습니다.", "XQLite");
-                            return 0;
-                        }
-
-                        var sm = sheet.GetOrCreateSheet(ws.Name);
-                        var ct = sm.Columns.TryGetValue(colName!, out var cur) ? cur : new XqlSheet.ColumnType();
-                        ct.Kind = kind;
-                        sm.SetColumn(colName!, ct);
-
-                        // 툴팁/검증 갱신
-                        var tips = XqlSheetView.BuildHeaderTooltips(sm, header);
-                        XqlSheetView.SetHeaderTooltips(header, tips);
-                        XqlSheetView.ApplyDataValidationForHeader(ws, header, sm);
+                        MessageBox.Show("컬럼명을 찾을 수 없습니다.", "XQLite");
+                        return 0;
                     }
-                    finally
-                    {
-                        XqlCommon.ReleaseCom(cell, hit);
-                    }
+
+                    var sm = sheet.GetOrCreateSheet(ws.Value.Name);
+                    var ct = sm.Columns.TryGetValue(colName!, out var cur) ? cur : new XqlSheet.ColumnType();
+                    ct.Kind = kind;
+                    sm.SetColumn(colName!, ct);
+
+                    // 툴팁/검증 갱신
+                    var tips = XqlSheetView.BuildHeaderTooltips(sm, header.Value);
+                    XqlSheetView.SetHeaderTooltips(header.Value, tips);
+                    XqlSheetView.ApplyDataValidationForHeader(ws.Value, header.Value, sm);
                 }
                 catch (Exception ex)
                 {
@@ -572,50 +555,10 @@ namespace XQLite.AddIn
             });
         }
 
-        // ───────────────────────── Mso Image Helper ─────────────────────────
-        internal static class MsoImageHelper
+        // ─────────────── helpers ───────────────
+        private static Excel.Range? SafeIntersect(Excel.Application app, Excel.Range a, Excel.Range b)
         {
-            private static readonly ConcurrentDictionary<string, stdole.IPictureDisp> _cache =
-                new(StringComparer.OrdinalIgnoreCase);
-
-            /// <summary>Office 버전/PIA 차이를 피하기 위해 리플렉션으로 GetImageMso 호출.</summary>
-            public static stdole.IPictureDisp? Get(string idMso, int size = 32)
-            {
-                if (string.IsNullOrWhiteSpace(idMso)) return null;
-
-                if (_cache.TryGetValue(idMso, out var pic))
-                    return pic;
-
-                try
-                {
-                    object app = ExcelDnaUtil.Application;                // Excel.Application (COM)
-                    var appType = app.GetType();
-
-                    // Application.CommandBars
-                    object commandBars = appType.InvokeMember(
-                        "CommandBars",
-                        BindingFlags.GetProperty,
-                        binder: null, target: app, args: null);
-
-                    // CommandBars.GetImageMso(string idMso, int width, int height) : IPictureDisp
-                    object? ret = commandBars.GetType().InvokeMember(
-                        "GetImageMso",
-                        BindingFlags.InvokeMethod,
-                        binder: null, target: commandBars,
-                        args: new object[] { idMso, size, size });
-
-                    pic = ret as stdole.IPictureDisp;
-                    if (pic != null)
-                        _cache[idMso] = pic;
-
-                    return pic;
-                }
-                catch
-                {
-                    // 실패 시 null 반환 → UI는 기본 아이콘/텍스트로 진행
-                    return null;
-                }
-            }
+            try { return app.Intersect(a, b) as Excel.Range; } catch { return null; }
         }
     }
 }

@@ -166,30 +166,52 @@ namespace XQLite.AddIn
                                         if (res2?.Assigned != null && res2.Assigned.Count > 0)
                                         {
                                             var app = (Excel.Application)ExcelDnaUtil.Application;
-                                            var ws = (Excel.Worksheet)app.Worksheets[t.WorksheetName];
+                                            Excel.Worksheet? ws = null;
 
-                                            foreach (var a in res2.Assigned)
+                                            try
                                             {
-                                                if (a == null) continue;
+                                                try { ws = app.Worksheets[t.WorksheetName] as Excel.Worksheet; }
+                                                catch (Exception ex) { XqlLog.Warn($"Recover: worksheet access failed: {ex.Message}"); ws = null; }
 
-                                                // 신형: table/temp_row_key/new_id
-                                                var tempKey = GetProp(a, "temp_row_key");
-                                                var newId = GetProp(a, "new_id");
-
-                                                // 구형 폴백: client_row/row_key (client_row는 없음이므로 생략)
-                                                if (string.IsNullOrWhiteSpace(tempKey))
-                                                    tempKey = GetProp(a, "client_temp") ?? GetProp(a, "client_row") ?? "";
-                                                if (string.IsNullOrWhiteSpace(newId))
-                                                    newId = GetProp(a, "row_key");
-
-                                                if (string.IsNullOrWhiteSpace(tempKey) || string.IsNullOrWhiteSpace(newId)) continue;
-
-                                                if (tempKeyToExcelRow.TryGetValue(tempKey!, out var excelRow))
+                                                if (ws != null)
                                                 {
-                                                    var keyCell = (Excel.Range)ws.Cells[excelRow, t.BodyLeft + keyColIdx1 - 1];
-                                                    try { keyCell.Value2 = newId; }
-                                                    finally { XqlCommon.ReleaseCom(keyCell); }
+                                                    foreach (var a in res2.Assigned)
+                                                    {
+                                                        if (a == null) continue;
+
+                                                        // 신형: table/temp_row_key/new_id
+                                                        var tempKey = GetProp(a, "temp_row_key");
+                                                        var newId = GetProp(a, "new_id");
+
+                                                        // 구형 폴백: client_row/row_key (client_row는 없음이므로 생략)
+                                                        if (string.IsNullOrWhiteSpace(tempKey))
+                                                            tempKey = GetProp(a, "client_temp") ?? GetProp(a, "client_row") ?? "";
+                                                        if (string.IsNullOrWhiteSpace(newId))
+                                                            newId = GetProp(a, "row_key");
+
+                                                        if (string.IsNullOrWhiteSpace(tempKey) || string.IsNullOrWhiteSpace(newId)) continue;
+
+                                                        if (tempKeyToExcelRow.TryGetValue(tempKey!, out var excelRow))
+                                                        {
+                                                            Excel.Range? keyCell = null;
+                                                            try
+                                                            {
+                                                                keyCell = (Excel.Range)ws.Cells[excelRow, t.BodyLeft + keyColIdx1 - 1];
+                                                                keyCell.Value2 = newId;
+                                                            }
+                                                            catch (Exception ex)
+                                                            {
+                                                                XqlLog.Warn($"Recover assigned id write failed for tempKey={tempKey}: {ex.Message}");
+                                                            }
+                                                            finally { XqlCommon.ReleaseCom(keyCell); }
+                                                        }
+                                                    }
                                                 }
+                                            }
+                                            finally
+                                            {
+                                                XqlCommon.ReleaseCom(ws);
+                                                // ExcelDnaUtil.Application은 전역 어플리케이션 객체이므로 보통 Release하지 않습니다.
                                             }
                                         }
                                     }

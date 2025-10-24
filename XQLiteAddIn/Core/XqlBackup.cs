@@ -1,4 +1,4 @@
-﻿// XqlBackup.cs
+﻿// XqlBackup.cs — SmartCom<T> 적용
 using ExcelDna.Integration;
 using Newtonsoft.Json;
 using System;
@@ -8,6 +8,7 @@ using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 using Excel = Microsoft.Office.Interop.Excel;
+using static XQLite.AddIn.XqlCommon;
 
 namespace XQLite.AddIn
 {
@@ -25,7 +26,7 @@ namespace XQLite.AddIn
         public XqlBackup(IXqlBackend backend, XqlSheet sheet)
         {
             _sheet = sheet ?? throw new ArgumentNullException(nameof(sheet));
-            _backend = backend;
+            _backend = backend ?? throw new ArgumentNullException(nameof(backend));
         }
 
         public void Dispose() { /* backend is owned by AddIn */ }
@@ -40,7 +41,7 @@ namespace XQLite.AddIn
         {
             try
             {
-                var tmp = XqlCommon.CreateTempDir("xql_diag_");
+                var tmp = CreateTempDir("xql_diag_");
                 try
                 {
                     // meta.json
@@ -66,7 +67,7 @@ namespace XQLite.AddIn
                             File.WriteAllText(Path.Combine(serverDir, "meta.json"), metaText, new UTF8Encoding(false));
                         }
 
-                        // 2) 감사 로그 (전체 스냅샷)
+                        // 2) 감사 로그 (전체)
                         var audit = await _backend.TryFetchAuditLog(null).ConfigureAwait(false);
                         if (audit != null)
                         {
@@ -74,19 +75,18 @@ namespace XQLite.AddIn
                             File.WriteAllText(Path.Combine(serverDir, "audit_log.json"), auditText, new UTF8Encoding(false));
                         }
                     }
-                    catch { /* 서버가 미구현이어도 무시 */ }
+                    catch { /* 서버 미구현/일시 오류 무시 */ }
 
                     // zip
-                    XqlCommon.SafeZipDirectory(tmp, outZipPath);
+                    SafeZipDirectory(tmp, outZipPath);
                 }
                 finally
                 {
-                    XqlCommon.TryDeleteDir(tmp);
+                    TryDeleteDir(tmp);
                 }
             }
             catch (Exception ex)
             {
-                // 실패는 무음 처리(Excel 안정성 우선), 로그 시트에만 남김
                 XqlLog.Warn("ExportDiagnostics failed: " + ex.Message);
             }
         }
@@ -94,7 +94,7 @@ namespace XQLite.AddIn
         // ============================================================
         // 2) Recover
         //   - 원칙: Excel 파일 = 동기화된 DB 원본
-        //   - 절차: 스키마 생성/보강 → 배치 업서트 → 무결성 검사(서버 쪽) → 완료
+        //   - 절차: 스키마 생성/보강 → 배치 업서트 → (신규) id 배정 반영 → 요약
         // ============================================================
         public async Task RecoverFromExcel(int batchSize = 500)
         {
@@ -108,29 +108,66 @@ namespace XQLite.AddIn
                 foreach (var sheetName in GetWorkbookSheets(app))
                 {
                     if (!_sheet.TryGetSheet(sheetName, out var sm)) continue;
-                    await EnsureTableSchema(sm).ConfigureAwait(false);
 
-                    var rows = ReadSheetRows(app, sheetName, sm);
-                    if (rows.Count == 0) continue;
-                    var table = sm.TableName ?? sheetName; // 요약/충돌 기록에 사용
+                    await EnsureTableSchema(sheetName, sm).ConfigureAwait(false);
 
-                    foreach (var chunk in XqlCommon.Chunk(RowsToCellEdits(table, sm, rows), batchSize))
+                    // 표/헤더 스냅샷 + 행 로딩 (Excel 스레드 접근은 내부에서만)
+                    var snap = ReadSheetSnapshot(app, sheetName, sm);
+                    if (snap.Rows.Count == 0) continue;
+
+                    var table = string.IsNullOrWhiteSpace(sm.TableName) ? sheetName : sm.TableName!;
+
+                    foreach (var chunkRows in XqlCommon.Chunk(snap.Rows, batchSize))
                     {
-                        var res = await _backend.UpsertCells(chunk).ConfigureAwait(false);
-                        // 충돌이 있으면 Conflict 워크시트에 적재
-                        if (res?.Conflicts != null && res.Conflicts.Count > 0)
+                        // 행들을 Cell 단위 편평화(서버 upsertCells 사용)
+                        var (edits, tempMap) = RowsToCellEdits(table, sm, chunkRows);
+
+                        var res = await _backend.UpsertCells(edits).ConfigureAwait(false);
+
+                        // 충돌 로그 적재
+                        if (res?.Conflicts is { Count: > 0 })
                             XqlSheetView.AppendConflicts(res.Conflicts.Cast<object>());
-                        // 요약 집계(행/셀 기준은 운영 목적에 맞춰 조정 가능. 여기선 '셀 건수'로 반영)
-                        var conflicts = res?.Conflicts?.Count ?? 0;
-                        var errors = res?.Errors?.Count ?? 0;
-                        var affected = chunk.Count; // 업서트한 셀 개수
+
+                        // 신규 id 배정 반영
+                        if (res?.Assigned is { Count: > 0 })
+                        {
+                            try
+                            {
+                                await OnExcelThreadAsync(() =>
+                                {
+                                    using var ws = SmartCom<Excel.Worksheet>.Wrap(XqlSheet.FindWorksheet(app, sheetName));
+                                    if (ws?.Value == null) return 0;
+
+                                    foreach (var a in res.Assigned)
+                                    {
+                                        if (!string.Equals(a.Table, table, StringComparison.Ordinal)) continue;
+                                        if (string.IsNullOrEmpty(a.NewId) || string.IsNullOrEmpty(a.TempRowKey)) continue;
+                                        if (!tempMap.TryGetValue(a.TempRowKey!, out var excelRow)) continue;
+
+                                        var keyAbsCol = snap.HeaderColumn + snap.KeyIndex1 - 1;
+                                        using var keyCell = SmartCom<Excel.Range>.Acquire(() => (Excel.Range)ws.Value.Cells[excelRow, keyAbsCol]);
+                                        if (keyCell?.Value != null) keyCell.Value.Value2 = a.NewId;
+                                    }
+                                    return 0;
+                                });
+                            }
+                            catch { /* 시트가 닫혔거나 사용자가 이동한 경우 무시 */ }
+                        }
+
+                        // 요약
+                        int conflicts = res?.Conflicts?.Count ?? 0;
+                        int errors = res?.Errors?.Count ?? 0;
+                        int affected = edits.Count; // 업서트한 '셀' 개수
                         XqlSheetView.RecoverSummaryPush(table, affected, conflicts, errors);
                     }
                 }
 
                 XqlSheetView.RecoverSummaryShow();
             }
-            catch { /* 무음 실패 (UI는 Inspector/Diag로 확인) */ }
+            catch
+            {
+                // 무음(사용자는 Inspector/Diag로 확인 가능)
+            }
         }
 
         // ============================================================
@@ -141,11 +178,11 @@ namespace XQLite.AddIn
         {
             try
             {
-                var tmp = XqlCommon.CreateTempDir("xql_export_");
+                var tmp = CreateTempDir("xql_export_");
                 try
                 {
                     // 1) 서버가 풀 덤프를 지원하면 그 결과를 그대로 보관
-                    var dbBytes = await _backend.TryExportDatabase();
+                    var dbBytes = await _backend.TryExportDatabase().ConfigureAwait(false);
                     if (dbBytes != null)
                     {
                         var dbPath = Path.Combine(tmp, "database.sqlite");
@@ -159,11 +196,11 @@ namespace XQLite.AddIn
                     Directory.CreateDirectory(sheetsDir);
                     ExportAllSheetsCsv(sheetsDir);
 
-                    XqlCommon.SafeZipDirectory(tmp, outZipPath);
+                    SafeZipDirectory(tmp, outZipPath);
                 }
                 finally
                 {
-                    XqlCommon.TryDeleteDir(tmp);
+                    TryDeleteDir(tmp);
                 }
             }
             catch (Exception ex)
@@ -175,123 +212,188 @@ namespace XQLite.AddIn
         // ============================================================
         // 내부: 스키마/행/셀 변환 유틸
         // ============================================================
-        private async Task EnsureTableSchema(XqlSheet.Meta sm)
+        private static string MapKind(XqlSheet.ColumnKind k) => k switch
         {
-            await _backend.TryCreateTable(sm.TableName, sm.KeyColumn);
+            XqlSheet.ColumnKind.Int => "integer",
+            XqlSheet.ColumnKind.Real => "real",
+            XqlSheet.ColumnKind.Bool => "bool",
+            XqlSheet.ColumnKind.Date => "integer", // epoch ms
+            XqlSheet.ColumnKind.Json => "json",
+            _ => "text"
+        };
+
+        private async Task EnsureTableSchema(string sheetName, XqlSheet.Meta sm)
+        {
+            // 테이블명/키 기본값 보강
+            var table = string.IsNullOrWhiteSpace(sm.TableName) ? sheetName : sm.TableName!;
+            var key = string.IsNullOrWhiteSpace(sm.KeyColumn) ? "id" : sm.KeyColumn!;
+            sm.TableName = table;
+            sm.KeyColumn = key;
+
+            await _backend.TryCreateTable(table, key).ConfigureAwait(false);
+
+            // 현재 메타 기준 컬럼 정의(없으면 TEXT NULL)
             var defs = sm.Columns.Select(kv => new ColumnDef
             {
                 Name = kv.Key,
-                Kind = kv.Value.Kind.ToString().ToLowerInvariant(),
+                Kind = MapKind(kv.Value.Kind),
                 NotNull = !kv.Value.Nullable,
                 Check = null
             }).ToList();
-            await _backend.TryAddColumns(sm.TableName, defs);
+
+            // 빈 정의일 수 있어도 호출은 안전(서버에서 무시)
+            await _backend.TryAddColumns(table, defs).ConfigureAwait(false);
         }
 
-        private static List<Dictionary<string, object?>> ReadSheetRows(Excel.Application app, string sheetName, XqlSheet.Meta sm)
+        // 스냅샷 DTO(헤더 좌표/키 인덱스 포함)
+        private sealed class SheetSnapshot
         {
-            var list = new List<Dictionary<string, object?>>();
-            Excel.Worksheet? ws = null; Excel.Range? used = null; Excel.Range? header = null; Excel.ListObject? lo = null;
-            try
-            {
-                ws = app.Worksheets.Cast<Excel.Worksheet>()
-                    .FirstOrDefault(s => string.Equals(s.Name, sheetName, StringComparison.Ordinal));
-                if (ws == null) return list;
-
-                used = ws.UsedRange;
-
-                int usedLastRow = used.Row + used.Rows.Count - 1;
-                XqlCommon.ReleaseCom(used); used = null;
-
-                // 1) 헤더 탐색: 마커 → 표 헤더 → Fallback
-                if (!XqlSheet.TryGetHeaderMarker(ws, out header))
-                {
-                    lo = ws.ListObjects?.Count > 0 ? ws.ListObjects[1] : null;
-                    if (lo?.HeaderRowRange != null) header = lo.HeaderRowRange;
-                    if (header == null) header = XqlSheet.GetHeaderRange(ws);
-                }
-                if (header == null) return list;
-
-
-                // 2) 헤더 수집 (배열 경로)
-                var headers = new List<string>(header.Columns.Count);
-                var hv = header.Value2 as object[,];
-                if (hv != null)
-                {
-                    int cols = header.Columns.Count;
-                    for (int i = 1; i <= cols; i++)
-                    {
-                        var nm = (Convert.ToString(hv[1, i]) ?? "").Trim();
-                        headers.Add(string.IsNullOrEmpty(nm) ? XqlCommon.ColumnIndexToLetter(header.Column + i - 1) : nm);
-                    }
-                }
-                else
-                {
-                    for (int i = 1; i <= header.Columns.Count; i++)
-                    {
-                        Excel.Range? hc = null;
-                        try
-                        {
-                            hc = (Excel.Range)header.Cells[1, i];
-                            var nm = (hc.Value2 as string)?.Trim();
-                            headers.Add(string.IsNullOrEmpty(nm) ? XqlCommon.ColumnIndexToLetter(header.Column + i - 1) : nm!);
-                        }
-                        finally { XqlCommon.ReleaseCom(hc); }
-                    }
-                }
-
-                // 3) 데이터 행: header 바로 아래부터 UsedRange 끝까지
-                int firstDataRow = header.Row + 1;
-                int lastRow = Math.Max(firstDataRow, usedLastRow);
-                for (int r = firstDataRow; r <= lastRow; r++)
-                {
-                    var row = new Dictionary<string, object?>(StringComparer.Ordinal);
-                    bool any = false;
-                    for (int i = 1; i <= header.Columns.Count; i++)
-                    {
-                        var key = headers[i - 1];
-                        if (string.IsNullOrWhiteSpace(key)) continue;
-                        if (!sm.Columns.ContainsKey(key)) continue; // 메타에 없는 컬럼 skip
-
-                        Excel.Range? cell = null;
-                        object? v = null;
-                        try { cell = (Excel.Range)ws.Cells[r, header.Column + i - 1]; v = cell.Value2; }
-                        catch { }
-                        finally { XqlCommon.ReleaseCom(cell); }
-                        // Excel 정수=double → 그대로 보관 (서버가 형변환)
-                        row[key] = v;
-                        if (v != null && !(v is string s && string.IsNullOrWhiteSpace(s))) any = true;
-                    }
-                    if (any) list.Add(row);
-                }
-            }
-            catch { }
-            finally
-            {
-                XqlCommon.ReleaseCom(header, lo, ws);
-            }
-            return list;
+            public int HeaderRow;
+            public int HeaderColumn;
+            public int HeaderCols;
+            public int KeyIndex1;
+            public List<string> HeaderNames = new();
+            public List<RowData> Rows = new();
         }
 
-        private static List<EditCell> RowsToCellEdits(string table, XqlSheet.Meta sm, List<Dictionary<string, object?>> rows)
+        private sealed class RowData
         {
-            var cells = new List<EditCell>(rows.Count * 4);
-            for (int i = 0; i < rows.Count; i++)
-            {
-                var r = rows[i];
-                // 행 키는 "id" 또는 "key" 또는 1열 값을 우선 사용 (여기선 id/key 우선)
-                object rowKey =
-                (sm.KeyColumn is { Length: > 0 } && r.TryGetValue(sm.KeyColumn, out var pk) && pk != null) ? pk :
-                (r.TryGetValue("id", out var idv) && idv != null ? idv :
-                r.TryGetValue("key", out var kv) && kv != null ? kv :
-                i + 1);
+            public int ExcelRow;
+            public Dictionary<string, object?> Values = new(StringComparer.Ordinal);
+        }
 
-                foreach (var kvp in r)
+        /// <summary>
+        /// 시트 헤더/키 인덱스/행 데이터를 한 번에 스냅샷(모두 순수 데이터만 반환; COM 미보관)
+        /// </summary>
+        private SheetSnapshot ReadSheetSnapshot(Excel.Application app, string sheetName, XqlSheet.Meta sm)
+        {
+            var snap = new SheetSnapshot();
+
+            using var ws = SmartCom<Excel.Worksheet>.Wrap(XqlSheet.FindWorksheet(app, sheetName));
+            if (ws?.Value == null) return snap;
+
+            using var used = SmartCom<Excel.Range>.Wrap(ws.Value.UsedRange);
+
+            // 헤더 탐색: 마커 → 표 헤더 → 폴백
+            using var header = SmartCom<Excel.Range>.Acquire(() =>
+            {
+                if (XqlSheet.TryGetHeaderMarker(ws.Value, out var mk)) return mk;
+                Excel.ListObject? lo = null;
+                try { lo = ws.Value.ListObjects?.Count > 0 ? ws.Value.ListObjects[1] : null; }
+                catch { lo = null; }
+                if (lo?.HeaderRowRange != null) return lo.HeaderRowRange;
+                return XqlSheet.GetHeaderRange(ws.Value);
+            });
+
+            if (header?.Value == null) return snap;
+
+            // UsedRange 끝 행 계산 (Value 접근 전 Address-touch는 SmartCom 필요 없음)
+            int lastRow = 0;
+            try { lastRow = used?.Value != null ? (used.Value.Row + used.Value.Rows.Count - 1) : (ws.Value.UsedRange.Row + ws.Value.UsedRange.Rows.Count - 1); }
+            catch { lastRow = ws.Value.UsedRange.Row + ws.Value.UsedRange.Rows.Count - 1; }
+
+            snap.HeaderRow = header.Value.Row;
+            snap.HeaderColumn = header.Value.Column;
+            snap.HeaderCols = header.Value.Columns.Count;
+
+            // 헤더명 (Value2 배열 우선)
+            var hv = header.Value.Value2 as object[,];
+            if (hv != null)
+            {
+                for (int i = 1; i <= snap.HeaderCols; i++)
                 {
-                    cells.Add(new EditCell(table, rowKey, kvp.Key, kvp.Value));
+                    var nm = (Convert.ToString(hv[1, i]) ?? "").Trim();
+                    snap.HeaderNames.Add(string.IsNullOrEmpty(nm)
+                        ? ColumnIndexToLetter(snap.HeaderColumn + i - 1)
+                        : nm);
                 }
             }
-            return cells;
+            else
+            {
+                for (int i = 1; i <= snap.HeaderCols; i++)
+                {
+                    using var hc = SmartCom<Excel.Range>.Acquire(() => (Excel.Range)header.Value.Cells[1, i]);
+                    var nm = (hc?.Value?.Value2 as string)?.Trim();
+                    snap.HeaderNames.Add(string.IsNullOrEmpty(nm)
+                        ? ColumnIndexToLetter(snap.HeaderColumn + i - 1)
+                        : nm!);
+                }
+            }
+
+            // 키 인덱스(1-based)
+            var keyName = string.IsNullOrWhiteSpace(sm.KeyColumn) ? "id" : sm.KeyColumn!;
+            snap.KeyIndex1 = XqlSheet.FindKeyColumnIndex(snap.HeaderNames, keyName);
+            if (snap.KeyIndex1 <= 0) snap.KeyIndex1 = 1;
+
+            // 데이터 행
+            int firstDataRow = snap.HeaderRow + 1;
+            int last = Math.Max(firstDataRow, lastRow);
+
+            for (int r = firstDataRow; r <= last; r++)
+            {
+                var row = new RowData { ExcelRow = r };
+                bool any = false;
+
+                for (int i = 1; i <= snap.HeaderCols; i++)
+                {
+                    var colName = snap.HeaderNames[i - 1];
+                    if (string.IsNullOrWhiteSpace(colName)) continue;
+                    if (!sm.Columns.ContainsKey(colName)) continue; // 메타에 없는 컬럼은 무시
+
+                    using var cell = SmartCom<Excel.Range>.Acquire(() => (Excel.Range)ws.Value.Cells[r, snap.HeaderColumn + i - 1]);
+                    object? v = null;
+                    try { v = cell?.Value?.Value2; } catch { }
+
+                    row.Values[colName] = v;
+                    if (v != null && !(v is string s && string.IsNullOrWhiteSpace(s))) any = true;
+                }
+
+                if (any) snap.Rows.Add(row);
+            }
+
+            return snap;
+        }
+
+        /// <summary>
+        /// 행 묶음을 Cell 편평화로 변환. tempKey("-<ExcelRow>") 매핑을 반환해서
+        /// 서버 Assigned → 시트 id 반영에 사용.
+        /// </summary>
+        private static (List<EditCell> Cells, Dictionary<string, int> TempKeyToRow)
+            RowsToCellEdits(string table, XqlSheet.Meta sm, IEnumerable<RowData> rows)
+        {
+            var cells = new List<EditCell>();
+            var map = new Dictionary<string, int>(StringComparer.Ordinal);
+
+            string keyName = string.IsNullOrWhiteSpace(sm.KeyColumn) ? "id" : sm.KeyColumn!;
+
+            foreach (var rd in rows)
+            {
+                var r = rd.Values;
+
+                // RowKey 결정: key 컬럼 값 있으면 그걸, 없으면 tempKey 사용
+                object? keyVal = null;
+                if (!string.IsNullOrWhiteSpace(keyName) && r.TryGetValue(keyName, out var pk) && pk != null)
+                    keyVal = pk;
+
+                string? tempKey = null;
+                if (keyVal == null)
+                {
+                    tempKey = "-" + rd.ExcelRow.ToString();
+                    keyVal = tempKey;
+                    map[tempKey] = rd.ExcelRow;
+                }
+
+                foreach (var kv in r)
+                {
+                    var col = kv.Key;
+                    if (string.Equals(col, keyName, StringComparison.OrdinalIgnoreCase))
+                        continue; // PK 컬럼은 업서트 셀에서 제외
+
+                    cells.Add(new EditCell(table, keyVal!, col, kv.Value));
+                }
+            }
+
+            return (cells, map);
         }
 
         private string SerializeMeta()
@@ -312,8 +414,8 @@ namespace XQLite.AddIn
                 sheets.Add(new
                 {
                     sheet = name,
-                    table = sm.TableName,
-                    key = sm.KeyColumn,
+                    table = string.IsNullOrWhiteSpace(sm.TableName) ? name : sm.TableName,
+                    key = string.IsNullOrWhiteSpace(sm.KeyColumn) ? "id" : sm.KeyColumn,
                     columns = cols
                 });
             }
@@ -327,7 +429,8 @@ namespace XQLite.AddIn
             foreach (var sheetName in GetWorkbookSheets(app))
             {
                 if (!_sheet.TryGetSheet(sheetName, out var sm)) continue;
-                var rows = ReadSheetRows(app, sheetName, sm);
+                var snap = ReadSheetSnapshot(app, sheetName, sm);
+                var rows = snap.Rows.Select(r => r.Values).ToList();
                 var outPath = Path.Combine(outDir, $"{SafeFileName(sheetName)}.csv");
                 WriteCsv(outPath, rows);
             }
@@ -336,23 +439,23 @@ namespace XQLite.AddIn
         private static IEnumerable<string> GetWorkbookSheets(Excel.Application app)
         {
             var list = new List<string>();
+            using var sheets = SmartCom<Excel.Sheets>.Wrap(app.Worksheets);
             try
             {
-                foreach (Excel.Worksheet w in app.Worksheets)
+                int count = sheets?.Value?.Count ?? 0;
+                for (int i = 1; i <= count; i++)
                 {
-                    try { list.Add(w.Name); }
-                    finally { XqlCommon.ReleaseCom(w); }
+                    using var w = SmartCom<Excel.Worksheet>.Acquire(() => (Excel.Worksheet?)sheets!.Value![i]);
+                    if (w?.Value != null) list.Add(w.Value.Name);
                 }
             }
-            catch { }
+            catch { /* ignore */ }
             return list;
         }
 
         private IEnumerable<string> GetAllRegisteredSheets()
         {
-            // XqlMetaRegistry 내부 사전을 직접 노출하지 않으므로, CSV 내보내기는 워크북 기준으로,
-            // 메타 serialize 는 TryGetSheet로 가능한 이름만 포함.
-            // 여기서는 워크북 시트명과 메타 매칭을 시도.
+            // 워크북 시트명과 메타 매칭
             var app = (Excel.Application)ExcelDnaUtil.Application;
             foreach (var name in GetWorkbookSheets(app))
                 if (_sheet.TryGetSheet(name, out _)) yield return name;
@@ -364,18 +467,18 @@ namespace XQLite.AddIn
             {
                 if (rows.Count == 0) { File.WriteAllText(path, "", new UTF8Encoding(false)); return; }
 
-                // 헤더: 모든 키의 합집합 (메타로 제한되어 있지만 혹시 모를 차이를 위해 합집합)
+                // 헤더: 모든 키의 합집합
                 var headers = rows.SelectMany(r => r.Keys).Distinct(StringComparer.Ordinal).ToList();
                 using var sw = new StreamWriter(path, false, new UTF8Encoding(false));
-                sw.WriteLine(string.Join(",", headers.Select(XqlCommon.CsvEscape)));
+                sw.WriteLine(string.Join(",", headers.Select(CsvEscape)));
 
                 foreach (var r in rows)
                 {
-                    var line = string.Join(",", headers.Select(h => XqlCommon.CsvEscape(XqlCommon.ValueToString(r.TryGetValue(h, out var v) ? v : null))));
+                    var line = string.Join(",", headers.Select(h => CsvEscape(ValueToString(r.TryGetValue(h, out var v) ? v : null))));
                     sw.WriteLine(line);
                 }
             }
-            catch { }
+            catch { /* ignore */ }
         }
 
         private static string SafeFileName(string name)

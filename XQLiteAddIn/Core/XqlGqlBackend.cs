@@ -1,4 +1,4 @@
-﻿// XqlGqlBackend.cs (async-first, index.ts 프로토콜 정렬 + 안정화)
+﻿// XqlGqlBackend.cs (async-first, index.ts 프로토콜 정렬 + 안정화 강화를 위한 개정판)
 
 using GraphQL;
 using GraphQL.Client.Http;
@@ -9,7 +9,6 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-using static XQLite.AddIn.IXqlBackend;
 
 namespace XQLite.AddIn
 {
@@ -93,7 +92,7 @@ namespace XQLite.AddIn
           upsertCells(cells:$cells){
             max_row_version
             errors
-            conflicts { table row_key column message }
+            conflicts { table row_key column message server_version local_version }
             assigned { table temp_row_key new_id }
           }
         }";
@@ -261,12 +260,60 @@ namespace XQLite.AddIn
             try { await Ping().ConfigureAwait(false); } catch { /* ignore transient */ }
         }
 
+        // ── 공통 전송 래퍼(에러/상태 일관처리) ────────────────────────────────
+        private async Task<GraphQLResponse<T>> SendQuerySafeAsync<T>(GraphQLRequest req, CancellationToken ct)
+        {
+            try
+            {
+                var resp = await _http.SendQueryAsync<T>(req, ct).ConfigureAwait(false);
+                if (resp.Errors != null && resp.Errors.Length > 0)
+                    throw new Exception("GraphQL errors: " + string.Join(" | ", resp.Errors.Select(e => e.Message)));
+                SetState(IXqlBackend.ConnState.Online, "query ok");
+                return resp;
+            }
+            catch (Exception ex)
+            {
+                Degrade(ex);
+                throw;
+            }
+        }
+
+        private async Task<GraphQLResponse<T>> SendMutationSafeAsync<T>(GraphQLRequest req, CancellationToken ct)
+        {
+            try
+            {
+                var resp = await _http.SendMutationAsync<T>(req, ct).ConfigureAwait(false);
+                if (resp.Errors != null && resp.Errors.Length > 0)
+                    throw new Exception("GraphQL errors: " + string.Join(" | ", resp.Errors.Select(e => e.Message)));
+                SetState(IXqlBackend.ConnState.Online, "mutation ok");
+                return resp;
+            }
+            catch (Exception ex)
+            {
+                Degrade(ex);
+                throw;
+            }
+        }
+
+        private void Degrade(Exception ex)
+        {
+            var now = DateTime.UtcNow;
+            if (LastOkUtc == DateTime.MinValue)
+                SetState(IXqlBackend.ConnState.Connecting, ex.GetType().Name);
+            else
+            {
+                var ms = (now - LastOkUtc).TotalMilliseconds;
+                if (ms > HB_TTL_MS) SetState(IXqlBackend.ConnState.Disconnected, ex.GetType().Name);
+                else SetState(IXqlBackend.ConnState.Degraded, ex.GetType().Name);
+            }
+        }
+
         // ── Sync ─────────────────────────────────────────────────────────────
         public async Task<PullResult> PullRows(long since, CancellationToken ct = default)
         {
             var since32 = (int)XqlCommon.Clamp(since, int.MinValue, int.MaxValue);
             var req = new GraphQLRequest { Query = Q_PULL, Variables = new { since = since32 } };
-            var resp = await _http.SendQueryAsync<JObject>(req, ct).ConfigureAwait(false);
+            var resp = await SendQuerySafeAsync<JObject>(req, ct).ConfigureAwait(false);
             return ParsePull(resp.Data);
         }
 
@@ -276,7 +323,21 @@ namespace XQLite.AddIn
             var req = new GraphQLRequest { Query = SUB_ROWS };
             var observable = _ws.CreateSubscriptionStream<JObject>(req);
             var sub = observable.Subscribe(
-                p => { _subRetry = 0; try { onEvent(ParseSub(p.Data)); } catch { } },
+                p =>
+                {
+                    _subRetry = 0;
+                    try
+                    {
+                        var ev = ParseSub(p.Data);
+                        SetState(IXqlBackend.ConnState.Online, "sub event");
+                        onEvent(ev);
+                    }
+                    catch (Exception ex)
+                    {
+                        // 이벤트 파싱 실패는 재연결 트리거로 보지 않음
+                        SetState(IXqlBackend.ConnState.Degraded, "sub parse: " + ex.GetType().Name);
+                    }
+                },
                 _ => Resubscribe(onEvent, since),
                 () => Resubscribe(onEvent, since)
             );
@@ -293,6 +354,7 @@ namespace XQLite.AddIn
                 try { StartSubscription(onEvent, since); }
                 finally { _resubTimer?.Dispose(); _resubTimer = null; }
             }, null, delayMs, Timeout.Infinite);
+            SetState(IXqlBackend.ConnState.Connecting, $"resub in {delayMs}ms");
         }
 
         public void StopSubscription()
@@ -305,40 +367,40 @@ namespace XQLite.AddIn
         public async Task PresenceTouch(string nickname, string? sheet, string? cell, CancellationToken ct = default)
         {
             var req = new GraphQLRequest { Query = MUT_PRESENCE, Variables = new { n = nickname, s = sheet, c = cell } };
-            var resp = await _http.SendMutationAsync<PresenceTouchMutation>(req, ct).ConfigureAwait(false);
-            if (resp.Errors != null && resp.Errors.Length > 0)
-                throw new Exception("presenceTouch failed: " + resp.Errors[0].Message);
+            var resp = await SendMutationSafeAsync<PresenceTouchMutation>(req, ct).ConfigureAwait(false);
+            if (resp.Data?.presenceTouch?.ok != true)
+                throw new Exception("presenceTouch failed");
         }
 
         public Task AcquireLock(string cellOrResourceKey, string by, CancellationToken ct = default)
-            => _http.SendMutationAsync<JObject>(new GraphQLRequest { Query = MUT_ACQUIRE, Variables = new { cell = cellOrResourceKey, by } }, ct);
+            => SendMutationSafeAsync<JObject>(new GraphQLRequest { Query = MUT_ACQUIRE, Variables = new { cell = cellOrResourceKey, by } }, ct);
 
         public Task ReleaseLocksBy(string by, CancellationToken ct = default)
-            => _http.SendMutationAsync<JObject>(new GraphQLRequest { Query = MUT_RELEASE_BY, Variables = new { by } }, ct);
+            => SendMutationSafeAsync<JObject>(new GraphQLRequest { Query = MUT_RELEASE_BY, Variables = new { by } }, ct);
 
         // ── Schema ───────────────────────────────────────────────────────────
         public Task TryCreateTable(string table, string key, CancellationToken ct = default)
-            => _http.SendMutationAsync<object>(new GraphQLRequest
+            => SendMutationSafeAsync<object>(new GraphQLRequest
             {
                 Query = MUT_CREATE_TABLE,
                 Variables = new { table, key }
             }, ct);
 
         public Task TryAddColumns(string table, IEnumerable<ColumnDef> cols, CancellationToken ct = default)
-            => _http.SendMutationAsync<object>(new GraphQLRequest
+            => SendMutationSafeAsync<object>(new GraphQLRequest
             {
                 Query = MUT_ADD_COLUMNS,
                 Variables = new
                 {
                     table,
-                    columns = cols.Where(c => !string.IsNullOrWhiteSpace(c.Name))
-                                  .Select(c => new
-                                  {
-                                      name = c.Name,
-                                      type = MapType(c.Kind),
-                                      notNull = c.NotNull,
-                                      check = c.Check
-                                  }).ToArray()
+                    columns = cols?.Where(c => !string.IsNullOrWhiteSpace(c.Name))
+                                   .Select(c => new
+                                   {
+                                       name = c.Name,
+                                       type = MapType(c.Kind),
+                                       notNull = c.NotNull,
+                                       check = c.Check
+                                   }).ToArray() ?? Array.Empty<object>()
                 }
             }, ct);
 
@@ -349,7 +411,7 @@ namespace XQLite.AddIn
                              .ToArray() ?? Array.Empty<string>();
             if (list.Length == 0) return Task.CompletedTask;
 
-            return _http.SendMutationAsync<object>(new GraphQLRequest
+            return SendMutationSafeAsync<object>(new GraphQLRequest
             {
                 Query = MUT_DROP_COLUMNS,
                 Variables = new { t = table, ns = list }
@@ -364,7 +426,7 @@ namespace XQLite.AddIn
                                 .ToArray() ?? Array.Empty<object>();
             if (pairs.Length == 0) return Task.CompletedTask;
 
-            return _http.SendMutationAsync<object>(new GraphQLRequest
+            return SendMutationSafeAsync<object>(new GraphQLRequest
             {
                 Query = MUT_RENAME_COLUMNS,
                 Variables = new { t = table, rs = pairs }
@@ -384,7 +446,7 @@ namespace XQLite.AddIn
                               .ToArray() ?? Array.Empty<object>();
             if (list.Length == 0) return Task.CompletedTask;
 
-            return _http.SendMutationAsync<object>(new GraphQLRequest
+            return SendMutationSafeAsync<object>(new GraphQLRequest
             {
                 Query = MUT_ALTER_COLUMNS,
                 Variables = new { t = table, alters = list }
@@ -396,7 +458,7 @@ namespace XQLite.AddIn
         {
             try
             {
-                var resp = await _http.SendQueryAsync<JObject>(new GraphQLRequest { Query = Q_META }, ct).ConfigureAwait(false);
+                var resp = await SendQuerySafeAsync<JObject>(new GraphQLRequest { Query = Q_META }, ct).ConfigureAwait(false);
                 var raw = resp.Data?["meta"];
                 if (raw is JObject jo) return jo;
 
@@ -421,13 +483,15 @@ namespace XQLite.AddIn
                 var clamped = Math.Max(int.MinValue, Math.Min(int.MaxValue, since.Value));
                 s = unchecked((int)clamped);
             }
-            var resp = await _http.SendQueryAsync<JObject>(new GraphQLRequest { Query = Q_AUDIT, Variables = new { since = s } }, ct).ConfigureAwait(false);
+            var resp = await SendQuerySafeAsync<JObject>(
+                new GraphQLRequest { Query = Q_AUDIT, Variables = new { since = s } }, ct
+            ).ConfigureAwait(false);
             return resp.Data?["audit_log"] as JArray;
         }
 
         public async Task<byte[]?> TryExportDatabase(CancellationToken ct = default)
         {
-            var resp = await _http.SendQueryAsync<JObject>(new GraphQLRequest { Query = Q_EXPORT_DB }, ct).ConfigureAwait(false);
+            var resp = await SendQuerySafeAsync<JObject>(new GraphQLRequest { Query = Q_EXPORT_DB }, ct).ConfigureAwait(false);
             var s = (string?)resp.Data?["exportDatabase"];
             if (string.IsNullOrWhiteSpace(s)) return null;
             try { return Convert.FromBase64String(s); }
@@ -437,7 +501,7 @@ namespace XQLite.AddIn
         public async Task<PresenceItem[]?> FetchPresence(CancellationToken ct = default)
         {
             var req = new GraphQLRequest { Query = Q_PRESENCE };
-            var resp = await _http.SendQueryAsync<PresenceResp>(req, ct).ConfigureAwait(false);
+            var resp = await SendQuerySafeAsync<PresenceResp>(req, ct).ConfigureAwait(false);
             var arr = resp.Data?.presence ?? Array.Empty<PresenceItem>();
             return arr.Where(p => p != null).ToArray();
         }
@@ -446,7 +510,7 @@ namespace XQLite.AddIn
         public async Task<UpsertResult> UpsertRows(string table, List<Dictionary<string, object?>> rows, CancellationToken ct = default)
         {
             var req = new GraphQLRequest { Query = MUT_UPSERT_ROWS, Variables = new { table, rows } };
-            var resp = await _http.SendMutationAsync<JObject>(req, ct).ConfigureAwait(false);
+            var resp = await SendMutationSafeAsync<JObject>(req, ct).ConfigureAwait(false);
             return ParseUpsert(resp.Data);
         }
 
@@ -456,7 +520,7 @@ namespace XQLite.AddIn
             try
             {
                 var req = new GraphQLRequest { Query = Q_ROWS_SNAPSHOT, Variables = new { t = table } };
-                var resp = await _http.SendQueryAsync<JObject>(req, ct).ConfigureAwait(false);
+                var resp = await SendQuerySafeAsync<JObject>(req, ct).ConfigureAwait(false);
                 var arr = resp.Data?["rowsSnapshot"] as JArray;
                 var list = new List<RowPatch>();
                 if (arr == null) return list;
@@ -464,9 +528,7 @@ namespace XQLite.AddIn
                 foreach (var it in arr.OfType<JObject>())
                 {
                     var rk = it["id"]?.ToString() ?? it["row_key"]?.ToString() ?? "";
-                    var deleted = it["deleted"]?.Type == JTokenType.Integer
-                                  ? ((int?)it["deleted"] ?? 0) != 0
-                                  : (it["deleted"]?.Type == JTokenType.Boolean ? ((bool?)it["deleted"] ?? false) : false);
+                    var deleted = ParseDeleted(it["deleted"]);
 
                     var cells = new Dictionary<string, object?>(StringComparer.Ordinal);
                     foreach (var p in it.Properties())
@@ -499,7 +561,7 @@ namespace XQLite.AddIn
             }).ToArray();
 
             var req = new GraphQLRequest { Query = MUT_UPSERT_CELLS, Variables = new { cells = payload } };
-            var resp = await _http.SendMutationAsync<JObject>(req, ct).ConfigureAwait(false);
+            var resp = await SendMutationSafeAsync<JObject>(req, ct).ConfigureAwait(false);
 
             var root = resp.Data?["upsertCells"] as JObject;
             if (root == null) throw new Exception("upsertCells: empty response");
@@ -508,7 +570,16 @@ namespace XQLite.AddIn
             {
                 MaxRowVersion = (long?)root["max_row_version"] ?? 0,
                 Errors = root["errors"] is JArray ea ? ea.Select(x => x?.ToString() ?? "").ToList() : null,
-                Conflicts = root["conflicts"] is JArray ca ? ca.ToObject<List<Conflict>>() : null,
+                Conflicts = root["conflicts"] is JArray ca ? ca.OfType<JObject>().Select(c => new Conflict
+                {
+                    Kind = "conflict",
+                    Table = c["table"]?.ToString() ?? "",
+                    RowKey = c["row_key"]?.ToObject<object>(),
+                    Column = c["column"]?.ToString(),
+                    Message = c["message"]?.ToString() ?? "",
+                    ServerVersion = (long?)c["server_version"],
+                    LocalVersion = (long?)c["local_version"],
+                }).ToList() : null,
                 Assigned = root["assigned"] is JArray aa ? aa
                     .OfType<JObject>()
                     .Select(a => new AssignedId
@@ -525,7 +596,7 @@ namespace XQLite.AddIn
         public async Task<List<ColumnInfo>> GetTableColumns(string table, CancellationToken ct = default)
         {
             var req = new GraphQLRequest { Query = Q_TABLE_COLUMNS, Variables = new { t = table } };
-            var resp = await _http.SendQueryAsync<JObject>(req, ct).ConfigureAwait(false);
+            var resp = await SendQuerySafeAsync<JObject>(req, ct).ConfigureAwait(false);
             var arr = resp.Data?["tableColumns"] as JArray;
             return arr?.ToObject<List<ColumnInfo>>() ?? new List<ColumnInfo>();
         }

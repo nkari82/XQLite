@@ -49,13 +49,13 @@ namespace XQLite.AddIn
 
             if (Interlocked.Exchange(ref _refreshing, 1) == 1) return;
 
-            CancellationTokenSource? prev = _cts;
-            _cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            var newCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            CancellationTokenSource? prev = Interlocked.Exchange(ref _cts, newCts);
             try
             {
                 prev?.Dispose(); // 이전 CTS 정리
 
-                var list = await be.FetchPresence(_cts.Token).ConfigureAwait(false);
+                var list = await be.FetchPresence(newCts.Token).ConfigureAwait(false);
 
                 // UI 갱신
                 if (IsHandleCreated && !IsDisposed && list != null)
@@ -80,7 +80,7 @@ namespace XQLite.AddIn
                                         var dt = DateTimeOffset.FromUnixTimeMilliseconds(p.updated_at.Value).LocalDateTime;
                                         when = dt.ToString("MM-dd HH:mm:ss");
                                     }
-                                    catch { /* ms 값이 이상하면 그냥 공백 */ }
+                                    catch (Exception ex) { XqlLog.Warn("Presence when parse failed: " + ex.Message); }
                                 }
 
                                 // where: "sheet/cell" 또는 빈 문자열
@@ -96,7 +96,14 @@ namespace XQLite.AddIn
                     }));
                 }
             }
-            catch { /* 네트워크 일시 오류 무음 */ }
+            catch (OperationCanceledException)
+            {
+                // 타임아웃/취소는 무시
+            }
+            catch (Exception ex)
+            {
+                XqlLog.Warn("RefreshPresence failed: " + ex.Message);
+            }
             finally
             {
                 Interlocked.Exchange(ref _refreshing, 0);

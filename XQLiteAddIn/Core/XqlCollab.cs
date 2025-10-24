@@ -1,10 +1,11 @@
-﻿// XqlCollab.cs (UI-thread marshaling via XqlCommon.OnExcelThreadAsync, no blocking waits)
+﻿// XqlCollab.cs — SmartCom<T> 적용 (UI-thread marshaling via XqlCommon.OnExcelThreadAsync)
 using ExcelDna.Integration;
 using System;
 using System.Threading;
 using System.Threading.Tasks;
 using Excel = Microsoft.Office.Interop.Excel;
 using Timer = System.Threading.Timer;
+using static XQLite.AddIn.XqlCommon;
 
 namespace XQLite.AddIn
 {
@@ -42,7 +43,7 @@ namespace XQLite.AddIn
         {
             try
             {
-                var now = XqlCommon.NowMs();
+                var now = NowMs();
                 if (now - _lastPresenceMs < 800) return; // 0.8s 디바운스
 
                 var sig = $"{sheet}|{cellAddr}";
@@ -108,34 +109,31 @@ namespace XQLite.AddIn
         public async Task<bool> AcquireCurrentColumn()
         {
             // 1) UI 스냅샷(키 계산)만 Excel 스레드에서
-            var key = await XqlCommon.OnExcelThreadAsync<string?>(() =>
+            var key = await OnExcelThreadAsync<string?>(() =>
             {
-                Excel.Range? rng = null; Excel.Worksheet? ws = null; Excel.ListObject? lo = null; Excel.Range? headerCell = null;
-                try
-                {
-                    var app = (Excel.Application)ExcelDnaUtil.Application;
-                    rng = app.Selection as Excel.Range;
-                    if (rng == null) return null;
+                using var app = SmartCom<Excel.Application>.Wrap((Excel.Application)ExcelDnaUtil.Application);
 
-                    ws = (Excel.Worksheet)rng.Worksheet;
-                    lo = rng.ListObject ?? XqlSheet.FindListObjectContaining(ws, rng);
-                    if (lo?.HeaderRowRange == null) return null;
+                using var rng = SmartCom<Excel.Range>.Wrap(app.Value?.Selection as Excel.Range);
+                if (rng?.Value == null) return null;
 
-                    // 선택 좌상단 기준 컬럼 인덱스
-                    int colIndex = Math.Max(0, Math.Min(rng.Column - lo.HeaderRowRange.Column, lo.ListColumns.Count - 1));
-                    headerCell = (Excel.Range)lo.HeaderRowRange.Cells[1, colIndex + 1];
-                    var headerName = (headerCell.Value2 as string)?.Trim();
-                    if (string.IsNullOrEmpty(headerName))
-                        headerName = XqlCommon.ColumnIndexToLetter(headerCell.Column);
+                using var ws = SmartCom<Excel.Worksheet>.Wrap((Excel.Worksheet)rng.Value.Worksheet);
+                using var lo = SmartCom<Excel.ListObject>.Wrap(rng.Value.ListObject ?? XqlSheet.FindListObjectContaining(ws.Value!, rng.Value));
+                if (lo?.Value?.HeaderRowRange == null) return null;
 
-                    string tableName = XqlTableNameMap.Map(lo.Name, ws.Name);
-                    int hRow = lo.HeaderRowRange.Row;
-                    int hCol = lo.HeaderRowRange.Column;
-                    int colOffset = colIndex;
+                // 선택 좌상단 기준 컬럼 인덱스
+                int colIndex = Math.Max(0, Math.Min(rng.Value.Column - lo.Value.HeaderRowRange.Column, lo.Value.ListColumns.Count - 1));
 
-                    return XqlSheet.ColumnKey(ws.Name, tableName, hRow, hCol, colOffset, headerName!);
-                }
-                finally { XqlCommon.ReleaseCom(headerCell, rng, lo, ws); }
+                using var headerCell = SmartCom<Excel.Range>.Acquire(() => (Excel.Range)lo.Value.HeaderRowRange.Cells[1, colIndex + 1]);
+                var headerName = (headerCell?.Value?.Value2 as string)?.Trim();
+                if (string.IsNullOrEmpty(headerName))
+                    headerName = ColumnIndexToLetter(headerCell!.Value!.Column);
+
+                string tableName = XqlTableNameMap.Map(lo.Value.Name, ws.Value!.Name);
+                int hRow = lo.Value.HeaderRowRange.Row;
+                int hCol = lo.Value.HeaderRowRange.Column;
+                int colOffset = colIndex;
+
+                return XqlSheet.ColumnKey(ws.Value!.Name, tableName, hRow, hCol, colOffset, headerName!);
             }).ConfigureAwait(false);
 
             if (string.IsNullOrEmpty(key)) return false;
@@ -156,26 +154,19 @@ namespace XQLite.AddIn
         public async Task<bool> AcquireCurrentCell()
         {
             // 1) UI 스냅샷(키 계산)만 Excel 스레드에서
-            var key = await XqlCommon.OnExcelThreadAsync<string?>(() =>
+            var key = await OnExcelThreadAsync<string?>(() =>
             {
-                Excel.Range? rng = null; Excel.Worksheet? ws = null; Excel.ListObject? lo = null;
-                try
-                {
-                    var app = (Excel.Application)ExcelDnaUtil.Application;
-                    rng = app.Selection as Excel.Range; if (rng == null) return null;
+                using var app = SmartCom<Excel.Application>.Wrap((Excel.Application)ExcelDnaUtil.Application);
+                using var rng = SmartCom<Excel.Range>.Wrap(app.Value?.Selection as Excel.Range);
+                if (rng?.Value == null) return null;
 
-                    ws = (Excel.Worksheet)rng.Worksheet;
-                    lo = rng.ListObject ?? XqlSheet.FindListObjectContaining(ws, rng);
-                    if (lo?.HeaderRowRange == null) return null;
+                using var ws = SmartCom<Excel.Worksheet>.Wrap((Excel.Worksheet)rng.Value.Worksheet);
+                using var lo = SmartCom<Excel.ListObject>.Wrap(rng.Value.ListObject ?? XqlSheet.FindListObjectContaining(ws.Value!, rng.Value));
+                if (lo?.Value?.HeaderRowRange == null) return null;
 
-                    int hRow = lo.HeaderRowRange.Row, hCol = lo.HeaderRowRange.Column;
-                    int dr = rng.Row - (hRow + 1), dc = rng.Column - hCol;
-                    return XqlSheet.CellKey(ws.Name, XqlTableNameMap.Map(lo.Name, ws.Name), hRow, hCol, dr, dc);
-                }
-                finally
-                {
-                    XqlCommon.ReleaseCom(rng, lo, ws);
-                }
+                int hRow = lo.Value.HeaderRowRange.Row, hCol = lo.Value.HeaderRowRange.Column;
+                int dr = rng.Value.Row - (hRow + 1), dc = rng.Value.Column - hCol;
+                return XqlSheet.CellKey(ws.Value!.Name, XqlTableNameMap.Map(lo.Value.Name, ws.Value!.Name), hRow, hCol, dr, dc);
             }).ConfigureAwait(false);
 
             if (string.IsNullOrEmpty(key)) return false;
@@ -195,54 +186,81 @@ namespace XQLite.AddIn
         // UI가 현재 커서를 Presence에 태그하고 싶을 때 사용 (UI 스냅샷 전용)
         private static Task<(string? sheet, string? cellKey)> TryGetCurrentSheetAndCellKeyOrNullAsync()
         {
-            return XqlCommon.OnExcelThreadAsync<(string?, string?)>(() =>
+            return OnExcelThreadAsync<(string?, string?)>(() =>
             {
-                Excel.Range? rng = null; Excel.Worksheet? ws = null; Excel.ListObject? lo = null;
-                try
-                {
-                    var app = (Excel.Application)ExcelDnaUtil.Application;
-                    rng = app.Selection as Excel.Range;
-                    if (rng == null) return (null, null);
+                using var app = SmartCom<Excel.Application>.Wrap((Excel.Application)ExcelDnaUtil.Application);
+                using var rng = SmartCom<Excel.Range>.Wrap(app.Value?.Selection as Excel.Range);
+                if (rng?.Value == null) return (null, null);
 
-                    ws = (Excel.Worksheet)rng.Worksheet;
-                    lo = rng.ListObject ?? XqlSheet.FindListObjectContaining(ws, rng);
-                    if (lo?.HeaderRowRange == null) return (ws?.Name, null);
+                using var ws = SmartCom<Excel.Worksheet>.Wrap((Excel.Worksheet)rng.Value.Worksheet);
+                using var lo = SmartCom<Excel.ListObject>.Wrap(rng.Value.ListObject ?? XqlSheet.FindListObjectContaining(ws.Value!, rng.Value));
+                if (lo?.Value?.HeaderRowRange == null) return (ws?.Value?.Name, null);
 
-                    string tableName = XqlTableNameMap.Map(lo.Name, ws.Name);
-                    int hRow = lo.HeaderRowRange.Row;
-                    int hCol = lo.HeaderRowRange.Column;
-                    int rowOffset = rng.Row - (hRow + 1);
-                    int colOffset = rng.Column - hCol;
+                string tableName = XqlTableNameMap.Map(lo.Value.Name, ws.Value!.Name);
+                int hRow = lo.Value.HeaderRowRange.Row;
+                int hCol = lo.Value.HeaderRowRange.Column;
+                int rowOffset = rng.Value.Row - (hRow + 1);
+                int colOffset = rng.Value.Column - hCol;
 
-                    return (ws.Name, XqlSheet.CellKey(ws.Name, tableName, hRow, hCol, rowOffset, colOffset));
-                }
-                finally { XqlCommon.ReleaseCom(rng, lo, ws); }
+                return (ws.Value!.Name, XqlSheet.CellKey(ws.Value!.Name, tableName, hRow, hCol, rowOffset, colOffset));
             });
         }
 
         // (선택) 키를 더블클릭으로 점프할 때 사용: 상대키 → 현재 Range 복원
-        public static bool TryJumpTo(string key)
+        public static Task<bool> TryJumpToAsync(string key, CancellationToken ct = default)
         {
-            // 이 API는 시그니처를 유지(동기). 내부적으로 UI 스레드에서만 실행.
-            try
-            {
-                var ok = XqlCommon.OnExcelThreadAsync<bool>(() =>
+            if (string.IsNullOrWhiteSpace(key))
+                return Task.FromResult(false);
+
+            var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            _ = XqlCommon.BridgeAsync<string, XqlSheet.RelDesc?>(
+                // UI hop: 반드시 UI에서 할 필요는 없지만, Bridge의 형태를 맞춰 둠
+                captureOnUi: () => key.Trim(),
+
+                // BG hop: 파싱(순수 연산, COM 접근 금지)
+                workOnBg: (k, token) =>
                 {
-                    var app = (Excel.Application)ExcelDnaUtil.Application;
-                    if (XqlSheet.TryParse(key, out var desc) &&
-                        XqlSheet.TryResolve(app, desc, out var range, out _, out _))
+                    var ok = XqlSheet.TryParse(k, out var desc);
+                    return Task.FromResult(ok ? desc : (XqlSheet.RelDesc?)null);
+                },
+
+                // UI hop: COM 접근 및 Select
+                applyOnUi: desc =>
+                {
+                    if (desc == null) { tcs.TrySetResult(false); return; }
+
+                    try
                     {
-                        try { range?.Select(); return true; }
-                        finally { XqlCommon.ReleaseCom(range); }
+                        var app = (Excel.Application)ExcelDnaUtil.Application;
+
+                        if (XqlSheet.TryResolve(app, desc.Value, out var range, out _, out _))
+                        {
+                            using var _rg = SmartCom<Excel.Range>.Wrap(range);
+                            _rg.Value?.Select();
+                            tcs.TrySetResult(_rg.Value != null);
+                        }
+                        else
+                        {
+                            tcs.TrySetResult(false);
+                        }
                     }
-                    return false;
-                }).GetAwaiter().GetResult(); // 호출측이 비-UI일 가능성이 높아 동기 대기 허용
-                return ok;
-            }
-            catch
+                    catch
+                    {
+                        tcs.TrySetResult(false);
+                    }
+                },
+                ct
+            )
+            .ContinueWith(t =>
             {
-                return false;
-            }
+                // Bridge 단계에서 취소/예외가 나면 결과를 정리
+                if (t.IsCanceled) tcs.TrySetCanceled(ct);
+                else if (t.IsFaulted) tcs.TrySetResult(false);
+            }, TaskScheduler.Default);
+
+            return tcs.Task;
         }
+
     }
 }

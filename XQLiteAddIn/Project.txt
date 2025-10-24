@@ -53,6 +53,7 @@ History DB(선택): 필드 변경 이력 전용. 용량 관리 및 포렌식/회
 
 
 
+System.Runtime.InteropServices.InvalidComObjectException: '기본 RCW에서 분리된 COM 개체는 사용할 수 없습니다.'
 
 
 스펙2차를 위한 준비..

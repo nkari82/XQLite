@@ -1,6 +1,5 @@
 ﻿// XqlCommon.cs
 using ExcelDna.Integration;
-using ExcelDna.Integration.CustomUI;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -8,6 +7,7 @@ using System.Globalization;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
@@ -28,8 +28,82 @@ namespace XQLite.AddIn
             ExcelAsyncUtil.QueueAsMacro(() =>
             {
                 try { _excelMainThreadId = Thread.CurrentThread.ManagedThreadId; }
-                catch {}
+                catch { }
             });
+        }
+
+
+        /// <summary>
+        /// UI → BG → UI 세 단계 파이프라인을 안전하게 수행합니다.
+        /// - captureOnUi : Excel UI 스레드에서 순수 스냅샷(TSnap)만 캡처 (COM RCW 보관 금지)
+        /// - workOnBg    : 백그라운드에서 스냅샷을 이용해 순수 연산 수행(네트워크/CPU 등)
+        /// - applyOnUi   : 결과를 UI에 반영 (필요 시 Excel 개체 접근)
+        /// CancellationToken은 각 hop 사이에서 체크되어 즉시 중단됩니다.
+        /// </summary>
+        public static async Task BridgeAsync<TSnap, TResult>(
+            Func<TSnap> captureOnUi,
+            Func<TSnap, CancellationToken, Task<TResult>> workOnBg,
+            Action<TResult> applyOnUi,
+            CancellationToken ct = default)
+        {
+            // --- 인자 검증 ---
+            if (captureOnUi is null) throw new ArgumentNullException(nameof(captureOnUi));
+            if (workOnBg is null) throw new ArgumentNullException(nameof(workOnBg));
+            if (applyOnUi is null) throw new ArgumentNullException(nameof(applyOnUi));
+
+            // 빠른 취소
+            ct.ThrowIfCancellationRequested();
+
+            TSnap snap;
+            try
+            {
+                // UI hop (Excel UI 스레드로 마샬링)
+                snap = await OnExcelThreadAsync(captureOnUi).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                // 캡처 단계 예외는 그대로 전파하되 로깅
+                try { XqlLog.Warn("BridgeAsync.captureOnUi failed: " + ex.Message); } catch { }
+                throw;
+            }
+
+            // hop 사이에서도 취소 체크
+            ct.ThrowIfCancellationRequested();
+
+            TResult result;
+            try
+            {
+                // BG hop (절대 COM 접근 금지; 네트워크/CPU 위주)
+                result = await workOnBg(snap, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                // 백그라운드 작업 예외는 로깅 후 전파
+                try { XqlLog.Warn("BridgeAsync.workOnBg failed: " + ex.Message); } catch { }
+                throw;
+            }
+
+            // apply 직전 취소면 UI 반영 스킵
+            ct.ThrowIfCancellationRequested();
+
+            try
+            {
+                // UI hop (결과 반영)
+                await OnExcelThreadAsync(() =>
+                {
+                    applyOnUi(result);
+                    return 0;
+                }).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                // 반영 단계 예외 로깅 후 전파
+                try { XqlLog.Warn("BridgeAsync.applyOnUi failed: " + ex.Message); } catch { }
+                throw;
+            }
         }
 
         /// <summary>
@@ -75,6 +149,7 @@ namespace XQLite.AddIn
 
             try
             {
+
                 ExcelAsyncUtil.QueueAsMacro(() =>
                 {
                     if (token.IsCancellationRequested || tcs.Task.IsCompleted) return;
@@ -100,7 +175,7 @@ namespace XQLite.AddIn
 
         public static Task OnExcelThreadAsync(Action work, int? timeoutMs = null, CancellationToken ct = default)
             => OnExcelThreadAsync<object?>(() => { work(); return null; }, timeoutMs, ct);
-        
+
         public static long NowMs() => (Stopwatch.GetTimestamp() * 1000L) / Stopwatch.Frequency;
 
 
@@ -149,7 +224,8 @@ namespace XQLite.AddIn
             return s;
         }
 
-        public static void ReleaseCom(params object?[] objs)
+        // XqlCommon.cs
+        internal static void ReleaseCom(params object?[] objs)
         {
             foreach (var o in objs)
             {
@@ -157,14 +233,28 @@ namespace XQLite.AddIn
                 {
                     if (o == null) continue;
                     if (!Marshal.IsComObject(o)) continue;
-                    // 여러 번 Release 호출돼도 0 미만으로 내려가는 일은 없습니다.
-                    Marshal.FinalReleaseComObject(o);
+
+                    // 강제 분리(FinalRelease) 금지 — 참조 1회만 안전하게 감소
+                    try
+                    {
+                        Marshal.ReleaseComObject(o);
+                    }
+                    catch (InvalidComObjectException)
+                    {
+                        // 이미 분리된 RCW — 무시
+                    }
                 }
-                catch (COMException) { /* Excel 종료/분리 중 */ }
-                catch (InvalidComObjectException) { /* RCW 분리됨 */ }
-                catch { /* no-op */ }
+                catch (COMException)
+                {
+                    // Excel 종료/분리 중 예외 — 무시
+                }
+                catch
+                {
+                    // 어떤 예외도 삼킴
+                }
             }
         }
+
 
         internal static string CreateTempDir(string prefix)
         {
@@ -488,6 +578,178 @@ namespace XQLite.AddIn
                 try { if (_capAlerts) _app.DisplayAlerts = _oldAlerts; } catch { }
                 try { if (_capScreen) _app.ScreenUpdating = _oldScreen; } catch { }
                 try { if (_capEvents) _app.EnableEvents = _oldEvents; } catch { }
+            }
+        }
+
+
+        /// <summary>
+        /// COM 객체를 스코프 기반으로 안전하게 관리하기 위한 래퍼.
+        /// - Dispose 시 ReleaseComObject 1회만 호출 (FinalRelease 금지)
+        /// - Detach()로 소유권 이전 가능
+        /// - Use/Map 헬퍼 제공
+        /// - await 경계 넘기지 말 것 (스코프 생명주기 보장)
+        /// - 스레드 제약 없음 (사용자 책임)
+        /// </summary>
+        public sealed class SmartCom<T> : IDisposable where T : class
+        {
+            private T? _obj;
+            private bool _disposed;
+
+            public SmartCom(T? obj)
+            {
+                _obj = obj;
+            }
+
+            /// <summary>래핑된 실제 객체(읽기전용).</summary>
+            public T? Value => _disposed ? null : _obj;
+
+            /// <summary>암시적 변환: SmartCom<T>; → T?</summary>
+            public static implicit operator T?(SmartCom<T> w) => w?._obj;
+
+            /// <summary>소유권을 호출자에게 넘기고 이 래퍼는 해제하지 않음.</summary>
+            public T? Detach()
+            {
+                var o = Interlocked.Exchange(ref _obj, null);
+                return o;
+            }
+
+            /// <summary>사용 후 자동 해제 (Action 버전)</summary>
+            public void Use(Action<T> action)
+            {
+                if (_disposed) throw new ObjectDisposedException(nameof(SmartCom<T>));
+                var o = _obj;
+                if (o == null) { Dispose(); return; }
+                try { action(o); }
+                finally { Dispose(); }
+            }
+
+            /// <summary>사용 후 자동 해제 + 결과 반환 (Func 버전)</summary>
+            public R? Map<R>(Func<T, R?> func)
+            {
+                if (_disposed) throw new ObjectDisposedException(nameof(SmartCom<T>));
+                var o = _obj;
+                if (o == null) { Dispose(); return default; }
+                try { return func(o); }
+                finally { Dispose(); }
+            }
+
+            /// <summary>해제: ReleaseComObject 1회만 호출 (RCW 분리 금지)</summary>
+            public void Dispose()
+            {
+                if (_disposed) return;
+                _disposed = true;
+
+                var o = Interlocked.Exchange(ref _obj, null);
+                if (o == null) return;
+
+                try
+                {
+                    if (Marshal.IsComObject(o))
+                        Marshal.ReleaseComObject(o);
+                }
+                catch (InvalidComObjectException) { }
+                catch (COMException) { }
+                catch { }
+            }
+
+            // -------- Factory ----------
+            public static SmartCom<T> Wrap(T? obj) => new SmartCom<T>(obj);
+
+            public static SmartCom<T> Wrap(object? obj) => new SmartCom<T>(obj as T);
+
+            public static SmartCom<T> Acquire(Func<T?> acquire) => new SmartCom<T>(acquire());
+        }
+
+        /// <summary>
+        /// 여러 COM 객체를 한 스코프에서 관리 (역순 해제)
+        /// - Add()/Get() 으로 등록
+        /// - Dispose 시 ReleaseComObject 1회씩
+        /// - 스레드 제약 없음
+        /// </summary>
+        public sealed class SmartComBatch : IDisposable
+        {
+            private readonly List<object?> _objs = new(32);
+            private bool _disposed;
+
+            /// <summary>등록 후 SmartCom 형태로 반환</summary>
+            public SmartCom<T> Get<T>(Func<T?> acquire) where T : class
+            {
+                var o = acquire();
+                if (o != null) _objs.Add(o);
+                return SmartCom<T>.Wrap(o);
+            }
+
+            /// <summary>이미 얻은 COM 객체를 등록</summary>
+            public void Add(object? o)
+            {
+                if (o != null) _objs.Add(o);
+            }
+
+            /// <summary>해당 객체를 해제 목록에서 제외(소유권 이전)</summary>
+            public bool Detach(object? o)
+            {
+                if (o == null) return false;
+                return _objs.Remove(o);
+            }
+
+            public void Dispose()
+            {
+                if (_disposed) return;
+                _disposed = true;
+
+                for (int i = _objs.Count - 1; i >= 0; --i)
+                {
+                    var o = _objs[i];
+                    try
+                    {
+                        if (o != null && System.Runtime.InteropServices.Marshal.IsComObject(o))
+                            System.Runtime.InteropServices.Marshal.ReleaseComObject(o);
+                    }
+                    catch (System.Runtime.InteropServices.InvalidComObjectException) { }
+                    catch (System.Runtime.InteropServices.COMException) { }
+                    catch { }
+                }
+                _objs.Clear();
+            }
+        }
+
+
+        // ───────────────────────── Mso Image Helper ─────────────────────────
+        public static class MsoImageHelper
+        {
+            /// <summary>Office 버전/PIA 차이를 피하기 위해 리플렉션으로 GetImageMso 호출.</summary>
+            public static stdole.IPictureDisp? Get(string idMso, int size = 32)
+            {
+                if (string.IsNullOrWhiteSpace(idMso)) return null;
+
+                stdole.IPictureDisp? pic;
+                try
+                {
+                    object app = ExcelDnaUtil.Application;                // Excel.Application (COM)
+                    var appType = app.GetType();
+
+                    // Application.CommandBars
+                    object commandBars = appType.InvokeMember(
+                        "CommandBars",
+                        BindingFlags.GetProperty,
+                        binder: null, target: app, args: null);
+
+                    // CommandBars.GetImageMso(string idMso, int width, int height) : IPictureDisp
+                    object? ret = commandBars.GetType().InvokeMember(
+                        "GetImageMso",
+                        BindingFlags.InvokeMethod,
+                        binder: null, target: commandBars,
+                        args: new object[] { idMso, size, size });
+
+                    pic = ret as stdole.IPictureDisp;
+
+                    return pic;
+                }
+                catch
+                {
+                    // 실패 시 null 반환 → UI는 기본 아이콘/텍스트로 진행
+                    return null;
+                }
             }
         }
 
