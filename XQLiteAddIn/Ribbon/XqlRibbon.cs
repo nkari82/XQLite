@@ -182,13 +182,13 @@ namespace XQLite.AddIn
             }
 
             // ✅ 이벤트 허브 구독: 스키마/커밋 재평가 신호
-            XqlEvents.SchemaChanged += () =>
+            XqlExcelInterop.SchemaChanged += () =>
             {
                 SetBlock(false);
                 try { _ribbon?.InvalidateControl("btnCommit"); } catch { }
             };
 
-            XqlEvents.RequestReevalCommit += () =>
+            XqlExcelInterop.RequestReevalCommit += () =>
             {
                 try { _ribbon?.InvalidateControl("btnCommit"); } catch { }
                 _ = RefreshCommitEnabled();

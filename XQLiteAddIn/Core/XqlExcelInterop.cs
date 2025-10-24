@@ -27,6 +27,10 @@ namespace XQLite.AddIn
 
         private bool _started;
 
+
+        public static event Action? SchemaChanged;   // 헤더(스키마) 편집/변경 감지
+        public static event Action? RequestReevalCommit; // 커밋 버튼 즉시 재평가
+
         // ========= 수명 주기 =========
 
         public void Start()
@@ -291,7 +295,10 @@ namespace XQLite.AddIn
                     if (hitHeader?.Value != null)
                     {
                         XqlSheetView.InvalidateHeaderCache(sh.Name);
-                        XqlEvents.RaiseSchemaChanged(); // 리본 상태 갱신
+
+                        // 리본 상태 갱신
+                        try { SchemaChanged?.Invoke(); } catch { /* ignore */ }
+                        try { RequestReevalCommit?.Invoke(); } catch { /* ignore */ }
                         return;
                     }
                 }
