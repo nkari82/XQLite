@@ -185,14 +185,21 @@ function escapeRegex(s: string) {
 }
 
 /** 메인 스키마에 admin 전용 테이블이 남아 있으면 차단 */
+// assertDataSchemaIsPure 강화
 function assertDataSchemaIsPure(db: Database.Database) {
   const rows = db.prepare(`SELECT name FROM main.sqlite_master WHERE type='table'`).all() as Array<{ name: string }>;
   const names = new Set(rows.map(r => r.name));
-  const found = [...FORBIDDEN_IN_MAIN].filter(n => names.has(n));
-  if (found.length) {
-    throw new Error(`Admin tables must NOT exist in main schema: ${found.join(', ')}. Use admin.<table> via ATTACH.`);
-  }
+
+  // 1) admin 전용 표준 테이블이 main에 있으면 즉시 차단
+  const forbidden = ['_meta', '_events', '_presence', '_locks', '_audit_log', '_row_state'];
+  const foundStd = forbidden.filter(n => names.has(n));
+  if (foundStd.length) throw new Error(`Admin tables must NOT exist in main: ${foundStd.join(', ')}`);
+
+  // 2) 어떤 이름이든 '_' 로 시작하면 main에 두지 않음(모두 admin 전용 취급)
+  const stray = [...names].filter(n => n.startsWith('_'));
+  if (stray.length) throw new Error(`Underscore-prefixed tables are not allowed in main: ${stray.join(', ')}`);
 }
+
 
 // ────────────────────────────────────────────────────────────
 // open bundle (with migration)
@@ -409,7 +416,7 @@ function ensureTable(bundle: DBBundle, table: string, key: string) {
 }
 
 // ────────────────────────────────────────────────────────────
-// GraphQL Schema
+// GraphQL Schema  (⚠ 클라이언트(XqlGqlBackend)와 정합 맞춤)
 // ────────────────────────────────────────────────────────────
 const typeDefs = /* GraphQL */ `
   scalar JSON
@@ -428,9 +435,21 @@ const typeDefs = /* GraphQL */ `
     patches: [Patch!]!
   }
 
+  "⚠ 클라이언트는 table/temp_row_key/new_id 를 기대"
   type AssignedId {
-    client_row: Int
+    table: String!
+    temp_row_key: String
+    new_id: String!
+  }
+
+  "⚠ 클라이언트는 server_version/local_version 필드를 질의"
+  type Conflict {
+    table: String!
     row_key: String!
+    column: String!
+    message: String
+    server_version: Int
+    local_version: Int
   }
 
   type UpsertResult {
@@ -438,13 +457,6 @@ const typeDefs = /* GraphQL */ `
     errors: [String!]
     conflicts: [Conflict!]
     assigned: [AssignedId!]
-  }
-
-  type Conflict {
-    table: String!
-    row_key: String!
-    column: String!
-    message: String
   }
 
   type PresenceItem {
@@ -784,6 +796,7 @@ const resolvers = {
       return { ok: true };
     },
 
+    // ✅ 수정: target 이름이 이미 존재하거나 id/PK/예약어로의 rename은 skip
     renameColumns: (_: unknown, args: { table: string; renames: Array<{ from: string; to: string }>; project?: string }, ctx: any) => {
       if (READONLY) return { ok: true };
       const bundle = bundleFrom(ctx, args.project);
@@ -792,15 +805,24 @@ const resolvers = {
 
       const reserved = new Set(['row_version', 'updated_at', 'deleted']); // defensive
       const pk = info.find(c => (c.pk | 0) > 0)?.name;
+      const exists = new Set(info.map(c => c.name));
 
       const tx = bundle.db.transaction(() => {
         for (const r of args.renames) {
-          if (!r?.from || !r?.to) continue;
-          if (pk && r.from === pk) continue;
-          if (reserved.has(r.from)) continue;
-          if (r.from === r.to) continue;
-          const sql = `ALTER TABLE ${escapeIdent(args.table)} RENAME COLUMN ${escapeIdent(r.from)} TO ${escapeIdent(r.to)}`;
+          const from = (r?.from ?? '').trim();
+          const to = (r?.to ?? '').trim();
+          if (!from || !to) continue;
+          if (from === to) continue;
+          if (pk && from === pk) continue;
+          if (reserved.has(from)) continue;
+          // 타깃이 이미 있으면 skip (특히 id 중복 방지)
+          if (exists.has(to)) continue;
+          if (RESERVED_MAIN.has(to)) continue;
+
+          const sql = `ALTER TABLE ${escapeIdent(args.table)} RENAME COLUMN ${escapeIdent(from)} TO ${escapeIdent(to)}`;
           bundle.db.exec(sql);
+          exists.delete(from);
+          exists.add(to);
         }
       });
       tx();
@@ -858,11 +880,12 @@ const resolvers = {
     },
 
     // === 신규 정책: upsertCells에서도 신규 키 허용(단, PK=id INTEGER 이어야 자동발급 가능) ===
+    // ✅ assigned { table, temp_row_key, new_id } 반환으로 정합 수정
     upsertCells: (_: unknown, args: { cells: Array<{ table: string; row_key: string; column: string; value?: string | null }>; project?: string }, ctx: any) => {
       const bundle = bundleFrom(ctx, args.project);
       if (READONLY) {
         const mv = bundle.stmts.selectMaxVersion.get() as { v: number };
-        return { max_row_version: (mv?.v ?? 0) | 0, errors: ['READONLY'], conflicts: null, assigned: [] };
+        return { max_row_version: (mv?.v ?? 0) | 0, errors: ['READONLY'], conflicts: [], assigned: [] };
       }
 
       // 스키마 보장
@@ -876,7 +899,7 @@ const resolvers = {
       for (const [table, set] of perTable) ensureColumns(bundle, table, Array.from(set));
 
       type Edit = { column: string; value: any };
-      type Group = { table: string; row_key: string | null; edits: Edit[] };
+      type Group = { table: string; row_key: string | null; tempKey?: string | null; edits: Edit[] };
 
       const groups = new Map<string, Group>();
       function isNewKey(k: string | null | undefined): boolean {
@@ -892,13 +915,13 @@ const resolvers = {
         if (!c.table || !c.column) continue;
         const newRow = isNewKey(c.row_key);
         const key = `${c.table}::${newRow ? 'NEW' : c.row_key}`;
-        const g = groups.get(key) ?? { table: c.table, row_key: newRow ? null : c.row_key, edits: [] };
+        const g = groups.get(key) ?? { table: c.table, row_key: newRow ? null : c.row_key, tempKey: newRow ? (c.row_key ?? '') : undefined, edits: [] };
         g.edits.push({ column: c.column, value: c.value ?? null });
         groups.set(key, g);
       }
 
       const errors: string[] = [];
-      const assigned: Array<{ client_row: number | null; row_key: string }> = [];
+      const assigned: Array<{ table: string; temp_row_key: string | null; new_id: string }> = [];
 
       // 트랜잭션
       const tx = bundle.db.transaction(() => {
@@ -942,7 +965,7 @@ const resolvers = {
               table_name: g.table, row_key: String(newId), row_version: rv, ts, deleted: 0,
             });
 
-            assigned.push({ client_row: null, row_key: String(newId) });
+            assigned.push({ table: g.table, temp_row_key: g.tempKey ?? null, new_id: String(newId) });
           } else {
             // 기존 키
             const before = bundle.stmts.selectRowByPk(g.table, pk, g.row_key) ?? null;
@@ -984,15 +1007,15 @@ const resolvers = {
       const mv = bundle.stmts.selectMaxVersion.get() as { v: number };
       const maxRow = (mv?.v ?? 0) | 0;
       publishEvents(bundle, Math.max(0, maxRow - BROADCAST_BACKSCAN)).catch(() => { });
-      return { max_row_version: maxRow, errors: errors.length ? errors : null, conflicts: null, assigned };
+      return { max_row_version: maxRow, errors: errors.length ? errors : null, conflicts: [], assigned };
     },
 
-    // === 핵심: upsertRows에서도 PK 미지정 행을 허용 → 서버가 id 발급 + assigned 반환 ===
+    // === 핵심: upsertRows에서도 PK 미지정 행을 허용 → 서버가 id 발급 + assigned 반환(정합 수정)
     upsertRows: (_: unknown, args: { table: string; rows: Array<Record<string, any>>; project?: string }, ctx: any) => {
       const bundle = bundleFrom(ctx, args.project);
       if (READONLY) {
         const mv = bundle.stmts.selectMaxVersion.get() as { v: number };
-        return { max_row_version: (mv?.v ?? 0) | 0, errors: ['READONLY'], conflicts: null, assigned: [] };
+        return { max_row_version: (mv?.v ?? 0) | 0, errors: ['READONLY'], conflicts: [], assigned: [] };
       }
 
       ensureTable(bundle, args.table, 'id');
@@ -1007,7 +1030,7 @@ const resolvers = {
       ensureColumns(bundle, args.table, Array.from(keys));
 
       const errors: string[] = [];
-      const assigned: Array<{ client_row: number | null; row_key: string }> = [];
+      const assigned: Array<{ table: string; temp_row_key: string | null; new_id: String }> = [];
 
       const tx2 = bundle.db.transaction(() => {
         const info2 = bundle.stmts.tableInfo(args.table);
@@ -1050,7 +1073,7 @@ const resolvers = {
               table_name: args.table, row_key: String(newId), row_version: rv, ts, deleted: 0,
             });
 
-            assigned.push({ client_row: clientRow, row_key: String(newId) });
+            assigned.push({ table: args.table, temp_row_key: clientRow != null ? String(clientRow) : null, new_id: String(newId) });
           } else {
             const row_key = row[pk];
             const before = bundle.stmts.selectRowByPk(args.table, pk, row_key) ?? null;
@@ -1092,7 +1115,7 @@ const resolvers = {
       const mv = bundle.stmts.selectMaxVersion.get() as { v: number };
       const maxRow = (mv?.v ?? 0) | 0;
       publishEvents(bundle, Math.max(0, maxRow - BROADCAST_BACKSCAN)).catch(() => { });
-      return { max_row_version: maxRow, errors: errors.length ? errors : null, conflicts: null, assigned };
+      return { max_row_version: maxRow, errors: errors.length ? errors : null, conflicts: [], assigned };
     },
 
     rebuildRowState: (_: unknown, args: { table?: string; project?: string }, ctx: any) => {
@@ -1261,12 +1284,11 @@ function rebuildTableWithAlters(
   // 변경 반영 컬럼 정의 구성
   function buildColDef(c: (typeof baseInfo)[number]) {
     const w = wants.get(c.name);
-    const typ = (w?.toType ? sqlType(w.toType) : (c.type ?? '')).trim();          // 타입 변경 반영
-    const nn = (w?.toNotNull ?? ((c.notnull | 0) === 1)) ? ' NOT NULL' : '';     // NOT NULL 변경 반영
-    const pkd = (c.pk | 0) ? ' PRIMARY KEY' : '';                                  // PK 유지 (rename은 별도에서 처리)
-    const dft = (c.dflt_value != null) ? ` DEFAULT ${c.dflt_value}` : '';          // 기본값 유지
-    const chk = (w?.toCheck && w.toCheck.trim().length > 0) ? ` CHECK(${w.toCheck.trim()})` : ''; // CHECK 변경
-    // hidden(생성/가상 컬럼)은 table_xinfo.hidden=2. 별도 구문 지원은 원본 DDL 재구성이 어려워 그대로 두되, 이름/순서 보전.
+    const typ = (w?.toType ? sqlType(w.toType) : (c.type ?? '')).trim();
+    const nn = (w?.toNotNull ?? ((c.notnull | 0) === 1)) ? ' NOT NULL' : '';
+    const pkd = (c.pk | 0) ? ' PRIMARY KEY' : '';
+    const dft = (c.dflt_value != null) ? ` DEFAULT ${c.dflt_value}` : '';
+    const chk = (w?.toCheck && w.toCheck.trim().length > 0) ? ` CHECK(${w.toCheck.trim()})` : '';
     return `${escapeIdent(c.name)}${typ ? ' ' + typ : ''}${nn}${pkd}${dft}${chk}`;
   }
 
@@ -1274,11 +1296,9 @@ function rebuildTableWithAlters(
   const tableSuffix = `${tableLevelConstraints}${fkConstraintDDL}${withoutRowid ? ' WITHOUT ROWID' : ''}`;
   const tmp = `_tmp_${table}_${Date.now().toString(36)}`;
 
-  // 이관 가능한 컬럼 교집합(이름 기준; 컬럼 rename은 호출 전 별도 처리 가정)
   const names = baseInfo.map(c => c.name);
   const colList = names.map(escapeIdent).join(', ');
 
-  // 트랜잭션 유틸
   const begin = () => db.exec('BEGIN IMMEDIATE; PRAGMA foreign_keys=OFF;');
   const commit = () => db.exec('PRAGMA foreign_keys=ON; COMMIT;');
   const rollback = () => { try { db.exec('ROLLBACK; PRAGMA foreign_keys=ON;'); } catch { } };
@@ -1286,41 +1306,27 @@ function rebuildTableWithAlters(
   try {
     begin();
 
-    // INTEGER PRIMARY KEY → AUTOINCREMENT 유지
     const patchedColsDef = newColsDef.replace(
       /\bid\b\s+INTEGER\s+PRIMARY\s+KEY\b/i,
       (m) => hasAutoInc ? `${m} AUTOINCREMENT` : m
     );
 
-    // 1) 새 테이블 생성 (테이블 레벨 제약/FK/ROWID 특성 보존)
     db.exec(`CREATE TABLE ${escapeIdent(tmp)} (${patchedColsDef}${tableSuffix ? ', ' + tableSuffix.replace(/^,\s*/, '') : ''});`);
 
-    // 2) 데이터 이관
     if (colList) {
       db.exec(`INSERT INTO ${escapeIdent(tmp)} (${colList}) SELECT ${colList} FROM ${escapeIdent(table)};`);
     }
 
-    // 3) 기존 테이블 교체
     db.exec(`DROP TABLE ${escapeIdent(table)};`);
     db.exec(`ALTER TABLE ${escapeIdent(tmp)} RENAME TO ${escapeIdent(table)};`);
 
-    // 4) 사용자 생성 인덱스 재생성
-    for (const ix of indexes) {
-      try { db.exec(ix.sql); } catch { /* 이름 충돌 등은 무시 */ }
-    }
+    for (const ix of indexes) { try { db.exec(ix.sql); } catch { } }
+    for (const tr of triggers) { try { db.exec(tr.sql); } catch { } }
 
-    // 5) 트리거 재생성
-    for (const tr of triggers) {
-      try { db.exec(tr.sql); } catch { /* 무시 */ }
-    }
-
-    // 6) FK 검증(가능한 경우)
     try {
       const fkErrs = db.prepare('PRAGMA foreign_key_check').all() as any[];
       if (fkErrs.length) throw new Error(`foreign_key_check failed: ${fkErrs.length} violation(s)`);
-    } catch {
-      // 일부 SQLite/설정에서 실패 가능 — 검증 실패 자체는 치명적 오류로 보지 않음
-    }
+    } catch { /* ignore */ }
 
     commit();
   } catch (e) {
@@ -1328,4 +1334,3 @@ function rebuildTableWithAlters(
     throw e;
   }
 }
-

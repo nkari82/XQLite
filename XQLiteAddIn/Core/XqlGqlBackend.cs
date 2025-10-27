@@ -509,7 +509,19 @@ namespace XQLite.AddIn
         // 행 단위 업서트 (PK 미포함 → 서버 자동발급 가정, 반영은 Pull로 수신)
         public async Task<UpsertResult> UpsertRows(string table, List<Dictionary<string, object?>> rows, CancellationToken ct = default)
         {
-            var req = new GraphQLRequest { Query = MUT_UPSERT_ROWS, Variables = new { table, rows } };
+            // ✅ 모든 값을 문자열로 직렬화 (서버 TEXT/스키마와 정합)
+            var normRows = rows.Select(row =>
+            {
+                var obj = new Dictionary<string, object?>(StringComparer.Ordinal);
+                foreach (var kv in row)
+                {
+                    // __row (클라 식별자)도 문자열로 보냄(서버에서 숫자 캐스팅하여 처리)
+                    obj[kv.Key] = XqlCommon.ValueToString(kv.Value);
+                }
+                return (object)obj;
+            }).ToList();
+
+            var req = new GraphQLRequest { Query = MUT_UPSERT_ROWS, Variables = new { table, rows = normRows } };
             var resp = await SendMutationSafeAsync<JObject>(req, ct).ConfigureAwait(false);
             return ParseUpsert(resp.Data);
         }
@@ -552,12 +564,13 @@ namespace XQLite.AddIn
 
         public async Task<UpsertResult> UpsertCells(IEnumerable<EditCell> cells, CancellationToken ct = default)
         {
+            // ✅ value와 row_key를 반드시 문자열화
             var payload = cells.Select(c => new
             {
                 table = c.Table,
-                row_key = c.RowKey,
+                row_key = XqlCommon.ValueToString(c.RowKey) ?? "",
                 column = c.Column,
-                value = c.Value
+                value = XqlCommon.ValueToString(c.Value)  // GraphQL: value:String
             }).ToArray();
 
             var req = new GraphQLRequest { Query = MUT_UPSERT_CELLS, Variables = new { cells = payload } };
@@ -725,24 +738,22 @@ namespace XQLite.AddIn
             return false;
         }
 
-        private static string MapType(string kind)
+        // XqlGqlBackend.cs  — IXqlBackend 구현 내부에 추가
+        private static string MapType(string? kind)
         {
-            if (string.IsNullOrWhiteSpace(kind)) return "text";
-            switch (kind.Trim().ToLowerInvariant())
-            {
-                case "int":
-                case "integer": return "integer";
-                case "real":
-                case "float":
-                case "double": return "real";
-                case "bool":
-                case "boolean": return "bool";
-                case "json": return "json";
-                case "date": return "integer"; // epoch ms
-                case "text":
-                case "string":
-                default: return "text";
-            }
+            // 허용 키워드(대소문자 무시): INT, INTEGER, REAL, FLOAT, DOUBLE, TEXT, STRING, BOOL, BOOLEAN, DATE, DATETIME, JSON
+            if (string.IsNullOrWhiteSpace(kind)) return "TEXT";
+            var k = kind!.Trim().ToUpperInvariant();
+
+            // 넉넉히 허용, 서버는 SQLite affinity로 변환
+            if (k is "INT" or "INTEGER") return "INTEGER";
+            if (k is "REAL" or "FLOAT" or "DOUBLE" or "NUMERIC") return "REAL";
+            if (k is "BOOL" or "BOOLEAN") return "INTEGER";       // SQLite에서는 0/1 정수로
+            if (k is "DATE" or "DATETIME" or "TIMESTAMP") return "INTEGER"; // epoch ms(정수)
+            if (k is "JSON") return "JSON";
+            if (k is "TEXT" or "STRING") return "TEXT";
+
+            return "TEXT";
         }
     }
 

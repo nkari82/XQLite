@@ -737,6 +737,9 @@ namespace XQLite.AddIn
         }
 
         // 셀 값을 안전하게 가져오는 헬퍼(Value2 → Date/숫자/문자 정규화)
+        // XqlExcelInterop.cs
+
+        // 셀 값을 안전하게 가져오는 헬퍼(Value2 → 그대로 반환; 날짜 강제 변환 금지)
         private static object? GetCell(Excel.Worksheet w, int row, int col)
         {
             using var c = SmartCom<Excel.Range>.Acquire(() => (Excel.Range)w.Cells[row, col]);
@@ -744,11 +747,16 @@ namespace XQLite.AddIn
             {
                 var v = c.Value?.Value2;
                 if (v == null) return null;
-                if (v is double d && XqlCommon.IsExcelDateTimeLikely(c.Value!))
-                    return DateTime.FromOADate(d);
+
+                // 🔧 날짜 추정에 따른 강제 변환 제거
+                // 기존:
+                // if (v is double d && XqlCommon.IsExcelDateTimeLikely(c.Value!))
+                //     return DateTime.FromOADate(d);
+
                 return v;
             }
             catch { return null; }
         }
+
     }
 }

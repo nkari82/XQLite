@@ -177,32 +177,6 @@ namespace XQLite.AddIn
         // String / CSV / Hash
         // =====================================================================
 
-        /// <summary>값 정규화(전송/비교용) – 모든 모듈에서 이 함수만 사용.</summary>
-        public static string? Canonicalize(object? v)
-        {
-            if (v is null) return null;
-
-            switch (v)
-            {
-                case bool b: return b ? "1" : "0";
-                case double d: return d.ToString("R", CultureInfo.InvariantCulture);
-                case float f: return ((double)f).ToString("R", CultureInfo.InvariantCulture);
-                case int i: return i.ToString(CultureInfo.InvariantCulture);
-                case long l: return l.ToString(CultureInfo.InvariantCulture);
-                case uint ui: return ui.ToString(CultureInfo.InvariantCulture);
-                case ulong ul: return ul.ToString(CultureInfo.InvariantCulture);
-                case decimal m:
-                    // 최대 29자리의 손실 없는 문자열
-                    return m.ToString("G29", CultureInfo.InvariantCulture);
-                case DateTime dt:
-                    var ms = (long)(dt.ToUniversalTime() - new DateTime(1970, 1, 1)).TotalMilliseconds;
-                    return ms.ToString(CultureInfo.InvariantCulture);
-                default:
-                    var s = v.ToString();
-                    return string.IsNullOrWhiteSpace(s) ? "" : s!;
-            }
-        }
-
         /// <summary>SHA-1 64비트 축약 지문(16 hex)</summary>
         internal static string Fingerprint(object? v)
         {
@@ -235,29 +209,61 @@ namespace XQLite.AddIn
             return needQuote ? "\"" + s.Replace("\"", "\"\"") + "\"" : s;
         }
 
-        internal static string ValueToString(object? v)
+        public static string? ValueToString(object? v)
         {
-            if (v == null) return "";
-            if (v is bool b) return b ? "TRUE" : "FALSE";
-            if (v is DateTime dt) return dt.ToString("o", CultureInfo.InvariantCulture);
-            if (v is double d) return d.ToString("R", CultureInfo.InvariantCulture);
-            if (v is float f) return ((double)f).ToString("R", CultureInfo.InvariantCulture);
-            if (v is decimal m) return m.ToString("G29", CultureInfo.InvariantCulture);
-            return Convert.ToString(v, CultureInfo.InvariantCulture) ?? "";
+            if (v == null || v is DBNull) return null;
+
+            switch (v)
+            {
+                case string s:
+                    return s; // (원본 그대로; 필요시 여기서 Normalize(FormC) 추가 가능)
+
+                case bool b:
+                    return b ? "true" : "false";
+
+                case DateTimeOffset dto:
+                    // ISO 8601 with offset (서버 텍스트 컬럼과 일관)
+                    return dto.ToString("yyyy-MM-ddTHH:mm:ss.fffK", CultureInfo.InvariantCulture);
+
+                case DateTime dt:
+                    // Kind 보존해 ISO 문자열
+                    return dt.ToString("yyyy-MM-ddTHH:mm:ss.fffK", CultureInfo.InvariantCulture);
+
+                case double or float or decimal or long or int or short or byte or sbyte or uint or ulong:
+                    return Convert.ToString(v, CultureInfo.InvariantCulture);
+
+                default:
+                    return Convert.ToString(v, CultureInfo.InvariantCulture);
+            }
+        }
+
+        public static string? Canonicalize(object? v)
+        {
+            if (v == null || v is DBNull) return null;
+
+            if (v is DateTimeOffset dto)
+                return dto.ToString("yyyy-MM-ddTHH:mm:ss.fffK", CultureInfo.InvariantCulture);
+
+            if (v is DateTime dt)
+                return dt.ToString("yyyy-MM-ddTHH:mm:ss.fffK", CultureInfo.InvariantCulture);
+
+            return ValueToString(v);
         }
 
         internal static bool EqualKey(object? a, object? b)
         {
             if (a is null && b is null) return true;
             if (a is null || b is null) return false;
-            var sa = (Convert.ToString(a, CultureInfo.InvariantCulture) ?? "").Trim();
-            var sb = (Convert.ToString(b, CultureInfo.InvariantCulture) ?? "").Trim();
+
+            var sa = (Convert.ToString(a, CultureInfo.InvariantCulture) ?? "").Trim().Normalize(NormalizationForm.FormC);
+            var sb = (Convert.ToString(b, CultureInfo.InvariantCulture) ?? "").Trim().Normalize(NormalizationForm.FormC);
             return string.Equals(sa, sb, StringComparison.Ordinal);
         }
 
+
         internal static bool IsNullish(object? v)
         {
-            if (v is null) return true;
+            if (v is null || v is DBNull) return true;
             if (v is string s) return string.IsNullOrWhiteSpace(s);
             return false;
         }
@@ -352,10 +358,25 @@ namespace XQLite.AddIn
             {
                 switch (v)
                 {
-                    case DateTime dt: value = dt; return true;
-                    case double oa: value = DateTime.FromOADate(oa); return true;
+                    case DateTime dt:
+                        value = dt; return true;
+
+                    case DateTimeOffset dto:
+                        value = dto.LocalDateTime; return true;
+
+                    case double oa:
+                        value = DateTime.FromOADate(oa); return true;
+
                     case string s:
-                        if (DateTime.TryParse(s.Trim(), CultureInfo.InvariantCulture, DateTimeStyles.AssumeLocal, out var d))
+                        var t = s.Trim();
+
+                        // ISO 8601을 먼저 시도 (오탐 최소화)
+                        if (DateTimeOffset.TryParse(t, CultureInfo.InvariantCulture,
+                                DateTimeStyles.AssumeLocal | DateTimeStyles.AllowWhiteSpaces, out var dto2))
+                        { value = dto2.LocalDateTime; return true; }
+
+                        if (DateTime.TryParse(t, CultureInfo.InvariantCulture,
+                                DateTimeStyles.AssumeLocal | DateTimeStyles.AllowWhiteSpaces, out var d))
                         { value = d; return true; }
                         break;
                 }
@@ -363,6 +384,7 @@ namespace XQLite.AddIn
             catch { }
             value = default; return false;
         }
+
 
         /// <summary>문자열로 변환하며 NFC 정규화.</summary>
         internal static string NormalizeToString(object v)
