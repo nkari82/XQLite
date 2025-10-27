@@ -64,15 +64,20 @@ function bundleFrom(ctx: any, projectArg?: string | null): DBBundle {
 }
 
 /** storage class mapping */
+// index.txt
 function sqlType(t?: string | null) {
-  const v = (t ?? '').trim().toLowerCase();
-  if (!v) return 'TEXT';
-  if (v === 'integer' || v === 'int') return 'INTEGER';
-  if (v === 'real' || v === 'float' || v === 'double') return 'REAL';
-  if (v === 'bool' || v === 'boolean') return 'INTEGER'; // 0/1
-  if (v === 'json') return 'TEXT'; // JSON in TEXT (JSON1)
-  if (v === 'text' || v === 'string') return 'TEXT';
-  return v.toUpperCase();
+  // ✅ 앞부분 토큰만 뽑아서 판정 (•, 공백, 콤마 등 구분자 허용)
+  const raw = (t ?? '').trim().toLowerCase();
+  if (!raw) return 'TEXT';
+  const head = raw.split(/[\s•,;|]+/)[0]; // 첫 토큰
+
+  if (head === 'integer' || head === 'int') return 'INTEGER';
+  if (head === 'real' || head === 'float' || head === 'double' || head === 'numeric') return 'REAL';
+  if (head === 'bool' || head === 'boolean') return 'INTEGER'; // 0/1 저장
+  if (head === 'json') return 'TEXT'; // JSON1 (TEXT)
+  if (head === 'date' || head === 'datetime' || head === 'timestamp') return 'TEXT'; // 일반적으로 TEXT ISO8601
+  if (head === 'text' || head === 'string') return 'TEXT';
+  return head.toUpperCase();
 }
 
 // ────────────────────────────────────────────────────────────
@@ -393,11 +398,13 @@ function nextRowVersion(bundle: DBBundle): number {
 const RESERVED_MAIN = new Set(['id']); // id는 서버가 관리
 
 function ensureColumns(bundle: DBBundle, table: string, columns: string[]) {
-  if (!columns.length) return;
-  const info = bundle.stmts.tableInfo(table);
-  const existing = new Set(info.map(c => c.name));
-  const toAdd = columns.filter(c => c && !existing.has(c) && !RESERVED_MAIN.has(c));
-  for (const name of toAdd) bundle.db.exec(`ALTER TABLE ${escapeIdent(table)} ADD COLUMN ${escapeIdent(name)} TEXT`);
+  if (false) {
+    if (!columns.length) return;
+    const info = bundle.stmts.tableInfo(table);
+    const existing = new Set(info.map(c => c.name));
+    const toAdd = columns.filter(c => c && !existing.has(c) && !RESERVED_MAIN.has(c));
+    for (const name of toAdd) bundle.db.exec(`ALTER TABLE ${escapeIdent(table)} ADD COLUMN ${escapeIdent(name)} TEXT`);
+  }
 }
 
 /** 기본: id INTEGER PRIMARY KEY (rowid) */
