@@ -544,6 +544,11 @@ namespace XQLite.AddIn
 
             var lo = XqlSheet.FindListObjectContaining(ws, header);
 
+            // 데이터 시작/끝 (헤더 바로 아래부터)
+            int firstDataRow = hdrRow + 1;
+            int lastDataRow = GetLastDataRowSafe(ws, header, firstDataRow, colCount);
+            if (lastDataRow < firstDataRow) lastDataRow = firstDataRow; // 최소 1행 확보
+
             for (int i = 1; i <= colCount; i++)
             {
                 using var h = SmartCom<Range>.Wrap((Excel.Range)header.Cells[1, i]);
@@ -559,33 +564,194 @@ namespace XQLite.AddIn
                 bool isIdCol = !string.IsNullOrWhiteSpace(sm.KeyColumn) &&
                                string.Equals(name, sm.KeyColumn, StringComparison.OrdinalIgnoreCase);
 
-                using var body = SmartCom<Range>.Wrap(lo?.HeaderRowRange != null
-                                            ? lo.ListColumns[i]?.DataBodyRange
-                                            : ColBelowToEnd(ws, h.Value!));
-
-                // 헤더: id만 잠금, 그 외 Unlock
+                // 헤더 자체는: id만 잠금, 나머지는 잠금 해제
                 try { if (h.Value != null) h.Value.Locked = isIdCol; } catch { }
 
-                if (body.Value != null)
+                // ── 데이터 영역 범위 계산 (헤더/필터 영역 제외) ─────────────────────
+                Excel.Range? target = null;
+                int absColForThis = hdrCol0 + i - 1;
+
+                // 1) 표가 있으면 DataBodyRange의 해당 열만 (헤더/필터 제외)
+                if (lo?.DataBodyRange != null)
+                {
+                    try
+                    {
+                        var body = lo.DataBodyRange; // null 또는 빈 표일 수 있음
+                        if (body != null && body.Rows.Count > 0)
+                        {
+                            int rel = absColForThis - body.Column + 1;
+                            if (rel >= 1 && rel <= body.Columns.Count)
+                                target = (Excel.Range)body.Columns[rel];
+                        }
+                    }
+                    catch { target = null; }
+                }
+
+                // 2) 표가 없거나 DataBodyRange가 비면: 헤더 바로 아래 ~ 마지막 데이터행
+                if (target == null)
+                {
+                    try
+                    {
+                        var tl = (Excel.Range)ws.Cells[firstDataRow, absColForThis];
+                        var br = (Excel.Range)ws.Cells[Math.Max(firstDataRow, lastDataRow), absColForThis];
+                        target = ws.Range[tl, br];
+                    }
+                    catch { target = null; }
+                }
+
+                // ── 유효성/잠금 적용 ────────────────────────────────────────────────
+                if (target != null && target.Rows.Count > 0)
                 {
                     if (isIdCol)
                     {
-                        LockIdColumn(ws, body.Value);
-                        ApplyIdBlockedValidation(body.Value);
+                        // ID: 값 입력 금지(빈칸은 허용) + 잠금
+                        try { LockIdColumn(ws, target); } catch { }
+                        try { SafeApplyIdBlockedValidation(target); } catch { }
                     }
                     else
                     {
-                        try { body.Value.Validation.Delete(); } catch { }
-                        try { body.Value.Locked = false; } catch { }
+                        // 기타 컬럼: 타입 기반 유효성, 잠금 해제
+                        try { target.Validation.Delete(); } catch { }
+                        try { target.Locked = false; } catch { }
 
                         if (!string.IsNullOrEmpty(name) && sm.Columns.TryGetValue(name!, out var ct))
-                            ApplyValidationForKind(body.Value, ct.Kind);
+                        {
+                            try { ApplyValidationForKind(target, ct.Kind); } catch { /* 타입별 실패는 무시 */ }
+                        }
                     }
                 }
             }
 
             // 보호 정책: 헤더/바디 모두 id만 잠금, 나머지는 자유
             ApplyProtectionForHeaderAndIdOnly(ws, header, sm);
+
+            // ── 로컬 헬퍼들 ────────────────────────────────────────────────────────
+            static int GetLastDataRowSafe(Excel.Worksheet w, Excel.Range hdr, int firstRow, int headerColCount)
+            {
+                try
+                {
+                    // 1) 표가 있으면 DataBodyRange 기준으로 최대 행
+                    var loX = XqlSheet.FindListObjectContaining(w, hdr);
+                    var body = loX?.DataBodyRange;
+                    if (body != null && body.Rows.Count > 0)
+                        return body.Row + body.Rows.Count - 1;
+                }
+                catch { /* ignore */ }
+
+                // 2) 각 헤더 열에서 End(xlUp)
+                int last = firstRow - 1;
+                for (int c = 0; c < Math.Max(1, headerColCount); c++)
+                {
+                    try
+                    {
+                        int absCol = hdr.Column + c;
+                        using var lastCell = SmartCom<Excel.Range>.Acquire(() => (Excel.Range)w.Cells[w.Rows.Count, absCol]);
+                        if (lastCell?.Value == null) continue;
+
+                        using var hit = SmartCom<Excel.Range>.Acquire(() => (Excel.Range)lastCell.Value.End[Excel.XlDirection.xlUp]);
+                        if (hit?.Value == null) continue;
+
+                        int candidate = hit.Value.Row;
+                        if (candidate >= firstRow && candidate > last) last = candidate;
+                    }
+                    catch { /* per-col ignore */ }
+                }
+
+                // 3) 보조: UsedRange
+                if (last < firstRow)
+                {
+                    try
+                    {
+                        using var used = SmartCom<Excel.Range>.Wrap(w.UsedRange);
+                        try { _ = used?.Value?.Address[true, true, Excel.XlReferenceStyle.xlA1, false]; } catch { }
+                        int usedLast = (used?.Value?.Row ?? 1) + (used?.Value?.Rows.Count ?? 1) - 1;
+                        last = Math.Max(last, usedLast);
+                    }
+                    catch { }
+                }
+                return Math.Max(last, firstRow);
+            }
+
+            // Validation.Add에서 0x800A03EC 방지: 헤더/필터/머지 영역 제외 + 실패 시 폴백
+            // XqlSheetView.ApplyDataValidationForHeader(...) 내부의 Local helper 교체
+            static void SafeApplyIdBlockedValidation(Excel.Range rng)
+            {
+                if (rng == null) return;
+
+                // 1) 대상 시트
+                Excel.Worksheet? ws = null;
+                try { ws = rng.Worksheet; } catch { }
+                bool reProtect = false;
+
+                // 2) 보호 해제
+                try
+                {
+                    if (ws != null && ws.ProtectContents)
+                    {
+                        ws.Unprotect(Type.Missing);
+                        reProtect = true;
+                    }
+                }
+                catch { /* ignore */ }
+
+                void ApplyOne(Excel.Range r)
+                {
+                    if (r == null) return;
+                    try { if (r.MergeCells is bool m && m) return; } catch { }
+
+                    try { r.Validation?.Delete(); } catch { }
+
+                    try
+                    {
+                        var v = r.Validation;
+                        // 로케일 독립식: 항상 거짓
+                        v.Add(
+                            Excel.XlDVType.xlValidateCustom,
+                            Excel.XlDVAlertStyle.xlValidAlertStop,
+                            Type.Missing,
+                            "=1=0",           // ← "=FALSE" 대신
+                            Type.Missing
+                        );
+                        v.ErrorTitle = "편집 차단";
+                        v.ErrorMessage = "ID 열은 서버가 관리합니다.";
+                        v.ShowError = true;
+                        v.IgnoreBlank = true;   // 빈 값은 통과
+                        try { r.Locked = true; } catch { }
+                    }
+                    catch
+                    {
+                        // 폴백: Validation 포기, 잠금만
+                        try { r.Validation?.Delete(); } catch { }
+                        try { r.Locked = true; } catch { }
+                    }
+                }
+
+                try
+                {
+                    if ((rng.Areas?.Count ?? 1) > 1)
+                        foreach (Excel.Range a in rng.Areas!) ApplyOne(a);
+                    else
+                        ApplyOne(rng);
+                }
+                finally
+                {
+                    // 3) 보호 원복(헤더+ID만 잠금 정책)
+                    if (reProtect && ws != null)
+                    {
+                        try
+                        {
+                            using var headerW = SmartCom<Excel.Range>.Wrap(GetHeaderOrFallback(ws));
+                            var sm = XqlAddIn.Sheet?.GetOrCreateSheet(ws.Name);
+                            if (headerW.Value != null && sm != null)
+                                ApplyProtectionForHeaderAndIdOnly(ws, headerW.Value, sm);
+                            else
+                                EnsureSheetProtectedUiOnly(ws);
+                        }
+                        catch { /* ignore */ }
+                    }
+                }
+            }
+
         }
 
         // ─────────────────────────────────────────────────────────────────
@@ -907,6 +1073,10 @@ namespace XQLite.AddIn
                         ApplyCells(wsW.Value, row!.Value, headerFinal, headers, smeta, patch.Cells);
                     }
                     catch { /* per-row 안전 */ }
+
+                    // ✅ 패치로 인해 Excel이 코멘트/유효성검사를 덮어쓰는 경우가 있어,
+                    //    그룹 처리 끝에 메타/유효성/툴팁/ID-잠금 등을 다시 적용한다.
+                    try { ApplyHeaderUi(wsW.Value, headerFinal, smeta, withValidation: true); } catch { }
                 }
             }
         }

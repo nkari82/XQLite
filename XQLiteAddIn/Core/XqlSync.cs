@@ -1,4 +1,10 @@
 ﻿// XqlSync.cs  (ExcelPatchApplier 포함 버전, SmartCom 적용)
+// ▶ 변경 요약
+// 1) PullSince: 빈 시트 또는 since==0 이면 서버 스키마로 [id, ...] 헤더 보장 후 rowsSnapshot 적용
+// 2) EnsureHeaderFromServerAsync: 서버 컬럼 조회 → [PK(id) + 나머지] 순서로 헤더 작성
+// 3) ApplySnapshotToSheetAsync: 헤더 이름-열 인덱스 매핑으로 스냅샷을 정확히 쓰기(열 밀림 방지)
+// 4) 기존 증분 패치/업서트/상태저장 로직은 변경 없음
+
 using ExcelDna.Integration;
 using Newtonsoft.Json.Linq;
 using System;
@@ -257,17 +263,40 @@ namespace XQLite.AddIn
 
             try
             {
-                var since = sinceOverride ?? (_forceFullPull ? 0 : MaxRowVersion);
-                var pr = await _backend.PullRows(since, _cts.Token).ConfigureAwait(false);
-
-                // 초기 상태: 패치가 없고 로컬 max==0 이면 헤더 부트스트랩
-                if ((pr.Patches == null || pr.Patches.Count == 0) && (since == 0 || MaxRowVersion == 0))
+                // ── 부트스트랩 판단: 시트가 비었거나, since==0 이거나, 강제 플래그
+                var ui = await OnExcelThreadAsync(() =>
                 {
-                    await ApplyBootstrapAsync(pr).ConfigureAwait(false);
+                    var app = ExcelDnaUtil.Application as Excel.Application;
+                    using var wsW = SmartCom<Excel.Worksheet>.Wrap(app?.ActiveSheet);
+                    if (wsW?.Value == null) return (needs: false, sheet: null as Excel.Worksheet, table: "", key: "");
+
+                    var sm = _sheet.GetOrCreateSheet(wsW.Value.Name);
+                    var table = string.IsNullOrWhiteSpace(sm.TableName) ? wsW.Value.Name : sm.TableName!;
+                    var key = string.IsNullOrWhiteSpace(sm.KeyColumn) ? "id" : sm.KeyColumn!;
+                    bool needs = XqlSheet.NeedsBootstrap(wsW.Value);
+                    return (needs: needs, sheet: wsW.Value, table, key);
+                }).ConfigureAwait(false);
+
+                var since = sinceOverride ?? (_forceFullPull ? 0 : MaxRowVersion);
+
+                if (ui.sheet != null && (ui.needs || since == 0 || MaxRowVersion == 0))
+                {
+                    // 1) 서버 스키마로 헤더 보장
+                    var header = await EnsureHeaderFromServerAsync(ui.sheet!, ui.table, ui.key).ConfigureAwait(false);
+
+                    // 2) rowsSnapshot 받아 한 방에 쓰기
+                    var snap = await _backend.FetchRowsSnapshot(ui.table, _cts.Token).ConfigureAwait(false);
+                    await ApplySnapshotToSheetAsync(ui.sheet!, ui.table, header, snap).ConfigureAwait(false);
+
+                    // 3) 상태/캐시
+                    XqlSheetView.InvalidateHeaderCache(ui.sheet!.Name);
                     _pullErr = 0;
                     _forceFullPull = false;
                     return;
                 }
+
+                // ── 기존 증분 경로
+                var pr = await _backend.PullRows(since, _cts.Token).ConfigureAwait(false);
 
                 // 증분 패치 적용
                 await ApplyIncrementalPatches(pr).ConfigureAwait(false);
@@ -305,18 +334,113 @@ namespace XQLite.AddIn
             finally { _pushSem.Release(); }
         }
 
-        // Private
+        // Private ============================================================
 
-        // 풀 전체가 처음이거나, 증분이 0건인 초기 상태에서 호출
+        // (신규) 서버 스키마 기반으로 헤더를 [PK(id) + 기타] 순으로 보장
+        private async Task<List<string>> EnsureHeaderFromServerAsync(Excel.Worksheet ws, string table, string key)
+        {
+            var cols = await _backend.GetTableColumns(table, _cts.Token).ConfigureAwait(false);
+            if (cols.Count == 0)
+            {
+                // 서버에 테이블이 아직 없을 수 있음 → 생성 후 재질의
+                await _backend.TryCreateTable(table, key, _cts.Token).ConfigureAwait(false);
+                cols = await _backend.GetTableColumns(table, _cts.Token).ConfigureAwait(false);
+            }
+
+            // 순서: PK 먼저, 나머지는 서버 순서 유지
+            string pk = cols.FirstOrDefault(c => c.pk)?.name ?? key;
+            var ordered = new List<string> { pk };
+            ordered.AddRange(cols.Where(c => !c.pk).Select(c => c.name));
+
+            // 현재 헤더와 다르면 교체
+            await OnExcelThreadAsync(() =>
+            {
+                var (hdrRange, names0) = XqlSheet.GetHeaderAndNames(ws);
+                using var hdr = SmartCom<Excel.Range>.Wrap(hdrRange ?? XqlSheet.GetHeaderRange(ws));
+                if (hdr?.Value == null) return 0;
+
+                bool same = names0.Count == ordered.Count &&
+                            names0.Zip(ordered, (a, b) => string.Equals(a, b, StringComparison.OrdinalIgnoreCase)).All(x => x);
+                if (same) return 0;
+
+                for (int i = 0; i < ordered.Count; i++)
+                {
+                    using var c = SmartCom<Excel.Range>.Acquire(() => (Excel.Range)ws.Cells[hdr.Value.Row, hdr.Value.Column + i]);
+                    try { if (c?.Value != null) c.Value!.Value2 = ordered[i]; } catch { }
+                }
+                // 남은 이전 헤더 비우기
+                for (int j = ordered.Count; j < Math.Max(ordered.Count, names0.Count); j++)
+                {
+                    using var c = SmartCom<Excel.Range>.Acquire(() => (Excel.Range)ws.Cells[hdr.Value.Row, hdr.Value.Column + j]);
+                    try { if (c?.Value != null) c.Value!.Value2 = ""; } catch { }
+                }
+                return 0;
+            }).ConfigureAwait(false);
+
+            // 메타 레지스트리에도 반영
+            _sheet.EnsureColumns(ws.Name, ordered);
+            return ordered;
+        }
+
+        // (신규) rowsSnapshot을 헤더 매핑대로 시트에 씀
+        private async Task ApplySnapshotToSheetAsync(Excel.Worksheet ws, string table, List<string> header, List<RowPatch> rows)
+        {
+            if (rows == null) rows = new List<RowPatch>();
+
+            await OnExcelThreadAsync(() =>
+            {
+                var (hdrRange, _) = XqlSheet.GetHeaderAndNames(ws);
+                using var hdr = SmartCom<Excel.Range>.Wrap(hdrRange ?? XqlSheet.GetHeaderRange(ws));
+                if (hdr?.Value == null) return 0;
+
+                int firstDataRow = hdr.Value.Row + 1;
+                int colCount = header.Count;
+
+                // 데이터 영역 Clear
+                using (var rangeAll = SmartCom<Excel.Range>.Acquire(() =>
+                    (Excel.Range)ws.Range[
+                        ws.Cells[firstDataRow, hdr.Value.Column],
+                        ws.Cells[ws.Rows.Count, hdr.Value.Column + colCount - 1]
+                    ]))
+                { try { if (rangeAll?.Value != null) rangeAll.Value!.ClearContents(); } catch { } }
+
+                // 헤더 인덱스 맵
+                var idx = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                for (int i = 0; i < header.Count; i++) idx[header[i]] = i;
+
+                int r = firstDataRow;
+                foreach (var p in rows)
+                {
+                    // 우선 id/row_key
+                    object? id = p.RowKey;
+                    if (id == null && p.Cells.TryGetValue("id", out var id2)) id = id2;
+
+                    if (id != null && idx.TryGetValue("id", out int idCol0))
+                    {
+                        using var c = SmartCom<Excel.Range>.Acquire(() => (Excel.Range)ws.Cells[r, hdr.Value.Column + idCol0]);
+                        try { if (c?.Value != null) c.Value!.Value2 = id; } catch { }
+                    }
+
+                    foreach (var kv in p.Cells)
+                    {
+                        if (!idx.TryGetValue(kv.Key, out int ci)) continue;
+                        using var c = SmartCom<Excel.Range>.Acquire(() => (Excel.Range)ws.Cells[r, hdr.Value.Column + ci]);
+                        try { if (c?.Value != null) c.Value!.Value2 = kv.Value is null ? null : kv.Value; } catch { }
+                    }
+                    r++;
+                }
+                return 0;
+            }).ConfigureAwait(false);
+        }
+
+        // (기존) 풀 전체가 처음이거나, 증분이 0건인 초기 상태에서 호출 — 사용하지 않지만 남겨둠(호환)
         private async Task ApplyBootstrapAsync(PullResult pr)
         {
-            // 1) 서버 메타 가져와서 '플랜'만 구성 (비-COM)
             var meta = await _backend.TryFetchServerMeta().ConfigureAwait(false);
             if (meta == null) return;
 
             var schema = new Dictionary<string, List<string>>(StringComparer.Ordinal);
 
-            // (A) 신형 포맷: meta.tables[{ name, key, columns }]
             if (meta["tables"] is JArray tablesNew)
             {
                 foreach (var t in tablesNew.OfType<JObject>())
@@ -324,7 +448,6 @@ namespace XQLite.AddIn
                     var tname = (t["name"] ?? t["table_name"])?.ToString();
                     if (string.IsNullOrWhiteSpace(tname)) continue;
 
-                    // columns: [ {name:..}, ... ] or [ "id","Name", ... ]
                     var cols = new List<string>();
                     if (t["columns"] is JArray ca)
                     {
@@ -337,7 +460,6 @@ namespace XQLite.AddIn
                         }
                     }
 
-                    // 컬럼이 비어있으면 서버에 질의(레거시/보강)
                     if (cols.Count == 0)
                     {
                         try
@@ -350,7 +472,6 @@ namespace XQLite.AddIn
                         catch { /* ignore */ }
                     }
 
-                    // 키 보강(id 선호)
                     var key = (t["key"] ?? t["key_column"])?.ToString();
                     key = string.IsNullOrWhiteSpace(key) ? "id" : key!;
                     if (!cols.Any(c => c.Equals(key, StringComparison.OrdinalIgnoreCase)))
@@ -363,7 +484,6 @@ namespace XQLite.AddIn
                     if (cols.Count > 0) schema[tname!] = cols;
                 }
             }
-            // (B) 레거시 포맷: meta.schema[{ table_name, key_column }]
             else if (meta["schema"] is JArray legacy)
             {
                 foreach (var t in legacy.OfType<JObject>())
@@ -392,7 +512,6 @@ namespace XQLite.AddIn
 
             if (schema.Count == 0) return;
 
-            // 2) UI 스레드에서만 Excel 만지기 (내부에서 마샬링하므로 직접 RCW 접근 없음)
             XqlSheetView.ApplyPlanAndPatches(schema, pr?.Patches);
         }
 
