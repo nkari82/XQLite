@@ -175,7 +175,7 @@ namespace XQLite.AddIn
                             if (string.IsNullOrWhiteSpace(a.NewId)) continue;
                             if (string.IsNullOrWhiteSpace(a.TempRowKey)) continue;
 
-                            if (tempRowKeyToExcelRow.TryGetValue(a.TempRowKey, out var rowIdx))
+                            if (tempRowKeyToExcelRow.TryGetValue(a.TempRowKey!, out var rowIdx))
                             {
                                 using var keyCell = SmartCom<Excel.Range>.Acquire(() => (Excel.Range)ws.Value.Cells[rowIdx, header.Value.Column + keyIdx1 - 1]);
                                 try
