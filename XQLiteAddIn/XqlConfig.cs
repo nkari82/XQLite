@@ -33,6 +33,8 @@ namespace XQLite.AddIn
         [JsonProperty]
         public static bool AlwaysFullPullOnStartup { get; set; } = true;
         [JsonProperty]
+        public static bool EnableSheetLog { get; set; } = false;
+        [JsonProperty]
         public static bool FullPullWhenSchemaChanged { get; set; } = true;
         [JsonProperty]
         public static string StateDirName { get; set; } = ".xql";

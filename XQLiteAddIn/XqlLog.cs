@@ -34,6 +34,9 @@ namespace XQLite.AddIn
         // ─────────────────────────────────────────────────────────────────
         public static void Log(string level, string msg, string? sheet, string? address)
         {
+            if (!XqlConfig.EnableSheetLog)
+                return; // 파일 로거는 위 Info/Warn/Error에서 이미 기록됨
+
             // UI 스레드에서만 Excel COM 호출
             ExcelAsyncUtil.QueueAsMacro(() =>
             {

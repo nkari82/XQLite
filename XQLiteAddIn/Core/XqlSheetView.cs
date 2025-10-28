@@ -66,48 +66,14 @@ namespace XQLite.AddIn
 
                 using (new XqlCommon.ExcelBatchScope(app))
                 {
-                    // 좌표/폭 캡처
-                    int row0 = candW.Value.Row, col0 = candW.Value.Column, cols0 = candW.Value.Columns.Count;
+                    // 기존에는 여기서 idIdx1 계산/이동/Range 재구성/이름 재수집을 각각 수행
+                    // ⬇️ 공통 루틴으로 단일화
+                    var (newHeaderRaw, names2) = EnsureIdFirstAndRebuildHeader(wsW.Value, candW.Value, keyName);
+                    using var newHeaderW = SmartCom<Range>.Wrap(newHeaderRaw);
 
-                    // id 위치 (1-based)
-                    int idIdx1 = -1;
-                    for (int i = 0; i < names.Count; i++)
-                        if (string.Equals(names[i], keyName, StringComparison.OrdinalIgnoreCase)) { idIdx1 = i + 1; break; }
-
-                    if (idIdx1 == 1)
-                    {
-                        // nothing
-                    }
-                    else if (idIdx1 < 0)
-                    {
-                        using var idCell = SmartCom<Range>.Wrap((Excel.Range)wsW.Value.Cells[row0, col0]);
-                        if (idCell.Value != null) idCell.Value.Value2 = keyName; // 첫 열을 id로 ‘지정’
-                    }
-                    else
-                    {
-                        int idAbsCol = col0 + (idIdx1 - 1);
-                        using var srcCol = SmartCom<Range>.Wrap((Excel.Range)wsW.Value.Columns[idAbsCol]);
-                        using var dest = SmartCom<Range>.Wrap((Excel.Range)wsW.Value.Cells[row0, col0]);
-                        try { srcCol.Value?.Cut(dest.Value); } catch { /* 보호/공유 등 이동 막힘 무시 */ }
-                    }
-
-                    // 이동/변경 후 헤더 범위를 재구성(폭 유지: cols0)
-                    using var s = SmartCom<Range>.Wrap((Excel.Range)wsW.Value.Cells[row0, col0]);
-                    using var e = SmartCom<Range>.Wrap((Excel.Range)wsW.Value.Cells[row0, col0 + cols0 - 1]);
-                    using var newHeader = SmartCom<Range>.Wrap(wsW.Value.Range[s.Value, e.Value]);
-
-                    if (newHeader.Value != null)
-                    {
-                        // candW는 using 종료 시 자동 해제. 이후 newHeader로 교체
-                        names = BuildHeaderNames(newHeader.Value);
-                        sheet.EnsureColumns(wsW.Value.Name, names);
-
-                        // UI/검증
-                        ApplyHeaderUi(wsW.Value, newHeader.Value, sm, withValidation: true);
-
-                        // 마커
-                        XqlSheet.SetHeaderMarker(wsW.Value, newHeader.Value);
-                    }
+                    sheet.EnsureColumns(wsW.Value.Name, names2);
+                    ApplyHeaderUi(wsW.Value, newHeaderW.Value!, sm, withValidation: true);
+                    XqlSheet.SetHeaderMarker(wsW.Value, newHeaderW.Value!);
                 }
 
                 // 캐시 무효화
@@ -187,38 +153,12 @@ namespace XQLite.AddIn
 
                 using (new XqlCommon.ExcelBatchScope(app))
                 {
-                    int row0 = headerW.Value.Row, col0 = headerW.Value.Column, cols0 = headerW.Value.Columns.Count;
+                    var (newHeaderRaw, names2) = EnsureIdFirstAndRebuildHeader(wsW.Value, headerW.Value, keyName);
+                    using var newHeaderW = SmartCom<Range>.Wrap(newHeaderRaw);
 
-                    var names = BuildHeaderNames(headerW.Value);
-                    int idIdx1 = -1;
-                    for (int i = 0; i < names.Count; i++)
-                        if (string.Equals(names[i], keyName, StringComparison.OrdinalIgnoreCase)) { idIdx1 = i + 1; break; }
-
-                    if (idIdx1 == 1)
-                    {
-                        // nothing
-                    }
-                    else if (idIdx1 < 0)
-                    {
-                        using var idCell = SmartCom<Range>.Wrap((Excel.Range)wsW.Value.Cells[row0, col0]);
-                        if (idCell.Value != null) idCell.Value.Value2 = keyName;
-                    }
-                    else
-                    {
-                        int idAbsCol = col0 + (idIdx1 - 1);
-                        using var srcCol = SmartCom<Range>.Wrap((Excel.Range)wsW.Value.Columns[idAbsCol]);
-                        using var dest = SmartCom<Range>.Wrap((Excel.Range)wsW.Value.Cells[row0, col0]);
-                        try { srcCol.Value?.Cut(dest.Value); } catch { /* ignore */ }
-                    }
-
-                    using var s = SmartCom<Range>.Wrap((Excel.Range)wsW.Value.Cells[row0, col0]);
-                    using var e = SmartCom<Range>.Wrap((Excel.Range)wsW.Value.Cells[row0, col0 + cols0 - 1]);
-                    using var newHeader = SmartCom<Range>.Wrap(wsW.Value.Range[s.Value, e.Value]);
-
-                    Excel.Range hdrFinal = headerW.Value;
-                    if (newHeader.Value != null) hdrFinal = newHeader.Value;
-
-                    ApplyHeaderUi(wsW.Value, hdrFinal, sm, withValidation: true);
+                    sheet.EnsureColumns(wsW.Value.Name, names2);
+                    ApplyHeaderUi(wsW.Value, newHeaderW.Value!, sm, withValidation: true);
+                    XqlSheet.SetHeaderMarker(wsW.Value, newHeaderW.Value!);
                 }
 
                 InvalidateHeaderCache(wsW.Value.Name);
@@ -1089,6 +1029,55 @@ namespace XQLite.AddIn
 
                 return (object?)null;
             });
+        }
+
+        /// <summary>
+        /// 헤더 영역에서 keyName 열을 첫번째로 보정하고(필요시 이동), 새 헤더 Range와 컬럼명 목록을 반환.
+        /// </summary>
+        private static (Excel.Range newHeader, List<string> names) EnsureIdFirstAndRebuildHeader(
+            Excel.Worksheet ws, Excel.Range header, string keyName)
+        {
+            if (ws == null || header == null) throw new ArgumentNullException(nameof(header));
+
+            using var headerW = SmartCom<Excel.Range>.Wrap(header);
+            int row0 = headerW.Value!.Row, col0 = headerW.Value.Column, cols0 = headerW.Value.Columns.Count;
+
+            // 1) 현재 헤더 이름들 수집
+            var names = BuildHeaderNames(headerW.Value);
+
+            // 2) keyName 위치 파악(1-based)
+            int idIdx1 = -1;
+            for (int i = 0; i < names.Count; i++)
+                if (string.Equals(names[i], keyName, StringComparison.OrdinalIgnoreCase)) { idIdx1 = i + 1; break; }
+
+            // 3) id가 없으면 첫 셀에 채워넣고, 있으면 필요시 첫 열로 이동
+            if (idIdx1 < 0)
+            {
+                using var idCell = SmartCom<Excel.Range>.Wrap((Excel.Range)ws.Cells[row0, col0]);
+                try { if (idCell.Value != null) idCell.Value.Value2 = keyName; } catch { /* ignore */ }
+            }
+            else if (idIdx1 != 1)
+            {
+                int idAbsCol = col0 + (idIdx1 - 1);
+                using var srcCol = SmartCom<Excel.Range>.Wrap((Excel.Range)ws.Columns[idAbsCol]);
+                using var dest = SmartCom<Excel.Range>.Wrap((Excel.Range)ws.Cells[row0, col0]);
+                try
+                {
+                    srcCol.Value?.Copy(dest.Value);
+                    srcCol.Value?.Clear();
+                }
+                catch { /* Excel이 간헐적으로 실패해도 이후 Rebuild에서 수습 */ }
+            }
+
+            // 4) UsedRange로 새 헤더 범위 재구성(폭/시작 위치가 바뀌었을 수 있으므로)
+            using var used = SmartCom<Excel.Range>.Wrap(ws.UsedRange as Excel.Range);
+            var start = SmartCom<Excel.Range>.Wrap((Excel.Range)ws.Cells[row0, col0]);
+            var end = SmartCom<Excel.Range>.Wrap((Excel.Range)ws.Cells[row0, col0 + Math.Max(0, cols0 - 1)]);
+            using var newHeaderW = SmartCom<Excel.Range>.Wrap(ws.Range[start.Value, end.Value]);
+
+            // 5) 이름 목록 다시 읽어 최신화
+            var newNames = BuildHeaderNames(newHeaderW.Value!);
+            return (newHeaderW.Detach()!, newNames);
         }
 
         // ───────────────────────── 패치 엔진
