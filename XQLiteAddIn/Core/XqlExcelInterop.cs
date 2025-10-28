@@ -27,7 +27,6 @@ namespace XQLite.AddIn
 
         private bool _started;
 
-
         public static event Action? SchemaChanged;   // 헤더(스키마) 편집/변경 감지
         public static event Action? RequestReevalCommit; // 커밋 버튼 즉시 재평가
 
@@ -74,8 +73,8 @@ namespace XQLite.AddIn
         }
 
         // 베스트: 행 단위 커밋
-        // - 기존행(id 있음) → upsertRows
-        // - 신규행(id 없음) → upsertCells(임시키 포함) → assigned로 id 반영
+        // - 기존행(id 있음/없음 모두) → upsertRows로 통일
+        // - 신규행(id 없음 + 빈 행 포함) → __row만 보내도 서버가 id 선발급(assigned로 id 반영)
         public async void Cmd_CommitSync()
         {
             try
@@ -110,9 +109,8 @@ namespace XQLite.AddIn
                     return;
                 }
 
-                // 분기: 기존행/신규행
+                // === 행 스냅샷 구성: upsertRows 한 번으로 전송 ===
                 var rowsForUpsertRows = new List<Dictionary<string, object?>>();
-                var cellsForUpsertCells = new List<EditCell>();
                 var tempRowKeyToExcelRow = new Dictionary<string, int>(StringComparer.Ordinal);
 
                 for (int r = firstDataRow; r <= lastDataRow; r++)
@@ -120,83 +118,74 @@ namespace XQLite.AddIn
                     object? idVal = GetCell(ws.Value, r, header.Value.Column + keyIdx1 - 1);
                     string idStr = XqlCommon.Canonicalize(idVal) ?? "";
 
+                    // 행 객체 생성
                     var obj = new Dictionary<string, object?>(StringComparer.Ordinal);
+
+                    // 비즈니스 컬럼 수집
                     for (int i = 0; i < headers.Count; i++)
                     {
                         var col = headers[i];
                         if (string.IsNullOrWhiteSpace(col)) continue;
+
                         object? v = GetCell(ws.Value, r, header.Value.Column + i);
+
                         if (string.Equals(col, keyName, StringComparison.OrdinalIgnoreCase))
-                        {
-                            if (!string.IsNullOrWhiteSpace(idStr))
-                                obj[keyName] = idStr;
-                            continue;
-                        }
+                            continue; // PK는 별도로
+
                         obj[col] = v is DateTime dt ? dt : v;
                     }
 
-                    bool anyData = obj.Any(kv =>
-                        !kv.Key.Equals(keyName, StringComparison.OrdinalIgnoreCase) &&
-                        kv.Value != null &&
-                        !string.IsNullOrWhiteSpace(Convert.ToString(kv.Value)));
-                    if (!anyData && string.IsNullOrWhiteSpace(idStr)) continue;
+                    // 이 행이 “데이터 하나라도 있는가?”
+                    bool anyData = obj.Any(kv => kv.Value != null && !string.IsNullOrWhiteSpace(Convert.ToString(kv.Value)));
 
                     if (!string.IsNullOrWhiteSpace(idStr))
                     {
+                        // 기존행: PK 포함해서 전송
                         obj[keyName] = idStr;
                         rowsForUpsertRows.Add(obj);
                     }
                     else
                     {
-                        string tempKey = "-" + r.ToString();
-                        tempRowKeyToExcelRow[tempKey] = r;
+                        // 신규행: __row(엑셀 행번호) 부여
+                        // - anyData==false(완전 빈 행)이라도 __row만 담아 전송 → 서버가 DEFAULT VALUES로 id만 선발급
+                        string clientRowKey = r.ToString();
+                        obj["__row"] = clientRowKey;
 
-                        foreach (var kv in obj)
-                        {
-                            if (string.Equals(kv.Key, keyName, StringComparison.OrdinalIgnoreCase)) continue; // PK 제외
-                            var val = kv.Value;
-                            cellsForUpsertCells.Add(new EditCell(
-                                ws.Value.Name,
-                                tempKey,
-                                kv.Key,
-                                val
-                            ));
-                        }
+                        // 매핑용 캐시
+                        tempRowKeyToExcelRow[clientRowKey] = r;
+
+                        rowsForUpsertRows.Add(obj);
                     }
                 }
 
                 // 서버 호출 (⚠ await 전에는 RCW를 더 이상 들고있지 않음 — 모두 값으로만 유지)
                 if (XqlAddIn.Backend is IXqlBackend be)
                 {
-                    // 3-a) 기존행: upsertRows
-                    if (rowsForUpsertRows.Count > 0)
-                    {
-                        var resp = await be.UpsertRows(ws.Value.Name, rowsForUpsertRows).ConfigureAwait(false);
-                        if (resp?.Errors is { Count: > 0 })
-                            XqlLog.Warn("Commit errors (upsertRows): " + string.Join("; ", resp.Errors));
-                    }
+                    var resp = await be.UpsertRows(ws.Value.Name, rowsForUpsertRows).ConfigureAwait(false);
+                    if (resp?.Errors is { Count: > 0 })
+                        XqlLog.Warn("Commit errors (upsertRows): " + string.Join("; ", resp.Errors));
 
-                    // 3-b) 신규행: upsertCells (assigned 처리)
-                    if (cellsForUpsertCells.Count > 0)
+                    // 서버가 발급한 id를 시트에 반영
+                    if (resp?.Assigned is { Count: > 0 })
                     {
-                        var resp2 = await be.UpsertCells(cellsForUpsertCells).ConfigureAwait(false);
-                        if (resp2?.Errors is { Count: > 0 })
-                            XqlLog.Warn("Commit errors (upsertCells): " + string.Join("; ", resp2.Errors));
-
-                        // 서버가 발급한 id를 시트에 반영
-                        if (resp2?.Assigned is { Count: > 0 })
+                        foreach (var a in resp.Assigned)
                         {
-                            foreach (var a in resp2.Assigned)
-                            {
-                                if (a == null) continue;
-                                if (!string.Equals(a.Table, ws.Value.Name, StringComparison.Ordinal)) continue;
-                                if (string.IsNullOrWhiteSpace(a.NewId)) continue;
-                                if (a.TempRowKey == null) continue;
+                            if (a == null) continue;
+                            if (!string.Equals(a.Table, ws.Value.Name, StringComparison.Ordinal)) continue;
+                            if (string.IsNullOrWhiteSpace(a.NewId)) continue;
+                            if (string.IsNullOrWhiteSpace(a.TempRowKey)) continue;
 
-                                if (tempRowKeyToExcelRow.TryGetValue(a.TempRowKey, out var rowIdx))
+                            if (tempRowKeyToExcelRow.TryGetValue(a.TempRowKey, out var rowIdx))
+                            {
+                                using var keyCell = SmartCom<Excel.Range>.Acquire(() => (Excel.Range)ws.Value.Cells[rowIdx, header.Value.Column + keyIdx1 - 1]);
+                                try
                                 {
-                                    using var keyCell = SmartCom<Excel.Range>.Acquire(() => (Excel.Range)ws.Value.Cells[rowIdx, header.Value.Column + keyIdx1 - 1]);
-                                    try { if (keyCell.Value != null) keyCell.Value.Value2 = a.NewId; } catch { }
+                                    // ✅ 값 유무와 무관하게 강제 기록 (이전 코드의 null 체크로 인해 비어있으면 안 써지던 문제 수정)
+                                    if (keyCell?.Value != null) keyCell.Value.Value2 = a.NewId;
+                                }
+                                catch
+                                {
+                                    try { if (keyCell != null) keyCell.Value!.Value2 = a.NewId; } catch { }
                                 }
                             }
                         }
@@ -736,9 +725,6 @@ namespace XQLite.AddIn
             return list;
         }
 
-        // 셀 값을 안전하게 가져오는 헬퍼(Value2 → Date/숫자/문자 정규화)
-        // XqlExcelInterop.cs
-
         // 셀 값을 안전하게 가져오는 헬퍼(Value2 → 그대로 반환; 날짜 강제 변환 금지)
         private static object? GetCell(Excel.Worksheet w, int row, int col)
         {
@@ -747,16 +733,9 @@ namespace XQLite.AddIn
             {
                 var v = c.Value?.Value2;
                 if (v == null) return null;
-
-                // 🔧 날짜 추정에 따른 강제 변환 제거
-                // 기존:
-                // if (v is double d && XqlCommon.IsExcelDateTimeLikely(c.Value!))
-                //     return DateTime.FromOADate(d);
-
                 return v;
             }
             catch { return null; }
         }
-
     }
 }

@@ -64,7 +64,6 @@ function bundleFrom(ctx: any, projectArg?: string | null): DBBundle {
 }
 
 /** storage class mapping */
-// index.txt
 function sqlType(t?: string | null) {
   // ✅ 앞부분 토큰만 뽑아서 판정 (•, 공백, 콤마 등 구분자 허용)
   const raw = (t ?? '').trim().toLowerCase();
@@ -803,7 +802,7 @@ const resolvers = {
       return { ok: true };
     },
 
-    // ✅ 수정: target 이름이 이미 존재하거나 id/PK/예약어로의 rename은 skip
+    // ✅ rename 보호: target 이름이 이미 존재하거나 id/PK/예약어로의 rename은 skip
     renameColumns: (_: unknown, args: { table: string; renames: Array<{ from: string; to: string }>; project?: string }, ctx: any) => {
       if (READONLY) return { ok: true };
       const bundle = bundleFrom(ctx, args.project);
@@ -822,7 +821,6 @@ const resolvers = {
           if (from === to) continue;
           if (pk && from === pk) continue;
           if (reserved.has(from)) continue;
-          // 타깃이 이미 있으면 skip (특히 id 중복 방지)
           if (exists.has(to)) continue;
           if (RESERVED_MAIN.has(to)) continue;
 
@@ -886,8 +884,7 @@ const resolvers = {
       return { ok: true };
     },
 
-    // === 신규 정책: upsertCells에서도 신규 키 허용(단, PK=id INTEGER 이어야 자동발급 가능) ===
-    // ✅ assigned { table, temp_row_key, new_id } 반환으로 정합 수정
+    // === upsertCells: 임시 row_key인데 실질 편집이 없으면 id만 선발급 + 감사/이벤트/row_state ===
     upsertCells: (_: unknown, args: { cells: Array<{ table: string; row_key: string; column: string; value?: string | null }>; project?: string }, ctx: any) => {
       const bundle = bundleFrom(ctx, args.project);
       if (READONLY) {
@@ -943,36 +940,50 @@ const resolvers = {
           const kv: Record<string, any> = {};
           for (const e of g.edits) if (cols.includes(e.column)) kv[e.column] = e.value;
 
+          const hasRealEdit = cols.some(c => {
+            const v = kv[c];
+            return v != null && String(v).length > 0;
+          });
+
           const rv = nextRowVersion(bundle);
           const ts = nowMs();
 
           if (g.row_key == null) {
-            // 신규
+            // 신규: (A) 편집 없음 → id만 선발급, (B) 편집 있음 → id 발급 후 UPDATE
             if (!(pk === 'id' && (pkType === '' || pkType === 'INTEGER'))) {
               errors.push(`table ${g.table} has non-integer primary key; cannot auto-assign`);
               continue;
             }
+
+            // 공통: id 발급
             const infoIns = bundle.db.prepare(`INSERT INTO ${escapeIdent(g.table)} DEFAULT VALUES`).run();
             const newId = Number(infoIns.lastInsertRowid);
 
-            if (cols.length > 0) {
+            if (hasRealEdit && cols.length > 0) {
               const sets = cols.map(c => `${escapeIdent(c)}=@${c}`).join(', ');
               const param = { ...kv, id: newId };
               bundle.db.prepare(`UPDATE ${escapeIdent(g.table)} SET ${sets} WHERE id=@id`).run(param);
             }
 
+            // 감사/이벤트/row_state 기록(편집이 없으면 cells='{}')
             bundle.stmts.auditInsert.run({
               ts, user: 'excel', table_name: g.table, row_key: String(newId),
-              column: '(new)', old_value: null, new_value: null, row_version: rv,
+              column: hasRealEdit ? '(new)' : '(alloc)', old_value: null, new_value: null, row_version: rv,
             });
             bundle.stmts.insertEvent.run({
-              row_version: rv, ts, table_name: g.table, row_key: String(newId), deleted: 0, cells: JSON.stringify(kv),
+              row_version: rv, ts, table_name: g.table, row_key: String(newId), deleted: 0,
+              cells: JSON.stringify(hasRealEdit ? kv : {}),
             });
             bundle.stmts.rowStateUpsert.run({
               table_name: g.table, row_key: String(newId), row_version: rv, ts, deleted: 0,
             });
 
             assigned.push({ table: g.table, temp_row_key: g.tempKey ?? null, new_id: String(newId) });
+
+            if (!hasRealEdit) {
+              // 편집이 전혀 없으면 여기서 끝
+              continue;
+            }
           } else {
             // 기존 키
             const before = bundle.stmts.selectRowByPk(g.table, pk, g.row_key) ?? null;
@@ -1017,7 +1028,7 @@ const resolvers = {
       return { max_row_version: maxRow, errors: errors.length ? errors : null, conflicts: [], assigned };
     },
 
-    // === 핵심: upsertRows에서도 PK 미지정 행을 허용 → 서버가 id 발급 + assigned 반환(정합 수정)
+    // === upsertRows: PK 미지정 행 허용 → 서버가 id 발급 + 감사/이벤트/row_state + assigned ===
     upsertRows: (_: unknown, args: { table: string; rows: Array<Record<string, any>>; project?: string }, ctx: any) => {
       const bundle = bundleFrom(ctx, args.project);
       if (READONLY) {
@@ -1037,7 +1048,7 @@ const resolvers = {
       ensureColumns(bundle, args.table, Array.from(keys));
 
       const errors: string[] = [];
-      const assigned: Array<{ table: string; temp_row_key: string | null; new_id: String }> = [];
+      const assigned: Array<{ table: string; temp_row_key: string | null; new_id: string }> = [];
 
       const tx2 = bundle.db.transaction(() => {
         const info2 = bundle.stmts.tableInfo(args.table);
@@ -1051,11 +1062,16 @@ const resolvers = {
           const kv: Record<string, any> = {};
           for (const c of cols) kv[c] = row[c];
 
+          const hasAnyUserValue = cols.some(c => {
+            const v = kv[c];
+            return v != null && String(v).length > 0;
+          });
+
           const rv = nextRowVersion(bundle);
           const ts = nowMs();
 
           if (!hasPk) {
-            // 새 행: PK=id INTEGER 인 경우만 자동 발급
+            // 새 행: PK=id INTEGER 인 경우만 자동 발급 (값이 없어도 허용)
             if (!(pk === 'id' && (pkType === '' || pkType === 'INTEGER'))) {
               errors.push(`upsertRows: table ${args.table} has non-integer PK; cannot auto-assign for rows without PK`);
               continue;
@@ -1063,7 +1079,7 @@ const resolvers = {
             const infoIns = bundle.db.prepare(`INSERT INTO ${escapeIdent(args.table)} DEFAULT VALUES`).run();
             const newId = Number(infoIns.lastInsertRowid);
 
-            if (cols.length > 0) {
+            if (hasAnyUserValue && cols.length > 0) {
               const sets = cols.map(c => `${escapeIdent(c)}=@${c}`).join(', ');
               const param = { ...kv, id: newId };
               bundle.db.prepare(`UPDATE ${escapeIdent(args.table)} SET ${sets} WHERE id=@id`).run(param);
@@ -1071,10 +1087,11 @@ const resolvers = {
 
             bundle.stmts.auditInsert.run({
               ts, user: 'excel', table_name: args.table, row_key: String(newId),
-              column: '(new)', old_value: null, new_value: null, row_version: rv,
+              column: hasAnyUserValue ? '(new)' : '(alloc)', old_value: null, new_value: null, row_version: rv,
             });
             bundle.stmts.insertEvent.run({
-              row_version: rv, ts, table_name: args.table, row_key: String(newId), deleted: 0, cells: JSON.stringify(kv),
+              row_version: rv, ts, table_name: args.table, row_key: String(newId), deleted: 0,
+              cells: JSON.stringify(hasAnyUserValue ? kv : {}),
             });
             bundle.stmts.rowStateUpsert.run({
               table_name: args.table, row_key: String(newId), row_version: rv, ts, deleted: 0,

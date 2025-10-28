@@ -1,4 +1,4 @@
-﻿// XqlGqlBackend.cs (async-first, index.ts 프로토콜 정렬 + 안정화 강화를 위한 개정판)
+﻿// XqlGqlBackend.cs (async-first, index.ts 프로토콜 정렬 + 안정화 강화)
 
 using GraphQL;
 using GraphQL.Client.Http;
@@ -506,7 +506,7 @@ namespace XQLite.AddIn
             return arr.Where(p => p != null).ToArray();
         }
 
-        // 행 단위 업서트 (PK 미포함 → 서버 자동발급 가정, 반영은 Pull로 수신)
+        // 행 단위 업서트 (PK 미포함 → 서버 자동발급 가정, 반영은 Pull/Subscription으로 수신)
         public async Task<UpsertResult> UpsertRows(string table, List<Dictionary<string, object?>> rows, CancellationToken ct = default)
         {
             // ✅ 모든 값을 문자열로 직렬화 (서버 TEXT/스키마와 정합)
@@ -575,35 +575,7 @@ namespace XQLite.AddIn
 
             var req = new GraphQLRequest { Query = MUT_UPSERT_CELLS, Variables = new { cells = payload } };
             var resp = await SendMutationSafeAsync<JObject>(req, ct).ConfigureAwait(false);
-
-            var root = resp.Data?["upsertCells"] as JObject;
-            if (root == null) throw new Exception("upsertCells: empty response");
-
-            return new UpsertResult
-            {
-                MaxRowVersion = (long?)root["max_row_version"] ?? 0,
-                Errors = root["errors"] is JArray ea ? ea.Select(x => x?.ToString() ?? "").ToList() : null,
-                Conflicts = root["conflicts"] is JArray ca ? ca.OfType<JObject>().Select(c => new Conflict
-                {
-                    Kind = "conflict",
-                    Table = c["table"]?.ToString() ?? "",
-                    RowKey = c["row_key"]?.ToObject<object>(),
-                    Column = c["column"]?.ToString(),
-                    Message = c["message"]?.ToString() ?? "",
-                    ServerVersion = (long?)c["server_version"],
-                    LocalVersion = (long?)c["local_version"],
-                }).ToList() : null,
-                Assigned = root["assigned"] is JArray aa ? aa
-                    .OfType<JObject>()
-                    .Select(a => new AssignedId
-                    {
-                        Table = a["table"]?.ToString() ?? "",
-                        TempRowKey = a["temp_row_key"]?.ToString(),
-                        NewId = a["new_id"]?.ToString() ?? ""
-                    })
-                    .Where(x => !string.IsNullOrWhiteSpace(x.NewId))
-                    .ToList() : null
-            };
+            return ParseUpsert(resp.Data);
         }
 
         public async Task<List<ColumnInfo>> GetTableColumns(string table, CancellationToken ct = default)
@@ -642,6 +614,8 @@ namespace XQLite.AddIn
             if (u["errors"] is JArray errs)
                 foreach (var e in errs) res.Errors!.Add(e?.ToString() ?? "");
 
+            if (res.Errors != null && res.Errors.Count == 0) res.Errors = null;
+
             if (u["conflicts"] is JArray cts)
             {
                 foreach (var c in cts.OfType<JObject>())
@@ -658,6 +632,8 @@ namespace XQLite.AddIn
                     });
                 }
             }
+            if (res.Conflicts != null && res.Conflicts.Count == 0) res.Conflicts = null;
+
             return res;
         }
 
