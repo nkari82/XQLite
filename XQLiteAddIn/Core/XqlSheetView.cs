@@ -307,6 +307,110 @@ namespace XQLite.AddIn
             return null;
         }
 
+
+        // 파일: XqlSheetView.cs 내부 (클래스 XqlSheetView 끝부분 가까이 아무 위치에 추가)
+
+        /// <summary>
+        /// 현재 선택이 "헤더의 한 컬럼 셀"을 정확히 가리키는지 판정.
+        /// - 헤더와 교차하지 않거나, 여러 셀을 선택했거나(헤더 여러 칸) 하면 false.
+        /// - 성공 시 headerCell(헤더 셀)과 colName(컬럼명) 반환.
+        /// </summary>
+        public static bool TryGetHeaderSelectedColumn(
+            Excel.Worksheet ws,
+            out Excel.Range? headerCell,
+            out string? colName)
+        {
+            headerCell = null; colName = null;
+            if (ws == null) return false;
+
+            // 실제 헤더 범위(마커 우선, 없으면 1행의 유효 헤더)
+            var hdr = GetHeaderOrFallback(ws);
+            if (hdr == null) return false;
+
+            // 현재 선택
+            Excel.Range? sel = null;
+            try { sel = (Excel.Range)ws.Application.Selection; } catch { }
+
+            if (sel == null) return false;
+
+            // 선택과 헤더가 교차하는지
+            var inter = XqlCommon.IntersectSafe(ws, hdr, sel);
+            if (inter == null) return false;
+
+            // "헤더의 정확히 한 셀"만 선택된 경우만 허용
+            int cells = 1;
+            try { cells = inter.Cells.Count; } catch { }
+            if (cells != 1) return false;
+
+            // 반환용 셀
+            Excel.Range cell;
+            try { cell = (Excel.Range)inter.Cells[1, 1]; } catch { return false; }
+
+            // 컬럼명 계산 (비어 있으면 A/B/C 같은 레터)
+            string name = null!;
+            try { name = Convert.ToString(cell.Value2)?.Trim() ?? ""; } catch { }
+            if (string.IsNullOrEmpty(name))
+            {
+                try { name = XqlCommon.ColumnIndexToLetter(cell.Column); } catch { name = ""; }
+            }
+            if (string.IsNullOrEmpty(name)) return false;
+
+            headerCell = cell;
+            colName = name;
+            return true;
+        }
+
+        /// <summary>
+        /// 헤더가 아닌 선택일 때만 경고를 띄우고 false를 반환.
+        /// 헤더의 정확한 한 컬럼이 선택된 상태라면 true.
+        /// (리본 핸들러에서 그대로 호출해 사용)
+        /// </summary>
+        public static bool EnsureHeaderColumnSelectionOrWarn(Excel.Worksheet ws, string title = "XQLite")
+        {
+            if (TryGetHeaderSelectedColumn(ws, out _, out _))
+                return true;
+
+            try
+            {
+                MessageBox.Show("컬럼 타입은 '헤더의 한 셀'을 선택한 상태에서만 변경할 수 있습니다.\r\n" +
+                                "헤더(1행)에서 해당 컬럼명을 클릭하고 다시 시도하세요.",
+                                title, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+            catch { /* ignore UI errors */ }
+            return false;
+        }
+
+        // 새로 추가: 처음 설치용 헤더 후보 선택 로직
+        private static Excel.Range? GetHeaderCandidateForInstall(Excel.Worksheet ws)
+        {
+            if (ws == null) return null;
+
+            // 이미 마커가 있으면 그대로
+            if (XqlSheet.TryGetHeaderMarker(ws, out var hdr)) return hdr;
+
+            // 사용자가 선택한 범위가 1행에 있고, 한 줄짜리 선택이면 그 폭 그대로 헤더로 인정
+            var sel = GetSelection(ws);
+            if (sel != null)
+            {
+                try
+                {
+                    int top = sel.Row;
+                    int rows = sel.Rows.Count;
+                    int cols = sel.Columns.Count;
+                    if (top == 1 && rows == 1 && cols >= 1)
+                    {
+                        using var s = SmartCom<Range>.Wrap((Excel.Range)ws.Cells[1, sel.Column]);
+                        using var e = SmartCom<Range>.Wrap((Excel.Range)ws.Cells[1, sel.Column + cols - 1]);
+                        return SmartCom<Range>.Wrap(ws.Range[s.Value, e.Value]).Detach();
+                    }
+                }
+                catch { /* ignore */ }
+            }
+
+            // 그 외엔 1행의 기본 헤더 범위
+            return XqlSheet.GetHeaderRange(ws);
+        }
+
         private static Excel.Range? GetSelection(Excel.Worksheet ws)
         {
             try { return (Excel.Range)ws.Application.Selection; }

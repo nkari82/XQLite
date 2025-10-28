@@ -500,6 +500,7 @@ namespace XQLite.AddIn
                     var tag = (c?.Tag as string ?? "").Trim().ToUpperInvariant();
                     if (string.IsNullOrEmpty(tag)) return 0;
 
+
                     XqlSheet.ColumnKind kind = tag switch
                     {
                         "INT" or "INTEGER" => XqlSheet.ColumnKind.Int,
@@ -510,9 +511,17 @@ namespace XQLite.AddIn
                         _ => XqlSheet.ColumnKind.Text,
                     };
 
+
                     var app = (Excel.Application)ExcelDnaUtil.Application;
                     using var ws = SmartCom<Excel.Worksheet>.Wrap(app.ActiveSheet as Excel.Worksheet);
+
                     if (ws?.Value == null) return 0;
+
+                    // ⬇️ 헤더 컬럼이 정확히 선택된 경우만 진행, 아니면 경고 후 리턴
+                    if (!XqlSheetView.EnsureHeaderColumnSelectionOrWarn(ws.Value!)) return 0;
+
+                    // 이후: TryGetHeaderSelectedColumn(...)으로 headerCell/colName 받아 타입 적용
+                    if (!XqlSheetView.TryGetHeaderSelectedColumn(ws.Value!, out var hdrCell, out var colName)) return 0;
 
                     var sheet = XqlAddIn.Sheet;
                     if (sheet == null) { MessageBox.Show("MetaRegistry not ready.", "XQLite"); return 0; }
@@ -527,7 +536,7 @@ namespace XQLite.AddIn
 
                     if (cell?.Value == null) return 0;
 
-                    var colName = (cell.Value.Value2 as string)?.Trim();
+                    colName = (cell.Value.Value2 as string)?.Trim();
                     if (string.IsNullOrEmpty(colName))
                         colName = XqlCommon.ColumnIndexToLetter(cell.Value.Column); // 폴백
 
