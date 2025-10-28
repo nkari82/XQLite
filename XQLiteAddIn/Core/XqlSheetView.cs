@@ -981,12 +981,35 @@ namespace XQLite.AddIn
             if ((plan == null || plan.Count == 0) && (patches == null || patches.Count == 0))
                 return;
 
+            // 0) 이번 적용에 관여하는 테이블 수집
+            var tables = new HashSet<string>(StringComparer.Ordinal);
+            if (plan is { Count: > 0 })
+                foreach (var t in plan.Keys.Where(s => !string.IsNullOrWhiteSpace(s))) tables.Add(t);
+            if (patches is { Count: > 0 })
+                foreach (var t in patches.Select(p => p.Table).Where(s => !string.IsNullOrWhiteSpace(s))) tables.Add(t);
+
+            // 1) UI 스레드 들어가기 전에 서버 컬럼 스키마를 한 번씩 조회(네트워크는 여기서)
+            var serverColsByTable = new Dictionary<string, List<ColumnInfo>>(StringComparer.Ordinal);
+            try
+            {
+                if (XqlAddIn.Backend is IXqlBackend be)
+                {
+                    foreach (var tbl in tables)
+                    {
+                        try { serverColsByTable[tbl] = be.GetTableColumns(tbl).GetAwaiter().GetResult(); }
+                        catch { /* 테이블 미존재/일시 오류는 무시 */ }
+                    }
+                }
+            }
+            catch { /* ignore */ }
+
             _ = XqlCommon.OnExcelThreadAsync(() =>
             {
                 var app = (Excel.Application)ExcelDnaUtil.Application;
                 if (app == null) return (object?)null;
                 using var _batch = new XqlCommon.ExcelBatchScope(app);
 
+                // 2) (기존 로직) plan으로 헤더/시트 보장
                 if (plan is { Count: > 0 })
                 {
                     foreach (var (table, cols0) in plan)
@@ -999,6 +1022,65 @@ namespace XQLite.AddIn
                     }
                 }
 
+                // 3) 방금 가져온 서버 타입을 메타에 주입하고, 헤더 UI/Validation 재적용
+                foreach (var tbl in tables)
+                {
+                    try
+                    {
+                        using var wsW = SmartCom<Worksheet>.Wrap(XqlSheet.FindWorksheetByTable(app, tbl, out var smeta));
+                        if (wsW.Value == null || smeta == null) continue;
+
+                        // (a) 서버 컬럼 타입 → Meta 반영
+                        if (serverColsByTable.TryGetValue(tbl, out var infos) && infos != null)
+                        {
+                            string? pkName = infos.FirstOrDefault(c => c.pk)?.name;
+                            if (!string.IsNullOrWhiteSpace(pkName))
+                                smeta.KeyColumn = pkName!;
+                            if (string.IsNullOrWhiteSpace(smeta.KeyColumn)) smeta.KeyColumn = "id";
+
+                            foreach (var info in infos)
+                            {
+                                var n = (info.name ?? "").Trim();
+                                if (n.Length == 0) continue;
+
+                                var t = (info.type ?? "").Trim().ToUpperInvariant();
+                                var ct = smeta.Columns.TryGetValue(n, out var cur) && cur != null
+                                            ? cur
+                                            : new XqlSheet.ColumnType();
+
+                                ct.Kind = t switch
+                                {
+                                    "INT" or "INTEGER" => XqlSheet.ColumnKind.Int,
+                                    "REAL" or "FLOAT" or "DOUBLE" or "NUMERIC" => XqlSheet.ColumnKind.Real,
+                                    "BOOL" or "BOOLEAN" => XqlSheet.ColumnKind.Bool,
+                                    "DATE" or "DATETIME" or "TIMESTAMP" => XqlSheet.ColumnKind.Date,
+                                    "JSON" => XqlSheet.ColumnKind.Json,
+                                    _ => XqlSheet.ColumnKind.Text
+                                };
+                                ct.Nullable = !info.notnull;
+
+                                smeta.SetColumn(n, ct);
+                            }
+                        }
+                        else
+                        {
+                            // 서버 응답이 없어도 PK/id는 기본값 유지
+                            if (string.IsNullOrWhiteSpace(smeta.KeyColumn)) smeta.KeyColumn = "id";
+                        }
+
+                        // (b) 헤더 범위 찾아 툴팁/외곽선/유효성/ID잠금 다시 적용
+                        var lo = XqlSheet.FindListObjectByTable(wsW.Value, tbl);
+                        using var headerW = SmartCom<Range>.Wrap(lo?.HeaderRowRange ?? XqlSheet.GetHeaderRange(wsW.Value));
+                        if (headerW.Value != null)
+                        {
+                            // 이 경로는 ApplyDataValidationForHeader의 안전 로직(머지/필터 제외 + 실패 폴백)을 사용
+                            ApplyHeaderUi(wsW.Value, headerW.Value, smeta, withValidation: true);
+                        }
+                    }
+                    catch { /* per-table 안전 */ }
+                }
+
+                // 4) (기존 로직) 행 패치 적용
                 if (patches is { Count: > 0 })
                 {
                     InternalApplyCore(app, patches);
