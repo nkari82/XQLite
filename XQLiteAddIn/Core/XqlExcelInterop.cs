@@ -1,4 +1,5 @@
 ﻿// XqlExcelInterop.cs  — SmartCom<T> 적용 버전 (lastDataRow 계산 보강 + Commit 전/후 스키마 보장)
+// RCW 안전: 어떤 Excel RCW도 await 경계 밖으로 들고 나가지 않음.
 using ExcelDna.Integration;
 using System;
 using System.Collections.Generic;
@@ -79,116 +80,121 @@ namespace XQLite.AddIn
         {
             try
             {
-                var app = ExcelDnaUtil.Application as Excel.Application;
-                if (app == null) return;
-
-                using var ws = SmartCom<Excel.Worksheet>.Wrap(app.ActiveSheet as Excel.Worksheet);
-                if (ws?.Value == null) return;
-
-                // ✅ 0) 커밋 전에 항상 스키마부터(타입/이름 정규화 포함) 서버에 확정
+                // 0) 커밋 전에 스키마 확정 (내부에서 Excel 접근은 모두 Excel 스레드에서 수행)
                 await EnsureActiveSheetSchema().ConfigureAwait(false);
 
-                var sm = _sheet.GetOrCreateSheet(ws.Value.Name);
-
-                using var header = SmartCom<Excel.Range>.Wrap(XqlSheetView.GetHeaderOrFallback(ws.Value));
-                if (header?.Value == null) return;
-
-                var headers = XqlSheet.ComputeHeaderNames(header.Value);
-                string keyName = string.IsNullOrWhiteSpace(sm.KeyColumn) ? "id" : sm.KeyColumn!;
-                int keyIdx1 = XqlSheet.FindKeyColumnIndex(headers, keyName);
-                if (keyIdx1 <= 0) keyIdx1 = 1;
-
-                int firstDataRow = header.Value.Row + 1;
-
-                // ⚠ UsedRange만으로는 첫 입력 직후 갱신이 늦을 수 있어 보강 로직으로 최종 데이터 행을 산출한다.
-                int lastDataRow = GetLastDataRow(ws.Value, header.Value, firstDataRow, headers.Count);
-
-                if (lastDataRow < firstDataRow)
+                // 1) Excel 스레드에서 “순수 데이터 스냅샷”만 수집 (RCW 금지)
+                var snap = await XqlCommon.OnExcelThreadAsync(() =>
                 {
-                    // 데이터가 전혀 없으면 커밋할 것이 없다.
-                    return;
-                }
+                    var app = ExcelDnaUtil.Application as Excel.Application;
+                    using var wsW = SmartCom<Excel.Worksheet>.Wrap(app?.ActiveSheet as Excel.Worksheet);
+                    if (wsW?.Value == null) return default(CommitScan);
 
-                // === 행 스냅샷 구성: upsertRows 한 번으로 전송 ===
-                var rowsForUpsertRows = new List<Dictionary<string, object?>>();
-                var tempRowKeyToExcelRow = new Dictionary<string, int>(StringComparer.Ordinal);
+                    var sm = _sheet.GetOrCreateSheet(wsW.Value.Name);
 
-                for (int r = firstDataRow; r <= lastDataRow; r++)
-                {
-                    object? idVal = GetCell(ws.Value, r, header.Value.Column + keyIdx1 - 1);
-                    string idStr = XqlCommon.Canonicalize(idVal) ?? "";
+                    using var headerR = SmartCom<Excel.Range>.Wrap(XqlSheetView.GetHeaderOrFallback(wsW.Value));
+                    if (headerR?.Value == null) return default(CommitScan);
 
-                    // 행 객체 생성
-                    var obj = new Dictionary<string, object?>(StringComparer.Ordinal);
+                    var headers = XqlSheet.ComputeHeaderNames(headerR.Value);
+                    string keyName = string.IsNullOrWhiteSpace(sm.KeyColumn) ? "id" : sm.KeyColumn!;
+                    int keyIdx1 = XqlSheet.FindKeyColumnIndex(headers, keyName);
+                    if (keyIdx1 <= 0) keyIdx1 = 1;
 
-                    // 비즈니스 컬럼 수집
-                    for (int i = 0; i < headers.Count; i++)
+                    int firstDataRow = headerR.Value.Row + 1;
+                    int lastDataRow = GetLastDataRow(wsW.Value, headerR.Value, firstDataRow, headers.Count);
+                    if (lastDataRow < firstDataRow)
                     {
-                        var col = headers[i];
-                        if (string.IsNullOrWhiteSpace(col)) continue;
-
-                        object? v = GetCell(ws.Value, r, header.Value.Column + i);
-
-                        if (string.Equals(col, keyName, StringComparison.OrdinalIgnoreCase))
-                            continue; // PK는 별도로
-
-                        obj[col] = v is DateTime dt ? dt : v;
+                        return new CommitScan
+                        {
+                            SheetName = wsW.Value.Name,
+                            Table = string.IsNullOrWhiteSpace(sm.TableName) ? wsW.Value.Name : sm.TableName!,
+                            KeyName = keyName,
+                            KeyAbsCol = headerR.Value.Column + keyIdx1 - 1,
+                            Rows = new List<Dictionary<string, object?>>(),
+                            TempRowToExcelRow = new Dictionary<string, int>(StringComparer.Ordinal)
+                        };
                     }
 
-                    // 이 행이 “데이터 하나라도 있는가?”
-                    bool anyData = obj.Any(kv => kv.Value != null && !string.IsNullOrWhiteSpace(Convert.ToString(kv.Value)));
+                    var rows = new List<Dictionary<string, object?>>();
+                    var map = new Dictionary<string, int>(StringComparer.Ordinal);
 
-                    if (!string.IsNullOrWhiteSpace(idStr))
+                    for (int r = firstDataRow; r <= lastDataRow; r++)
                     {
-                        // 기존행: PK 포함해서 전송
-                        obj[keyName] = idStr;
-                        rowsForUpsertRows.Add(obj);
+                        object? idVal = GetCell(wsW.Value, r, headerR.Value.Column + keyIdx1 - 1);
+                        string idStr = XqlCommon.Canonicalize(idVal) ?? "";
+
+                        var obj = new Dictionary<string, object?>(StringComparer.Ordinal);
+
+                        for (int i = 0; i < headers.Count; i++)
+                        {
+                            var col = headers[i];
+                            if (string.IsNullOrWhiteSpace(col)) continue;
+
+                            object? v = GetCell(wsW.Value, r, headerR.Value.Column + i);
+                            if (string.Equals(col, keyName, StringComparison.OrdinalIgnoreCase))
+                                continue;
+
+                            obj[col] = v is DateTime dt ? dt : v;
+                        }
+
+                        if (!string.IsNullOrWhiteSpace(idStr))
+                        {
+                            obj[keyName] = idStr;
+                            rows.Add(obj);
+                        }
+                        else
+                        {
+                            string clientRowKey = r.ToString();
+                            obj["__row"] = clientRowKey;
+                            map[clientRowKey] = r;
+                            rows.Add(obj);
+                        }
                     }
-                    else
+
+                    return new CommitScan
                     {
-                        // 신규행: __row(엑셀 행번호) 부여
-                        // - anyData==false(완전 빈 행)이라도 __row만 담아 전송 → 서버가 DEFAULT VALUES로 id만 선발급
-                        string clientRowKey = r.ToString();
-                        obj["__row"] = clientRowKey;
+                        SheetName = wsW.Value.Name,
+                        Table = string.IsNullOrWhiteSpace(sm.TableName) ? wsW.Value.Name : sm.TableName!,
+                        KeyName = keyName,
+                        KeyAbsCol = headerR.Value.Column + keyIdx1 - 1,
+                        Rows = rows,
+                        TempRowToExcelRow = map
+                    };
+                }).ConfigureAwait(false);
 
-                        // 매핑용 캐시
-                        tempRowKeyToExcelRow[clientRowKey] = r;
+                if (string.IsNullOrEmpty(snap.SheetName)) return; // 시트 없음/데이터 없음
 
-                        rowsForUpsertRows.Add(obj);
-                    }
-                }
-
-                // 서버 호출 (⚠ await 전에는 RCW를 더 이상 들고있지 않음 — 모두 값으로만 유지)
+                // 2) 서버 호출 (이 시점엔 순수 데이터만 보유)
                 if (XqlAddIn.Backend is IXqlBackend be)
                 {
-                    var resp = await be.UpsertRows(ws.Value.Name, rowsForUpsertRows).ConfigureAwait(false);
+                    var resp = await be.UpsertRows(snap.Table, snap.Rows).ConfigureAwait(false);
                     if (resp?.Errors is { Count: > 0 })
-                        XqlLog.Warn("Commit errors (upsertRows): " + string.Join("; ", resp.Errors));
+                        XqlLog.Warn("Commit errors (upsertRows): " + string.Join("; ", resp.Errors ?? []));
 
-                    // 서버가 발급한 id를 시트에 반영
-                    if (resp?.Assigned is { Count: > 0 })
+                    // 3) 서버가 발급한 id를 시트에 반영 (Excel 스레드에서 RCW 재획득)
+                    if (resp?.Assigned is { Count: > 0 } && snap.TempRowToExcelRow.Count > 0)
                     {
-                        foreach (var a in resp.Assigned)
+                        await XqlCommon.OnExcelThreadAsync(() =>
                         {
-                            if (a == null) continue;
-                            if (!string.Equals(a.Table, ws.Value.Name, StringComparison.Ordinal)) continue;
-                            if (string.IsNullOrWhiteSpace(a.NewId)) continue;
-                            if (string.IsNullOrWhiteSpace(a.TempRowKey)) continue;
+                            var app = (Excel.Application)ExcelDnaUtil.Application;
+                            using var wsW = SmartCom<Excel.Worksheet>.Wrap(XqlSheet.FindWorksheet(app, snap.SheetName));
+                            if (wsW?.Value == null) return 0;
 
-                            if (tempRowKeyToExcelRow.TryGetValue(a.TempRowKey!, out var rowIdx))
+                            foreach (var a in resp.Assigned)
                             {
-                                using var keyCell = SmartCom<Excel.Range>.Acquire(() => (Excel.Range)ws.Value.Cells[rowIdx, header.Value.Column + keyIdx1 - 1]);
-                                try
+                                if (a == null) continue;
+                                if (!string.Equals(a.Table, snap.Table, StringComparison.Ordinal)) continue;
+                                if (string.IsNullOrWhiteSpace(a.NewId) || string.IsNullOrWhiteSpace(a.TempRowKey)) continue;
+
+                                if (snap.TempRowToExcelRow.TryGetValue(a.TempRowKey!, out var rowIdx))
                                 {
-                                    // ✅ 값 유무와 무관하게 강제 기록 (이전 코드의 null 체크로 인해 비어있으면 안 써지던 문제 수정)
-                                    if (keyCell?.Value != null) keyCell.Value.Value2 = a.NewId;
-                                }
-                                catch
-                                {
+                                    using var keyCell = SmartCom<Excel.Range>.Acquire(
+                                        () => (Excel.Range)wsW.Value.Cells[rowIdx, snap.KeyAbsCol]);
                                     try { if (keyCell != null) keyCell.Value!.Value2 = a.NewId; } catch { }
                                 }
                             }
-                        }
+                            return 0;
+                        }).ConfigureAwait(false);
                     }
                 }
 
@@ -197,7 +203,7 @@ namespace XQLite.AddIn
                 _sync.PullSince(null);
 #pragma warning restore CS4014
 
-                // ✅ 5) 혹시라도 동시성으로 TEXT가 잠깐 만들어졌다면 여기서 한 번 더 스키마 보정
+                // 5) 동시성으로 타입이 잠깐 깨졌다면 한 번 더 스키마 보정
                 await EnsureActiveSheetSchema().ConfigureAwait(false);
             }
             catch (Exception ex)
@@ -206,18 +212,32 @@ namespace XQLite.AddIn
             }
         }
 
+        private readonly struct CommitScan
+        {
+            public string SheetName { get; init; }
+            public string Table { get; init; }
+            public string KeyName { get; init; }
+            public int KeyAbsCol { get; init; }
+            public List<Dictionary<string, object?>> Rows { get; init; }
+            public Dictionary<string, int> TempRowToExcelRow { get; init; }
+        }
+
         public async void Cmd_PullOnly()
         {
             try
             {
-                var app = ExcelDnaUtil.Application as Excel.Application;
-                if (app == null) { await _sync.PullSince(); return; }
+                // Excel 스레드에서 부트스트랩 필요 여부만 계산 (RCW 금지)
+                var needs = await XqlCommon.OnExcelThreadAsync(() =>
+                {
+                    var app = ExcelDnaUtil.Application as Excel.Application;
+                    var ws = app?.ActiveSheet as Excel.Worksheet;
+                    if (ws == null) return false;
 
-                using var ws = SmartCom<Excel.Worksheet>.Wrap(app.ActiveSheet as Excel.Worksheet);
-                if (ws?.Value == null) { await _sync.PullSince(); return; }
+                    return XqlSheet.NeedsBootstrap(ws);
+                }).ConfigureAwait(false);
 
-                bool needsBootstrap = XqlSheet.NeedsBootstrap(ws.Value);
-                await _sync.PullSince(needsBootstrap ? 0 : (long?)null);
+                var since = (needs == true) ? 0 : (long?)null;
+                await _sync.PullSince(since).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -266,7 +286,7 @@ namespace XQLite.AddIn
             return (header, data, lo);
         }
 
-        // 변경 이벤트에서 호출
+        // 변경 이벤트에서 호출 (동기, Excel 스레드 내에서만 RCW 사용)
         private void App_SheetChange(object Sh, Excel.Range target)
         {
             try
@@ -541,9 +561,7 @@ namespace XQLite.AddIn
                     if (hit?.Value == null) continue;
 
                     int candidate = hit.Value.Row;
-                    // 헤더행보다 위쪽이면 데이터가 없다는 뜻
                     if (candidate < firstDataRow) continue;
-
                     if (candidate > last) last = candidate;
                 }
                 catch { /* ignore per column */ }
