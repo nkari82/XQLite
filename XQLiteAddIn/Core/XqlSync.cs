@@ -429,6 +429,14 @@ namespace XQLite.AddIn
                     }
                     r++;
                 }
+
+                if (hdr.Value != null)
+                {
+                    var sm = _sheet.GetOrCreateSheet(ws.Name);
+                    XqlSheetView.ApplyHeaderUi(ws, hdr.Value, sm, withValidation: true);
+                    XqlSheet.SetHeaderMarker(ws, hdr.Value);
+                    XqlSheetView.RegisterTableSheet(table, ws.Name);
+                }
                 return 0;
             }).ConfigureAwait(false);
         }
