@@ -279,33 +279,79 @@ namespace XQLite.AddIn
         internal static Excel.Worksheet? FindWorksheetByTable(Excel.Application app, string table, out XqlSheet.Meta? smeta)
         {
             smeta = null;
-            Excel.Worksheet? match = null;
+            if (app == null) return null;
+
+            // 1) 먼저 ActiveWorkbook에서만 시도(가장 안전)
             try
             {
-                foreach (Excel.Worksheet w in app.Worksheets)
+                using var wbW = SmartCom<Excel.Workbook>.Wrap(app.ActiveWorkbook);
+                if (wbW?.Value != null)
                 {
-                    try
-                    {
-                        if (XqlAddIn.Sheet!.TryGetSheet(w.Name, out var m))
-                        {
-                            var t = string.IsNullOrWhiteSpace(m.TableName) ? w.Name : m.TableName!;
-                            if (string.Equals(t, table, StringComparison.OrdinalIgnoreCase))
-                            { smeta = m; match = w; break; }
-                        }
-                        else if (string.Equals(w.Name, table, StringComparison.OrdinalIgnoreCase))
-                        { smeta = XqlAddIn.Sheet!.GetOrCreateSheet(w.Name); match = w; break; }
-                    }
-                    finally
-                    {
-                        if (!object.ReferenceEquals(match, w))
-                        {
-                            // no-op
-                        }
-                    }
+                    var hit = FindInWorkbook(wbW.Value, table, out smeta);
+                    if (hit != null) return hit;
                 }
             }
-            catch { }
-            return match;
+            catch { /* ignore */ }
+
+            // 2) 열려있는 모든 Workbook을 안전하게 순회
+            try
+            {
+                using var wbsW = SmartCom<Excel.Workbooks>.Wrap(app.Workbooks);
+                int wbc = wbsW?.Value?.Count ?? 0;
+                for (int wi = 1; wi <= wbc; wi++)
+                {
+                    using var wb = SmartCom<Excel.Workbook>.Acquire(() => wbsW!.Value![wi]);
+                    if (wb?.Value == null) continue;
+
+                    var hit = FindInWorkbook(wb.Value, table, out smeta);
+                    if (hit != null) return hit;
+                }
+            }
+            catch { /* ignore */ }
+
+            return null;
+        }
+
+        private static Excel.Worksheet? FindInWorkbook(Excel.Workbook wb, string table, out XqlSheet.Meta? smeta)
+        {
+            smeta = null;
+            try
+            {
+                using var sheetsW = SmartCom<Excel.Sheets>.Wrap(wb.Worksheets);
+                int count = sheetsW?.Value?.Count ?? 0;
+                for (int i = 1; i <= count; i++)
+                {
+                    Excel.Worksheet? raw = null;
+                    try { raw = sheetsW!.Value![i] as Excel.Worksheet; }
+                    catch { continue; }
+
+                    using var w = SmartCom<Excel.Worksheet>.Wrap(raw);
+                    if (w?.Value == null) continue;
+
+                    try
+                    {
+                        // 메타 → 테이블 이름 매핑 우선
+                        if (XqlAddIn.Sheet!.TryGetSheet(w.Value.Name, out var m))
+                        {
+                            var t = string.IsNullOrWhiteSpace(m.TableName) ? w.Value.Name : m.TableName!;
+                            if (string.Equals(t, table, StringComparison.OrdinalIgnoreCase))
+                            {
+                                var ret = w.Value; w.Detach(); smeta = m; return ret;
+                            }
+                        }
+                        // 메타가 없으면 시트명 직접 매칭
+                        else if (string.Equals(w.Value.Name, table, StringComparison.OrdinalIgnoreCase))
+                        {
+                            smeta = XqlAddIn.Sheet!.GetOrCreateSheet(w.Value.Name);
+                            var ret = w.Value; w.Detach(); return ret;
+                        }
+                    }
+                    catch { /* continue */ }
+                }
+            }
+            catch { /* ignore */ }
+
+            return null;
         }
 
         /// <summary>
